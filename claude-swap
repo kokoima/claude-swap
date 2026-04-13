@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+#
+# claude-swap — Rotate between multiple Claude Max accounts in Claude Code
+#
+# https://github.com/javierpardo/claude-swap
+#
+# Usage:
+#   claude-swap              Interactive: status + check + select
+#   claude-swap <n>          Rotate to account N
+#   claude-swap status       Show current account state
+#   claude-swap check        Status + API rate limit check
+#   claude-swap auto         Auto-rotate to best available account
+#   claude-swap add          Add a new account
+#   claude-swap remove <n>   Remove an account
+#   claude-swap init         First-time setup
+#   claude-swap version      Show version
+
+set -e
+
+VERSION="1.0.0"
+STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
+CLAUDE_CREDS="$HOME/.claude/.credentials.json"
+CLAUDE_JSON="$HOME/.claude.json"
+IS_MACOS=false
+[ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
+
+# --- Checks ---
+
+check_python() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "Error: python3 is required but not found."
+    echo ""
+    echo "Install it:"
+    echo "  macOS:  Python 3 is pre-installed, or: brew install python3"
+    echo "  Linux:  sudo apt install python3  (or your distro's equivalent)"
+    exit 1
+  }
+}
+
+check_store() {
+  [ -f "$STORE" ] || {
+    echo "No accounts configured yet."
+    echo ""
+    echo "Run 'claude-swap init' to get started."
+    exit 1
+  }
+}
+
+# --- Commands ---
+
+cmd_version() {
+  echo "claude-swap v$VERSION"
+}
+
+cmd_help() {
+  echo "claude-swap v$VERSION — Multi-account manager for Claude Code"
+  echo ""
+  echo "Usage:"
+  echo "  claude-swap              Interactive: status + check + select"
+  echo "  claude-swap <n>          Rotate to account N"
+  echo "  claude-swap status       Show current account state"
+  echo "  claude-swap check        Status + API rate limit check"
+  echo "  claude-swap auto         Auto-rotate to best available account"
+  echo "  claude-swap add          Add a new account"
+  echo "  claude-swap remove <n>   Remove an account"
+  echo "  claude-swap init         First-time setup"
+  echo "  claude-swap version      Show version"
+  echo "  claude-swap help         Show this help"
+}
+
+cmd_init() {
+  if [ -f "$STORE" ]; then
+    echo "Store already exists at $STORE"
+    echo "Use 'claude-swap add' to add more accounts."
+    return
+  fi
+
+  echo "claude-swap — Multi-account manager for Claude Code"
+  echo ""
+
+  mkdir -p "$(dirname "$STORE")"
+  echo '{"version":1,"active":0,"accounts":[]}' > "$STORE"
+  chmod 600 "$STORE"
+
+  echo "To add an account, you need a setup token (lasts 1 year):"
+  echo "  1. Open a new terminal"
+  echo "  2. Log in with the account:  claude login"
+  echo "  3. Generate a token:         claude setup-token"
+  echo "  4. Come back here and paste it"
+  echo ""
+
+  while true; do
+    _add_account_interactive
+    echo ""
+    read -r -p "Add another account? (y/n) " more
+    case "$more" in
+      [yY]*) echo "" ;;
+      *) break ;;
+    esac
+  done
+
+  # Set first account as active if we have any
+  local count
+  count=$(python3 -c "import json; print(len(json.load(open('$STORE'))['accounts']))")
+  if [ "$count" -gt 0 ]; then
+    python3 -c "
+import json
+with open('$STORE') as f:
+    d = json.load(f)
+d['active'] = 1
+with open('$STORE', 'w') as f:
+    json.dump(d, f, indent=2)
+"
+    echo ""
+    echo "Account 1 set as active."
+    _do_rotate 1
+  fi
+}
+
+cmd_status() {
+  check_store
+  python3 - "$STORE" "$CLAUDE_CREDS" "$CLAUDE_JSON" "$IS_MACOS" "$VERSION" <<'PYEOF'
+import json, hashlib, time, os, sys, subprocess, binascii
+
+store_path = sys.argv[1]
+creds_path = sys.argv[2]
+claude_json_path = sys.argv[3]
+is_macos = sys.argv[4] == "true"
+version = sys.argv[5]
+
+with open(store_path) as f:
+    store = json.load(f)
+
+accounts = store.get("accounts", [])
+active = store.get("active", 0)
+now_ms = int(time.time() * 1000)
+
+def fingerprint(token):
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+def match_token(token):
+    fp = fingerprint(token)
+    for i, acc in enumerate(accounts):
+        if acc.get("token") and fingerprint(acc["token"]) == fp:
+            return i + 1, fp
+    return None, fp
+
+print(f"claude-swap v{version}")
+print()
+
+if not accounts:
+    print("No accounts configured. Run 'claude-swap add' to add one.")
+    sys.exit(0)
+
+if 1 <= active <= len(accounts):
+    acc = accounts[active - 1]
+    print(f"Active: {active} ({acc.get('label', '?')} / {acc.get('email') or '-'})")
+else:
+    print(f"Active: none")
+print()
+
+# Keychain check (macOS only)
+if is_macos:
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, check=True
+        )
+        raw = out.stdout.strip()
+        if raw:
+            try:
+                kd = json.loads(raw)
+            except json.JSONDecodeError:
+                kd = json.loads(binascii.unhexlify(raw).decode("utf-8"))
+            ko = kd.get("claudeAiOauth", {})
+            ktoken = ko.get("accessToken", "")
+            has_refresh = bool(ko.get("refreshToken"))
+            kmatch, kfp = match_token(ktoken)
+            kind = "OAuth" if has_refresh else "setup-token"
+            label = f"account {kmatch}" if kmatch else "UNKNOWN"
+            print(f"  Keychain: {kfp} ({label}, {kind}) ** HAS PRIORITY **")
+        else:
+            print(f"  Keychain: empty (OK)")
+    except subprocess.CalledProcessError:
+        print(f"  Keychain: not found (OK)")
+
+# .credentials.json check
+try:
+    with open(creds_path) as f:
+        d = json.load(f)
+    o = d["claudeAiOauth"]
+    cmatch, cfp = match_token(o["accessToken"])
+    label = f"account {cmatch}" if cmatch else "UNKNOWN"
+    print(f"  .credentials.json: {cfp} ({label})")
+except FileNotFoundError:
+    print(f"  .credentials.json: not found")
+except Exception as e:
+    print(f"  .credentials.json: error ({e})")
+
+print()
+
+# Account list
+print(f"  #  {'Label':<20} {'Email':<30} Expires")
+for i, acc in enumerate(accounts):
+    n = i + 1
+    marker = "*" if n == active else " "
+    label = acc.get("label", "")[:20]
+    email = (acc.get("email") or "-")[:30]
+    days = (acc.get("expires", 0) - now_ms) / 86400000
+    if days > 0:
+        expires = f"{days:.0f}d"
+    else:
+        expires = "EXPIRED"
+    print(f"  {marker}{n}  {label:<20} {email:<30} {expires}")
+PYEOF
+}
+
+cmd_check() {
+  check_store
+  cmd_status
+  echo ""
+  _deep_check
+}
+
+_deep_check() {
+  python3 - "$STORE" <<'PYEOF'
+import json, os, sys, time
+import urllib.request, urllib.error
+from datetime import datetime, timezone
+
+store_path = sys.argv[1]
+with open(store_path) as f:
+    store = json.load(f)
+
+accounts = store.get("accounts", [])
+active = store.get("active", 0)
+local_tz = datetime.now().astimezone().tzinfo
+
+results = []
+for i, acc in enumerate(accounts):
+    n = i + 1
+    if not acc.get("token"):
+        results.append({"n": n, "label": acc.get("label", ""), "status": "NO TOKEN"})
+        continue
+
+    data = json.dumps({
+        "model": "claude-haiku-4-5",
+        "max_tokens": 5,
+        "system": "Reply ok.",
+        "messages": [{"role": "user", "content": "ok"}]
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {acc['token']}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json"
+        }
+    )
+
+    r_status = "?"
+    util_5h = "-"
+    util_7d = "-"
+    detail = ""
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            headers = dict(r.headers)
+            r_status = "OK"
+            u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
+            u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
+            s7 = headers.get("anthropic-ratelimit-unified-7d-status", "")
+            if u5:
+                util_5h = f"{float(u5)*100:.0f}%"
+            if u7:
+                util_7d = f"{float(u7)*100:.0f}%"
+            if s7 == "allowed_warning":
+                r_status = "OK (warning)"
+    except urllib.error.HTTPError as e:
+        headers = dict(e.headers)
+        try:
+            body = json.loads(e.read())
+            et = body.get("error", {}).get("type", "?")
+        except Exception:
+            et = f"HTTP {e.code}"
+
+        u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
+        u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        if u5:
+            util_5h = f"{float(u5)*100:.0f}%"
+        if u7:
+            util_7d = f"{float(u7)*100:.0f}%"
+
+        if et == "rate_limit_error":
+            retry = headers.get("retry-after", "")
+            if retry:
+                mins = int(retry) // 60
+                r_status = f"RATE LIMITED (retry {mins}m)"
+            else:
+                r_status = "RATE LIMITED"
+        elif et == "authentication_error":
+            r_status = "AUTH ERROR"
+        elif et == "overloaded_error":
+            r_status = "OVERLOADED"
+        else:
+            r_status = et
+    except Exception as e:
+        r_status = f"{type(e).__name__}"
+
+    results.append({
+        "n": n, "label": acc.get("label", ""), "status": r_status,
+        "util_5h": util_5h, "util_7d": util_7d
+    })
+
+print(f"  #  {'Label':<20} {'5h':<6} {'7d':<6} Status")
+for r in results:
+    marker = "*" if r["n"] == active else " "
+    label = r["label"][:20]
+    u5 = r.get("util_5h", "-")
+    u7 = r.get("util_7d", "-")
+    print(f"  {marker}{r['n']}  {label:<20} {u5:<6} {u7:<6} {r['status']}")
+PYEOF
+}
+
+cmd_auto() {
+  check_store
+  local result
+  result=$(python3 - "$STORE" <<'PYEOF'
+import json, os, sys, time
+import urllib.request, urllib.error
+
+store_path = sys.argv[1]
+with open(store_path) as f:
+    store = json.load(f)
+
+accounts = store.get("accounts", [])
+active = store.get("active", 0)
+
+results = []
+for i, acc in enumerate(accounts):
+    n = i + 1
+    if not acc.get("token"):
+        continue
+
+    data = json.dumps({
+        "model": "claude-haiku-4-5",
+        "max_tokens": 5,
+        "system": "Reply ok.",
+        "messages": [{"role": "user", "content": "ok"}]
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {acc['token']}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json"
+        }
+    )
+
+    entry = {"n": n, "label": acc.get("label", ""), "rate_limited": False,
+             "util_5h": 1.0, "util_7d": 1.0, "retry_after": 999999}
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            headers = dict(r.headers)
+            u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
+            u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
+            entry["util_5h"] = float(u5) if u5 else 0.0
+            entry["util_7d"] = float(u7) if u7 else 0.0
+    except urllib.error.HTTPError as e:
+        headers = dict(e.headers)
+        try:
+            body = json.loads(e.read())
+            et = body.get("error", {}).get("type", "?")
+        except Exception:
+            et = f"HTTP {e.code}"
+
+        if et == "rate_limit_error":
+            entry["rate_limited"] = True
+            retry = headers.get("retry-after", "")
+            entry["retry_after"] = int(retry) if retry else 999999
+            u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
+            u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
+            entry["util_5h"] = float(u5) if u5 else 1.0
+            entry["util_7d"] = float(u7) if u7 else 1.0
+        else:
+            entry["rate_limited"] = True
+    except Exception:
+        entry["rate_limited"] = True
+
+    results.append(entry)
+    sys.stderr.write(f"  Checked {n}: {entry['label']:<20} {'RATE LIMITED' if entry['rate_limited'] else 'OK'} (5h={entry['util_5h']*100:.0f}%)\n")
+
+available = [r for r in results if not r["rate_limited"]]
+
+if available:
+    available.sort(key=lambda r: (r["util_5h"], r["util_7d"]))
+    best = available[0]
+    if best["n"] == active:
+        sys.stderr.write(f"\n  Already on best account: {best['n']} ({best['label']}, 5h={best['util_5h']*100:.0f}%)\n")
+        print("STAY")
+    else:
+        sys.stderr.write(f"\n  Best account: {best['n']} ({best['label']}, 5h={best['util_5h']*100:.0f}%)\n")
+        print(f"ROTATE {best['n']}")
+else:
+    results.sort(key=lambda r: r["retry_after"])
+    soonest = results[0]
+    mins = soonest["retry_after"] // 60
+    sys.stderr.write(f"\n  All accounts rate limited.\n")
+    sys.stderr.write(f"  Account {soonest['n']} ({soonest['label']}) unblocks soonest (retry in {mins}m)\n")
+    print("BLOCKED")
+PYEOF
+  )
+
+  case "$result" in
+    STAY) ;;
+    ROTATE\ *)
+      local target="${result#ROTATE }"
+      _do_rotate "$target"
+      ;;
+    BLOCKED) exit 1 ;;
+  esac
+}
+
+_do_rotate() {
+  local target="$1"
+
+  local token expires label
+  read -r token expires label < <(python3 -c "
+import json, sys
+with open('$STORE') as f:
+    d = json.load(f)
+acc = d['accounts'][int('$target') - 1]
+print(acc['token'], acc.get('expires', 0), acc.get('label', '?'))
+")
+
+  [ -n "$token" ] || { echo "Error: account $target has no token"; exit 1; }
+
+  echo ""
+  echo "Rotating to account $target ($label)"
+  echo ""
+
+  # 1. Keychain (macOS only)
+  if [ "$IS_MACOS" = true ]; then
+    security delete-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 && \
+      echo "  [1/4] Keychain cleared" || \
+      echo "  [1/4] Keychain already clear"
+  else
+    echo "  [1/4] Keychain skip (Linux)"
+  fi
+
+  # 2. Write .credentials.json
+  python3 -c "
+import json, os
+creds = {
+    'claudeAiOauth': {
+        'accessToken': '$token',
+        'refreshToken': '',
+        'expiresAt': $expires,
+        'scopes': ['user:file_upload','user:inference','user:mcp_servers','user:profile','user:sessions:claude_code'],
+        'subscriptionType': 'max',
+        'rateLimitTier': 'default_claude_max_20x'
+    }
+}
+path = os.path.expanduser('~/.claude/.credentials.json')
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w') as f:
+    json.dump(creds, f, indent=2)
+os.chmod(path, 0o600)
+"
+  echo "  [2/4] .credentials.json updated"
+
+  # 3. Clear oauthAccount
+  if [ -f "$CLAUDE_JSON" ]; then
+    python3 -c "
+import json
+path = '$CLAUDE_JSON'
+with open(path) as f:
+    d = json.load(f)
+d.pop('oauthAccount', None)
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+"
+    echo "  [3/4] oauthAccount cleared"
+  else
+    echo "  [3/4] oauthAccount skip (no .claude.json)"
+  fi
+
+  # 4. Update store
+  python3 -c "
+import json
+with open('$STORE') as f:
+    d = json.load(f)
+d['active'] = $target
+with open('$STORE', 'w') as f:
+    json.dump(d, f, indent=2)
+"
+  echo "  [4/4] Store updated"
+
+  echo ""
+  echo "Done. New Claude Code sessions will use account $target."
+}
+
+cmd_add() {
+  check_store
+  _add_account_interactive
+}
+
+_add_account_interactive() {
+  echo "Generate a setup token:"
+  echo "  1. Open a new terminal"
+  echo "  2. Log in:  claude login"
+  echo "  3. Run:     claude setup-token"
+  echo "  4. Paste the token here"
+  echo ""
+
+  local token label email
+  read -r -p "Token: " token
+
+  # Validate
+  case "$token" in
+    sk-ant-*) ;;
+    *)
+      echo "Error: token must start with 'sk-ant-'"
+      return 1
+      ;;
+  esac
+
+  # Check duplicate
+  local dup
+  dup=$(python3 -c "
+import json
+with open('$STORE') as f:
+    d = json.load(f)
+for i, a in enumerate(d['accounts']):
+    if a.get('token') == '''$token''':
+        print(i + 1)
+        break
+" 2>/dev/null)
+
+  if [ -n "$dup" ]; then
+    echo "This token already exists as account $dup."
+    return 1
+  fi
+
+  read -r -p "Label (optional): " label
+  read -r -p "Email (optional): " email
+
+  python3 -c "
+import json, time
+with open('$STORE') as f:
+    d = json.load(f)
+d['accounts'].append({
+    'label': '''$label''',
+    'email': '''$email''',
+    'token': '''$token''',
+    'expires': int(time.time() * 1000) + 365 * 86400 * 1000
+})
+with open('$STORE', 'w') as f:
+    json.dump(d, f, indent=2)
+print(len(d['accounts']))
+"
+  local count
+  count=$(python3 -c "import json; print(len(json.load(open('$STORE'))['accounts']))")
+  echo ""
+  echo "Account $count added (expires in 365d)"
+}
+
+cmd_remove() {
+  check_store
+  local target="$1"
+
+  [ -n "$target" ] || { echo "Usage: claude-swap remove <n>"; exit 1; }
+
+  python3 - "$STORE" "$target" <<'PYEOF'
+import json, sys
+
+store_path = sys.argv[1]
+target = int(sys.argv[2])
+
+with open(store_path) as f:
+    d = json.load(f)
+
+accounts = d.get("accounts", [])
+if target < 1 or target > len(accounts):
+    print(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
+    sys.exit(1)
+
+acc = accounts[target - 1]
+print(f"Account {target}: {acc.get('label', '?')} / {acc.get('email') or '-'}")
+PYEOF
+
+  read -r -p "Remove this account? (y/n) " confirm
+  case "$confirm" in
+    [yY]*)
+      python3 -c "
+import json
+with open('$STORE') as f:
+    d = json.load(f)
+target = $target
+d['accounts'].pop(target - 1)
+active = d.get('active', 0)
+if active == target:
+    d['active'] = 1 if d['accounts'] else 0
+elif active > target:
+    d['active'] = active - 1
+with open('$STORE', 'w') as f:
+    json.dump(d, f, indent=2)
+print(f'Account {target} removed. Active: {d[\"active\"]}')
+"
+      ;;
+    *)
+      echo "Cancelled."
+      ;;
+  esac
+}
+
+cmd_interactive() {
+  check_store
+  cmd_status
+  echo ""
+  _deep_check
+  echo ""
+
+  local count
+  count=$(python3 -c "import json; print(len(json.load(open('$STORE'))['accounts']))")
+
+  read -r -p "Account to switch to? (1-$count, 'auto', or empty to exit) " choice
+
+  case "$choice" in
+    "") exit 0 ;;
+    auto|a) cmd_auto ;;
+    [0-9]*) _do_rotate "$choice" ;;
+    *) echo "Invalid choice: $choice" ;;
+  esac
+}
+
+# --- Main ---
+
+check_python
+
+case "${1:-}" in
+  version|--version|-v)
+    cmd_version
+    ;;
+  help|--help|-h)
+    cmd_help
+    ;;
+  init)
+    cmd_init
+    ;;
+  status|s)
+    cmd_status
+    ;;
+  check|c)
+    cmd_check
+    ;;
+  auto|a)
+    cmd_auto
+    ;;
+  add)
+    cmd_add
+    ;;
+  remove|rm)
+    cmd_remove "${2:-}"
+    ;;
+  "")
+    cmd_interactive
+    ;;
+  [0-9]*)
+    _do_rotate "$1"
+    ;;
+  *)
+    echo "Unknown command: $1"
+    echo ""
+    cmd_help
+    exit 1
+    ;;
+esac
