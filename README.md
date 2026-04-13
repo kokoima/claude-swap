@@ -37,13 +37,13 @@ Done. New Claude Code sessions will use account 1.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/javierpardo/claude-swap/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kokoima/claude-swap/main/install.sh | sh
 ```
 
 Or clone and install:
 
 ```bash
-git clone https://github.com/javierpardo/claude-swap
+git clone https://github.com/kokoima/claude-swap
 cd claude-swap && make install
 ```
 

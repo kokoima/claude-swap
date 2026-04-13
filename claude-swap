@@ -2,7 +2,7 @@
 #
 # claude-swap — Rotate between multiple Claude Max accounts in Claude Code
 #
-# https://github.com/javierpardo/claude-swap
+# https://github.com/kokoima/claude-swap
 #
 # Usage:
 #   claude-swap              Interactive: status + check + select

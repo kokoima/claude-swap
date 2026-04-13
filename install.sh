@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="https://raw.githubusercontent.com/javierpardo/claude-swap/main"
+REPO="https://raw.githubusercontent.com/kokoima/claude-swap/main"
 INSTALL_DIR="${HOME}/.local/bin"
 
 echo "Installing claude-swap..."
