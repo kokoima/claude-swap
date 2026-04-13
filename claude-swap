@@ -121,6 +121,7 @@ cmd_status() {
   check_store
   python3 - "$STORE" "$CLAUDE_CREDS" "$CLAUDE_JSON" "$IS_MACOS" "$VERSION" <<'PYEOF'
 import json, hashlib, time, os, sys, subprocess, binascii
+from datetime import datetime
 
 store_path = sys.argv[1]
 creds_path = sys.argv[2]
@@ -206,12 +207,12 @@ for i, acc in enumerate(accounts):
     marker = "*" if n == active else " "
     label = acc.get("label", "")[:20]
     email = (acc.get("email") or "-")[:30]
-    days = (acc.get("expires", 0) - now_ms) / 86400000
-    if days > 0:
-        expires = f"{days:.0f}d"
+    exp_ms = acc.get("expires", 0)
+    if exp_ms > now_ms:
+        exp_dt = datetime.fromtimestamp(exp_ms / 1000).strftime("%Y-%m-%d")
     else:
-        expires = "EXPIRED"
-    print(f"  {marker}{n}  {label:<20} {email:<30} {expires}")
+        exp_dt = "EXPIRED"
+    print(f"  {marker}{n}  {label:<20} {email:<30} {exp_dt}")
 PYEOF
 }
 
@@ -277,7 +278,7 @@ for i, acc in enumerate(accounts):
             if u7:
                 util_7d = f"{float(u7)*100:.0f}%"
             if s7 == "allowed_warning":
-                r_status = "OK (warning)"
+                r_status = "OK (7d near limit)"
     except urllib.error.HTTPError as e:
         headers = dict(e.headers)
         try:
@@ -294,12 +295,21 @@ for i, acc in enumerate(accounts):
             util_7d = f"{float(u7)*100:.0f}%"
 
         if et == "rate_limit_error":
-            retry = headers.get("retry-after", "")
-            if retry:
-                mins = int(retry) // 60
-                r_status = f"RATE LIMITED (retry {mins}m)"
-            else:
-                r_status = "RATE LIMITED"
+            reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
+            reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
+            parts = ["RATE LIMITED"]
+            now = datetime.now()
+            for window, reset_ts in [("5h", reset_5h), ("7d", reset_7d)]:
+                if reset_ts:
+                    reset_dt = datetime.fromtimestamp(int(reset_ts))
+                    if reset_dt.date() == now.date():
+                        when = f"today {reset_dt.strftime('%H:%M')}"
+                    elif (reset_dt.date() - now.date()).days == 1:
+                        when = f"tomorrow {reset_dt.strftime('%H:%M')}"
+                    else:
+                        when = reset_dt.strftime("%a %d %H:%M")
+                    parts.append(f"{window} resets {when}")
+            r_status = " | ".join(parts) if len(parts) > 1 else parts[0]
         elif et == "authentication_error":
             r_status = "AUTH ERROR"
         elif et == "overloaded_error":
