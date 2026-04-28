@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -237,6 +237,29 @@ accounts = store.get("accounts", [])
 active = store.get("active", 0)
 local_tz = datetime.now().astimezone().tzinfo
 
+def format_resets(headers):
+    parts = []
+    now = datetime.now()
+    for window, key in [
+        ("5h", "anthropic-ratelimit-unified-5h-reset"),
+        ("7d", "anthropic-ratelimit-unified-7d-reset"),
+    ]:
+        ts = headers.get(key, "")
+        if not ts:
+            continue
+        try:
+            reset_dt = datetime.fromtimestamp(int(ts))
+        except (ValueError, TypeError):
+            continue
+        if reset_dt.date() == now.date():
+            when = f"today {reset_dt.strftime('%H:%M')}"
+        elif (reset_dt.date() - now.date()).days == 1:
+            when = f"tomorrow {reset_dt.strftime('%H:%M')}"
+        else:
+            when = reset_dt.strftime("%a %d %H:%M")
+        parts.append(f"{window} resets {when}")
+    return parts
+
 results = []
 for i, acc in enumerate(accounts):
     n = i + 1
@@ -279,6 +302,9 @@ for i, acc in enumerate(accounts):
                 util_7d = f"{float(u7)*100:.0f}%"
             if s7 == "allowed_warning":
                 r_status = "OK (7d near limit)"
+            resets = format_resets(headers)
+            if resets:
+                r_status = " | ".join([r_status] + resets)
     except urllib.error.HTTPError as e:
         headers = dict(e.headers)
         try:
@@ -295,20 +321,7 @@ for i, acc in enumerate(accounts):
             util_7d = f"{float(u7)*100:.0f}%"
 
         if et == "rate_limit_error":
-            reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
-            reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
-            parts = ["RATE LIMITED"]
-            now = datetime.now()
-            for window, reset_ts in [("5h", reset_5h), ("7d", reset_7d)]:
-                if reset_ts:
-                    reset_dt = datetime.fromtimestamp(int(reset_ts))
-                    if reset_dt.date() == now.date():
-                        when = f"today {reset_dt.strftime('%H:%M')}"
-                    elif (reset_dt.date() - now.date()).days == 1:
-                        when = f"tomorrow {reset_dt.strftime('%H:%M')}"
-                    else:
-                        when = reset_dt.strftime("%a %d %H:%M")
-                    parts.append(f"{window} resets {when}")
+            parts = ["RATE LIMITED"] + format_resets(headers)
             r_status = " | ".join(parts) if len(parts) > 1 else parts[0]
         elif et == "authentication_error":
             r_status = "AUTH ERROR"
