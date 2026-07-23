@@ -109,6 +109,10 @@ claude-swap
 | `claude-swap auto` | Auto-switch to best available account |
 | `claude-swap add` | Add a new account |
 | `claude-swap remove <n>` | Remove an account |
+| `claude-swap auto fable` (or `af`) | Auto-switch using the Fable strategy |
+| `claude-swap watch start [fable\|general]` | Background auto-switcher (rotates at 99%, pre-warns at 95%) |
+| `claude-swap watch stop` | Stop the watcher |
+| `claude-swap watch status` | Watcher state + last probe + log tail |
 | `claude-swap key <n>` | Set claude.ai sessionKey (enables Fable % in check) |
 | `claude-swap keys-sync` | Auto-import sessionKeys from Chrome profiles (by email) |
 | `claude-swap disable <n>` | Mark account as disabled (skipped by check/auto/keys-sync) |
@@ -160,7 +164,35 @@ New Claude Code sessions pick up the change automatically. Existing sessions kee
 
 `claude-swap auto` checks all your accounts against the Anthropic API and picks the one with the lowest 5-hour utilization. If all accounts are rate-limited, it tells you which one unblocks soonest.
 
+`claude-swap auto fable` (alias `af`) instead picks by the Fable strategy: accounts with Fable capacity, soonest weekly renewal first.
+
 The check uses a single minimal Haiku request per account — cheap and fast.
+
+## `watch` mode — automatic switching
+
+```bash
+claude-swap watch start fable     # or: general
+claude-swap watch status
+claude-swap watch stop
+```
+
+A small daemon (plain process + pidfile, log in
+`~/.claude/claude-swap-watch.log`) probes **only the active account** on
+an adaptive schedule — every 10 min below 80%, every 3 min at 80–95%,
+every minute above 95%. Consumption is negligible: one 5-token Haiku
+call per probe, and the Fable check costs zero tokens (claude.ai cookie
+API).
+
+- At **95%** it sends a macOS notification (pre-warning, once per crossing).
+- At **99%** (or on rate-limit) it probes the rest, picks the best target
+  with the chosen strategy (soonest weekly renewal first), rotates, and
+  notifies. If everything is exhausted it tells you and keeps retrying.
+- After rotating it watches the new active account automatically.
+
+The interactive menu (`claude-swap` with no args) shows the watcher
+state and accepts shortcuts: `wf`/`wg` start it (fable/general), `wp`
+stops it, `ws` shows status, `a`/`af` run auto general/fable, and a
+number switches account as usual.
 
 ## Requirements
 

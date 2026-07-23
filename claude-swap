@@ -17,10 +17,13 @@
 
 set -e
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
+WATCH_PID="$HOME/.claude/claude-swap-watch.pid"
+WATCH_LOG="$HOME/.claude/claude-swap-watch.log"
+WATCH_STATE="$HOME/.claude/claude-swap-watch.state"
 IS_MACOS=false
 [ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
 
@@ -60,7 +63,11 @@ cmd_help() {
   echo "  claude-swap <n>          Rotate to account N"
   echo "  claude-swap status       Show current account state"
   echo "  claude-swap check        Status + API rate limit check"
-  echo "  claude-swap auto         Auto-rotate to best available account"
+  echo "  claude-swap auto [fable|general]  Auto-rotate to best available account"
+  echo "  claude-swap af           Alias de 'auto fable'"
+  echo "  claude-swap watch start [fable|general]  Auto-switch en background al 99% (pre-aviso 95%)"
+  echo "  claude-swap watch stop   Parar el watcher"
+  echo "  claude-swap watch status Estado del watcher + log"
   echo "  claude-swap add          Add a new account"
   echo "  claude-swap remove <n>   Remove an account"
   echo "  claude-swap key <n>      Set claude.ai sessionKey (enables Fable % in check)"
@@ -162,6 +169,32 @@ if 1 <= active <= len(accounts):
     print(f"Active: {active} ({acc.get('label', '?')} / {acc.get('email') or '-'})")
 else:
     print(f"Active: none")
+
+# Watcher
+wpid_path = os.path.expanduser("~/.claude/claude-swap-watch.pid")
+wstate_path = os.path.expanduser("~/.claude/claude-swap-watch.state")
+wpid, walive = None, False
+try:
+    wpid = int(open(wpid_path).read().strip())
+    os.kill(wpid, 0)
+    walive = True
+except Exception:
+    pass
+try:
+    ws = json.load(open(wstate_path))
+except Exception:
+    ws = {}
+if walive:
+    parts = [f"ACTIVO ({ws.get('strategy', '?')}, PID {wpid})"]
+    if ws.get("active"):
+        parts.append(f"vigilando #{ws['active']}")
+    if ws.get("last"):
+        parts.append(f"ultima sonda {ws.get('last_time', '?')}: {ws['last']}")
+    print("Watch:  " + " — ".join(parts))
+elif wpid is not None:
+    print(f"Watch:  pidfile huerfano (PID {wpid} muerto) — limpia con 'claude-swap watch stop'")
+else:
+    print("Watch:  inactivo")
 print()
 
 # Keychain check (macOS only)
@@ -563,17 +596,54 @@ PYEOF
 
 cmd_auto() {
   check_store
+  local strategy="${1:-general}"
+  case "$strategy" in
+    fable|general) ;;
+    *) echo "Estrategia invalida: $strategy (usa fable o general)"; exit 1 ;;
+  esac
   local result
-  result=$(python3 - "$STORE" <<'PYEOF'
+  result=$(python3 - "$STORE" "$strategy" <<'PYEOF'
 import json, os, sys, time
 import urllib.request, urllib.error
+from datetime import datetime
 
 store_path = sys.argv[1]
+strategy = sys.argv[2]
 with open(store_path) as f:
     store = json.load(f)
 
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
+
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+
+def fetch_fable(acc):
+    """(% Fable, epoch reset) via claude.ai; (None, None) sin cookie/org."""
+    sk, org = acc.get("session_key"), acc.get("org_id")
+    if not sk or not org:
+        return None, None
+    req = urllib.request.Request(
+        f"https://claude.ai/api/organizations/{org}/usage",
+        headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r)
+        for l in d.get("limits", []):
+            m = (l.get("scope") or {}).get("model") or {}
+            if (m.get("display_name") or "").lower() == "fable":
+                ts = None
+                if l.get("resets_at"):
+                    try:
+                        ts = datetime.fromisoformat(
+                            str(l["resets_at"]).replace("Z", "+00:00")).timestamp()
+                    except (ValueError, TypeError):
+                        pass
+                return l.get("percent"), ts
+    except Exception:
+        pass
+    return None, None
 
 results = []
 for i, acc in enumerate(accounts):
@@ -629,13 +699,30 @@ for i, acc in enumerate(accounts):
     except Exception:
         entry["rate_limited"] = True
 
+    if strategy == "fable" and not entry["rate_limited"]:
+        entry["fable"], entry["rf"] = fetch_fable(acc)
+        time.sleep(1.5)  # claude.ai corta rafagas
     results.append(entry)
-    sys.stderr.write(f"  Checked {n}: {entry['label']:<20} {'RATE LIMITED' if entry['rate_limited'] else 'OK'} (5h={entry['util_5h']*100:.0f}%)\n")
+    extra = ""
+    if strategy == "fable" and entry.get("fable") is not None:
+        extra = f", fable={entry['fable']:.0f}%"
+    sys.stderr.write(f"  Checked {n}: {entry['label']:<20} {'RATE LIMITED' if entry['rate_limited'] else 'OK'} (5h={entry['util_5h']*100:.0f}%{extra})\n")
 
 available = [r for r in results if not r["rate_limited"]]
+if strategy == "fable":
+    available = [r for r in available
+                 if r.get("fable") is None or r["fable"] < 99]
+
+def eta(ts):
+    return ts if ts else float("inf")
 
 if available:
-    available.sort(key=lambda r: (r["util_5h"], r["util_7d"]))
+    if strategy == "fable":
+        # primero la que antes renueva Fable; % solo desempata
+        available.sort(key=lambda r: (eta(r.get("rf")),
+                                      r["fable"] if r.get("fable") is not None else 101))
+    else:
+        available.sort(key=lambda r: (r["util_5h"], r["util_7d"]))
     best = available[0]
     if best["n"] == active:
         sys.stderr.write(f"\n  Already on best account: {best['n']} ({best['label']}, 5h={best['util_5h']*100:.0f}%)\n")
@@ -955,6 +1042,287 @@ if missing:
 PYEOF
 }
 
+# --- Watcher ---
+
+watch_alive() {
+  [ -f "$WATCH_PID" ] || return 1
+  kill -0 "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null
+}
+
+cmd_watch_start() {
+  check_store
+  local strategy="${1:-fable}"
+  case "$strategy" in
+    fable|general) ;;
+    *) echo "Estrategia invalida: $strategy (usa fable o general)"; exit 1 ;;
+  esac
+  if watch_alive; then
+    echo "Watch ya activo (PID $(cat "$WATCH_PID")). Paralo antes con 'claude-swap watch stop'."
+    return
+  fi
+  rm -f "$WATCH_PID"
+  local self
+  self="$(command -v claude-swap || echo "$0")"
+  nohup "$self" watch run "$strategy" >> "$WATCH_LOG" 2>&1 &
+  echo $! > "$WATCH_PID"
+  echo "Watch arrancado — estrategia $strategy, PID $(cat "$WATCH_PID")"
+  echo "  log: $WATCH_LOG"
+  echo "  parar: claude-swap watch stop  (o 'wp' en el interactivo)"
+}
+
+cmd_watch_stop() {
+  if watch_alive; then
+    kill "$(cat "$WATCH_PID")" 2>/dev/null
+    rm -f "$WATCH_PID"
+    echo "Watch detenido."
+  elif [ -f "$WATCH_PID" ]; then
+    rm -f "$WATCH_PID"
+    echo "Habia un pidfile huerfano (proceso ya muerto) — limpiado."
+  else
+    echo "Watch no estaba activo."
+  fi
+}
+
+cmd_watch_status() {
+  if watch_alive; then
+    echo "Watch ACTIVO (PID $(cat "$WATCH_PID"))"
+  elif [ -f "$WATCH_PID" ]; then
+    echo "Watch MUERTO (pidfile huerfano — limpia con 'claude-swap watch stop')"
+  else
+    echo "Watch inactivo."
+  fi
+  if [ -f "$WATCH_STATE" ]; then
+    python3 -c "
+import json
+try:
+    s = json.load(open('$WATCH_STATE'))
+    print(f\"  estrategia {s.get('strategy','?')} · vigilando #{s.get('active','?')} · ultima sonda {s.get('last_time','?')} ({s.get('last','sin datos')})\")
+except Exception:
+    pass"
+  fi
+  if [ -f "$WATCH_LOG" ]; then
+    echo ""
+    echo "Ultimas lineas del log:"
+    tail -5 "$WATCH_LOG" | sed 's/^/  /'
+  fi
+}
+
+cmd_watch_run() {
+  check_store
+  local strategy="${1:-fable}"
+  # exec: el python reemplaza a este bash y conserva su PID — asi el pidfile
+  # que escribe 'watch start' apunta al proceso real y 'watch stop' lo mata
+  exec python3 - "$STORE" "$(command -v claude-swap || echo "$0")" "$strategy" "$WATCH_STATE" <<'PYEOF'
+import json, os, subprocess, sys, time
+import urllib.request, urllib.error
+from datetime import datetime
+
+store_path, self_bin, strategy, state_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+
+def log(msg):
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+def notify(msg):
+    if sys.platform != "darwin":
+        return
+    m = msg.replace('"', "'")
+    subprocess.run(["osascript", "-e",
+                    f'display notification "{m}" with title "claude-swap" sound name "Glass"'],
+                   capture_output=True)
+
+def probe(acc):
+    """Sonda minima Haiku: % de 5h/7d, epoch de resets y rate_limited."""
+    out = {"u5": None, "u7": None, "r7": None, "rate_limited": False, "error": None}
+    if not acc.get("token"):
+        out["error"] = "NO TOKEN"
+        return out
+    data = json.dumps({
+        "model": "claude-haiku-4-5", "max_tokens": 5,
+        "system": "Reply ok.", "messages": [{"role": "user", "content": "ok"}]
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=data,
+        headers={"Authorization": f"Bearer {acc['token']}",
+                 "anthropic-version": "2023-06-01",
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "content-type": "application/json"})
+    def take(headers):
+        u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
+        u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        if u5: out["u5"] = float(u5) * 100
+        if u7: out["u7"] = float(u7) * 100
+        try:
+            out["r7"] = int(headers.get("anthropic-ratelimit-unified-7d-reset", ""))
+        except (ValueError, TypeError):
+            pass
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            take(dict(r.headers))
+    except urllib.error.HTTPError as e:
+        take(dict(e.headers))
+        try:
+            et = json.loads(e.read()).get("error", {}).get("type", "?")
+        except Exception:
+            et = f"HTTP {e.code}"
+        if et == "rate_limit_error":
+            out["rate_limited"] = True
+        else:
+            out["error"] = et
+    except Exception as e:
+        out["error"] = type(e).__name__
+    return out
+
+def fable(acc):
+    """(% Fable, epoch reset) via claude.ai; (None, None) sin cookie/org."""
+    sk, org = acc.get("session_key"), acc.get("org_id")
+    if not sk or not org:
+        return None, None
+    req = urllib.request.Request(
+        f"https://claude.ai/api/organizations/{org}/usage",
+        headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r)
+        for l in d.get("limits", []):
+            m = (l.get("scope") or {}).get("model") or {}
+            if (m.get("display_name") or "").lower() == "fable":
+                ts = None
+                if l.get("resets_at"):
+                    try:
+                        ts = datetime.fromisoformat(
+                            str(l["resets_at"]).replace("Z", "+00:00")).timestamp()
+                    except (ValueError, TypeError):
+                        pass
+                return l.get("percent"), ts
+    except Exception:
+        pass
+    return None, None
+
+def eta(ts):
+    return ts if ts else float("inf")
+
+def choose_target(store, exclude_n):
+    cands = []
+    for i, acc in enumerate(store.get("accounts", [])):
+        n = i + 1
+        if n == exclude_n or acc.get("disabled") or not acc.get("token"):
+            continue
+        p = probe(acc)
+        if p["rate_limited"] or p["error"]:
+            continue
+        fp, fr = (None, None)
+        if strategy == "fable":
+            fp, fr = fable(acc)
+            time.sleep(1.5)  # claude.ai corta rafagas
+            if fp is not None and fp >= 99:
+                continue
+        cands.append({"n": n, "label": acc.get("label") or acc.get("email") or "?",
+                      "u7": p["u7"] or 0, "r7": p["r7"], "fable": fp, "rf": fr})
+    if not cands:
+        return None
+    if strategy == "fable":
+        cands.sort(key=lambda c: (eta(c["rf"]),
+                                  c["fable"] if c["fable"] is not None else 101))
+    else:
+        cands.sort(key=lambda c: (eta(c["r7"]), c["u7"]))
+    return cands[0]
+
+state = {"strategy": strategy, "prewarned": False,
+         "started": datetime.now().isoformat(timespec="seconds")}
+
+def save_state():
+    try:
+        with open(state_path, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+log(f"watch iniciado — estrategia {strategy}, PID {os.getpid()}")
+notify(f"Watch activo (estrategia {strategy})")
+
+while True:
+    try:
+        with open(store_path) as f:
+            store = json.load(f)
+        accounts = store.get("accounts", [])
+        active = store.get("active", 0)
+        if not (1 <= active <= len(accounts)):
+            log("sin cuenta activa valida — reintento en 5 min")
+            time.sleep(300)
+            continue
+        acc = accounts[active - 1]
+        p = probe(acc)
+        metrics = {}
+        if p["u5"] is not None:
+            metrics["5h"] = p["u5"]
+        if p["u7"] is not None:
+            metrics["7d"] = p["u7"]
+        if strategy == "fable":
+            fp, _ = fable(acc)
+            if fp is not None:
+                metrics["Fable"] = float(fp)
+        desc = " · ".join(f"{k} {v:.0f}%" for k, v in metrics.items()) or "sin datos"
+        peak = max(metrics.values()) if metrics else None
+        state.update({"active": active, "last": desc,
+                      "last_time": datetime.now().strftime("%H:%M")})
+        save_state()
+
+        if p["error"]:
+            log(f"#{active} error de sonda: {p['error']} — reintento en 5 min")
+            time.sleep(300)
+            continue
+
+        if p["rate_limited"] or (peak is not None and peak >= 99):
+            reason = "RATE LIMITED" if p["rate_limited"] else desc
+            log(f"#{active} al limite ({reason}) — buscando destino ({strategy})")
+            notify(f"Cuenta #{active} al limite ({reason}). Buscando swap…")
+            target = choose_target(store, active)
+            if target:
+                log(f"rotando #{active} -> #{target['n']} ({target['label']})")
+                r = subprocess.run([self_bin, str(target["n"])],
+                                   capture_output=True, text=True)
+                for line in (r.stdout or r.stderr or "").strip().splitlines():
+                    log(f"  {line.strip()}")
+                if r.returncode == 0:
+                    notify(f"Rotado a #{target['n']} {target['label']}")
+                    state["prewarned"] = False
+                    save_state()
+                    time.sleep(120)
+                else:
+                    log(f"rotacion fallo (rc={r.returncode})")
+                    notify("Fallo al rotar — mira el log del watch")
+                    time.sleep(300)
+            else:
+                log("sin cuentas disponibles — reintento en 10 min")
+                notify("Todas las cuentas al limite — reintento en 10 min")
+                time.sleep(600)
+            continue
+
+        if peak is not None and peak >= 95 and not state.get("prewarned"):
+            notify(f"Cuenta #{active} al {peak:.0f}% ({desc}) — rotare al 99%")
+            log(f"pre-aviso: #{active} {desc}")
+            state["prewarned"] = True
+            save_state()
+        elif peak is not None and peak < 90 and state.get("prewarned"):
+            state["prewarned"] = False
+            save_state()
+
+        interval = 600 if (peak or 0) < 80 else (180 if peak < 95 else 60)
+        log(f"#{active} {desc} — proxima sonda en {interval // 60} min")
+        time.sleep(interval)
+    except KeyboardInterrupt:
+        log("watch detenido")
+        break
+    except Exception as e:
+        log(f"error inesperado: {type(e).__name__}: {e} — reintento en 5 min")
+        time.sleep(300)
+PYEOF
+}
+
 cmd_set_disabled() {
   check_store
   local target="$1" val="$2"
@@ -1040,11 +1408,16 @@ cmd_interactive() {
   local count
   count=$(python3 -c "import json; print(len(json.load(open('$STORE'))['accounts']))")
 
-  read -r -p "Account to switch to? (1-$count, 'auto', or empty to exit) " choice
+  read -r -p "Switch? (1-$count · a=auto · af=auto fable · wf/wg=watch fable/general · wp=parar · ws=estado · Enter=salir) " choice
 
   case "$choice" in
     "") exit 0 ;;
-    auto|a) cmd_auto ;;
+    auto|a) cmd_auto general ;;
+    af) cmd_auto fable ;;
+    wf) cmd_watch_start fable ;;
+    wg) cmd_watch_start general ;;
+    wp) cmd_watch_stop ;;
+    ws) cmd_watch_status ;;
     [0-9]*) _do_rotate "$choice" ;;
     *) echo "Invalid choice: $choice" ;;
   esac
@@ -1071,7 +1444,19 @@ case "${1:-}" in
     cmd_check
     ;;
   auto|a)
-    cmd_auto
+    cmd_auto "${2:-general}"
+    ;;
+  af)
+    cmd_auto fable
+    ;;
+  watch)
+    case "${2:-status}" in
+      start) cmd_watch_start "${3:-fable}" ;;
+      run) cmd_watch_run "${3:-fable}" ;;
+      stop) cmd_watch_stop ;;
+      status) cmd_watch_status ;;
+      *) echo "Usage: claude-swap watch [start [fable|general]|stop|status]"; exit 1 ;;
+    esac
     ;;
   add)
     cmd_add
