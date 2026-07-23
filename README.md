@@ -8,7 +8,7 @@ hit the wall.
 ```
 $ claude-swap check
 
-claude-swap v1.3.1
+claude-swap v1.4.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% · 7d 44% · Fable 65%
