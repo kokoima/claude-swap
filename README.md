@@ -13,23 +13,23 @@ Claude Max subscribers hit rate limits on 5-hour and 7-day windows. If you have 
 ```
 $ claude-swap check
 
-claude-swap v1.2.0
+claude-swap v1.3.1
 
 Active: 2 (Work / me@work.com)
 
- #   Cuenta        Plan    5h           reset   7d           Fable       │  J23    V24    S25    D26    L27    M28    X29    J30
+ #   Account       Plan    5h           reset   7d           Fable       │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
 ─────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
   1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100% │   ·      ·    22:00    ·      ·      ·      ·      ·
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
   3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100% │   ·      ·      ·      ·      ·    17:00    ·      ·
-  4  Old Account   FREE   — desactivada —
+  4  Old Account   FREE   — disabled —
 
-  calendario: hora del reset 7d · Fable si cae en dia distinto   │   barras: <50% verde · 50–80% amarillo · ≥80% rojo
+  calendar: 7d reset time · Fable when it falls on a different day   │   bars: <50% green · 50–80% yellow · ≥80% red
 
-  Estrategia Fable — primero la que antes renueva (excluye rate-limited y Fable 100%)
+  Fable strategy — soonest renewal first (excludes rate-limited and Fable 100%)
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
 
-  Estrategia General 7d — primero la que antes renueva (excluye rate-limited)
+  General 7d strategy — soonest renewal first (excludes rate-limited)
   3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100% │   ·      ·      ·      ·      ·    17:00    ·      ·
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
 
@@ -140,7 +140,7 @@ session:
 PRO / FREE, cached in the store), color bars for 5h / 7d / Fable, the
 exact 5h reset time, and an 8-day calendar with the time each weekly
 limit renews. Below the table, two orderings of the same rows suggest
-swaps: **Estrategia Fable** and **Estrategia General 7d**, both sorted by
+swaps: **Fable strategy** and **General 7d strategy**, both sorted by
 soonest weekly renewal (capacity you burn there is regained first);
 rate-limited and disabled accounts are excluded.
 
@@ -158,7 +158,7 @@ When you run `claude-swap <n>`, it:
 3. Clears `oauthAccount` from `~/.claude.json` (Claude Code repopulates it)
 4. Updates the active account in `~/.claude/claude-swap.json`
 
-New Claude Code sessions pick up the change automatically. Existing sessions keep the old token in memory — close and reopen them to switch.
+New Claude Code sessions pick up the change automatically. Running sessions pick it up as well once they refresh credentials.
 
 ## `auto` mode
 
@@ -214,7 +214,7 @@ checks — never to any third party.
 
 ### Do I need to restart Claude Code?
 
-New sessions automatically use the swapped account. Sessions already running keep their token in memory — close and reopen them.
+No. New sessions automatically use the swapped account, and running sessions pick it up as well once they refresh credentials.
 
 ### What about Linux?
 
