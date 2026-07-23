@@ -75,7 +75,7 @@ Code itself — it works like being logged in, without re-authenticating.
 You need one per account:
 
 ```bash
-claude-swap init        # creates the store and walks you through adding accounts
+claude-swap init        # guided setup: accounts, sessionKeys and watcher
 ```
 
 For **each** account, in another terminal:
@@ -128,6 +128,9 @@ Cookies → `https://claude.ai` → copy the `sessionKey` value (starts with
 ```bash
 claude-swap key <n>
 ```
+
+`init` chains the next two steps for you (cookie scan and watcher) — the
+sections below explain what they do and how to redo them later.
 
 ### 4. First look
 
@@ -216,7 +219,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
 | `claude-swap keys-sync` | Auto-import sessionKeys from Chrome profiles (by email) |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
-| `claude-swap init` | First-time setup |
+| `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
 

@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -125,6 +125,34 @@ with open('$STORE', 'w') as f:
     echo ""
     echo "Account 1 set as active."
     _do_rotate 1
+
+    # --- Onboarding: sessionKeys (Fable % / plan columns) ---
+    echo ""
+    echo "Optional: the Fable % and Plan columns need each account's claude.ai"
+    echo "sessionKey cookie (from a logged-in claude.ai browser session)."
+    if python3 -c "import browser_cookie3" 2>/dev/null; then
+      read -r -p "Scan Chrome profiles for logged-in claude.ai sessions now? (y/n) " sync
+      case "$sync" in
+        [yY]*) echo ""; cmd_keys_sync ;;
+        *) echo "You can do it later with: claude-swap keys-sync" ;;
+      esac
+    else
+      echo ""
+      echo "  Automatic import needs browser_cookie3:"
+      echo "    pip3 install --user browser_cookie3 && claude-swap keys-sync"
+      echo "  Or paste a key manually per account: claude-swap key <n>"
+    fi
+
+    # --- Onboarding: watcher ---
+    echo ""
+    read -r -p "Start the auto-switcher? It rotates at 99% usage, pre-warns at 95% (y/n) " w
+    case "$w" in
+      [yY]*) cmd_watch_start fable ;;
+      *) echo "You can start it later with: claude-swap watch start fable" ;;
+    esac
+
+    echo ""
+    echo "All set. Run 'claude-swap check' to see the dashboard."
   fi
 }
 
