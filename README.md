@@ -5,6 +5,11 @@ dashboard of every account's 5h / 7d / Fable limits, a renewal calendar,
 swap strategies, and an optional watcher that rotates for you before you
 hit the wall.
 
+![claude-swap interactive dashboard](assets/claude-swap-check.png)
+
+<details>
+<summary>Plain-text example</summary>
+
 ```
 $ claude-swap check
 
@@ -29,6 +34,8 @@ Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% �
   3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100% │   ·      ·      ·      ·      ·    17:00    ·      ·
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
 ```
+
+</details>
 
 ## Why
 
