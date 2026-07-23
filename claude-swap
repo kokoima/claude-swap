@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -63,6 +63,10 @@ cmd_help() {
   echo "  claude-swap auto         Auto-rotate to best available account"
   echo "  claude-swap add          Add a new account"
   echo "  claude-swap remove <n>   Remove an account"
+  echo "  claude-swap key <n>      Set claude.ai sessionKey (enables Fable % in check)"
+  echo "  claude-swap keys-sync    Auto-import sessionKeys from Chrome profiles (by email)"
+  echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
+  echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -225,9 +229,9 @@ cmd_check() {
 
 _deep_check() {
   python3 - "$STORE" <<'PYEOF'
-import json, os, sys, time
+import json, os, re, sys, time
 import urllib.request, urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 store_path = sys.argv[1]
 with open(store_path) as f:
@@ -236,35 +240,145 @@ with open(store_path) as f:
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
 local_tz = datetime.now().astimezone().tzinfo
+store_dirty = [False]
 
-def format_resets(headers):
-    parts = []
-    now = datetime.now()
-    for window, key in [
-        ("5h", "anthropic-ratelimit-unified-5h-reset"),
-        ("7d", "anthropic-ratelimit-unified-7d-reset"),
-    ]:
-        ts = headers.get(key, "")
-        if not ts:
-            continue
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+
+def fetch_fable(acc):
+    """Contador semanal propio de Fable via claude.ai (cookie sessionKey).
+
+    Requiere acc['session_key'] (claude-swap key <n> / keys-sync). Devuelve
+    (pct, reset_datetime_local) — cualquiera puede ser None. Los setup-tokens
+    no sirven aqui: /api/oauth/usage exige scope user:profile. claude.ai
+    limita rafagas -> 1 reintento con pausa.
+    """
+    sk = acc.get("session_key")
+    if not sk:
+        return None, None
+    def get(url):
+        req = urllib.request.Request(url, headers={
+            "Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
+            "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)
+    for attempt in range(2):
         try:
-            reset_dt = datetime.fromtimestamp(int(ts))
-        except (ValueError, TypeError):
-            continue
-        if reset_dt.date() == now.date():
-            when = f"today {reset_dt.strftime('%H:%M')}"
-        elif (reset_dt.date() - now.date()).days == 1:
-            when = f"tomorrow {reset_dt.strftime('%H:%M')}"
-        else:
-            when = reset_dt.strftime("%a %d %H:%M")
-        parts.append(f"{window} resets {when}")
-    return parts
+            org = acc.get("org_id")
+            if not org or "plan" not in acc:
+                try:
+                    orgs = get("https://claude.ai/api/organizations")
+                    o = next((o for o in orgs
+                              if "chat" in (o.get("capabilities") or [])),
+                             orgs[0] if orgs else None)
+                    if o:
+                        org = o["uuid"]
+                        acc["org_id"] = org
+                        acc["plan"] = o.get("rate_limit_tier") or ""
+                        store_dirty[0] = True
+                except Exception:
+                    pass  # p.ej. cuentas free devuelven 403 aqui; no rompe el resto
+            if not org:
+                return None, None
+            d = get(f"https://claude.ai/api/organizations/{org}/usage")
+            for l in d.get("limits", []):
+                m = (l.get("scope") or {}).get("model") or {}
+                if (m.get("display_name") or "").lower() == "fable":
+                    return l.get("percent"), parse_iso(l.get("resets_at"))
+            return None, None
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
+    return None, None
+
+def parse_epoch(ts):
+    try:
+        return datetime.fromtimestamp(int(ts))
+    except (ValueError, TypeError):
+        return None
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+# ---------- render: todo el ancho se mide sin ANSI para alinear ----------
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+GREY, RED, GREEN, YELLOW, CYAN, MAG, BOLD = "90", "31", "32", "33", "36", "35", "1"
+TRACK_BG = "48;5;240"  # fondo gris de la barra: rellena tambien el hueco de los
+                       # bloques parciales (▋…), que si no muestran el fondo negro
+
+def paint(code, s):
+    return f"\x1b[{code}m{s}\x1b[0m" if USE_COLOR else s
+
+def vlen(s):
+    return len(_ANSI.sub("", s))
+
+def pad(s, w, right=False):
+    gap = w - vlen(s)
+    if gap <= 0:
+        return s
+    return (" " * gap + s) if right else (s + " " * gap)
+
+def center(s, w):
+    gap = w - vlen(s)
+    if gap <= 0:
+        return s
+    left = gap // 2
+    return " " * left + s + " " * (gap - left)
+
+EIGHTHS = "▏▎▍▌▋▊▉█"
+BAR_W = 6
+
+def threshold_color(p):
+    return GREEN if p < 50 else (YELLOW if p < 80 else RED)
+
+def pct_cell(pct):
+    """Barra de 6 celdas (octavos de bloque) + % alineado a la derecha."""
+    if pct is None:
+        return paint(GREY, "·" * BAR_W + "    -")
+    p = max(0.0, min(100.0, float(pct)))
+    e = round(p / 100 * BAR_W * 8)
+    full, rem = divmod(e, 8)
+    filled = "█" * full + (EIGHTHS[rem - 1] if rem else "")
+    rest = BAR_W - len(filled)
+    col = threshold_color(p)
+    if USE_COLOR:
+        b = (f"\x1b[{col};{TRACK_BG}m{filled}\x1b[0m"
+             + f"\x1b[{TRACK_BG}m{' ' * rest}\x1b[0m")
+    else:
+        b = filled + "░" * rest
+    return b + " " + paint(col, pad(f"{p:.0f}%", 4, right=True))
+
+def reset5_cell(dt):
+    """Hora del reset 5h: HH:MM si es hoy, +HH:MM si manana."""
+    if dt is None:
+        return paint(GREY, pad("-", 6, right=True))
+    prefix = "+" if dt.date() != datetime.now().date() else ""
+    return pad(prefix + dt.strftime("%H:%M"), 6, right=True)
 
 results = []
 for i, acc in enumerate(accounts):
     n = i + 1
+    row = {"n": n, "label": acc.get("label", ""), "error": None,
+           "u5": None, "u7": None, "fable": None, "plan": acc.get("plan"),
+           "r5": None, "r7": None, "rf": None, "disabled": False}
+
+    if acc.get("disabled"):
+        row["disabled"] = True
+        results.append(row)
+        continue
     if not acc.get("token"):
-        results.append({"n": n, "label": acc.get("label", ""), "status": "NO TOKEN"})
+        row["error"] = "NO TOKEN"
+        results.append(row)
         continue
 
     data = json.dumps({
@@ -284,66 +398,166 @@ for i, acc in enumerate(accounts):
         }
     )
 
-    r_status = "?"
-    util_5h = "-"
-    util_7d = "-"
-    detail = ""
+    row["fable"], row["rf"] = fetch_fable(acc)
+    row["plan"] = acc.get("plan")  # fetch_fable puede haberlo cacheado
+
+    def take_limits(headers):
+        u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
+        u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        if u5:
+            row["u5"] = float(u5) * 100
+        if u7:
+            row["u7"] = float(u7) * 100
+        row["r5"] = parse_epoch(headers.get("anthropic-ratelimit-unified-5h-reset"))
+        row["r7"] = parse_epoch(headers.get("anthropic-ratelimit-unified-7d-reset"))
 
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            headers = dict(r.headers)
-            r_status = "OK"
-            u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
-            u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
-            s7 = headers.get("anthropic-ratelimit-unified-7d-status", "")
-            if u5:
-                util_5h = f"{float(u5)*100:.0f}%"
-            if u7:
-                util_7d = f"{float(u7)*100:.0f}%"
-            if s7 == "allowed_warning":
-                r_status = "OK (7d near limit)"
-            resets = format_resets(headers)
-            if resets:
-                r_status = " | ".join([r_status] + resets)
+            take_limits(dict(r.headers))
     except urllib.error.HTTPError as e:
-        headers = dict(e.headers)
+        take_limits(dict(e.headers))
         try:
             body = json.loads(e.read())
             et = body.get("error", {}).get("type", "?")
         except Exception:
             et = f"HTTP {e.code}"
-
-        u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
-        u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
-        if u5:
-            util_5h = f"{float(u5)*100:.0f}%"
-        if u7:
-            util_7d = f"{float(u7)*100:.0f}%"
-
         if et == "rate_limit_error":
-            parts = ["RATE LIMITED"] + format_resets(headers)
-            r_status = " | ".join(parts) if len(parts) > 1 else parts[0]
+            row["error"] = "RATE LIMITED"
         elif et == "authentication_error":
-            r_status = "AUTH ERROR"
+            row["error"] = "AUTH ERROR"
         elif et == "overloaded_error":
-            r_status = "OVERLOADED"
+            row["error"] = "OVERLOADED"
         else:
-            r_status = et
+            row["error"] = et
     except Exception as e:
-        r_status = f"{type(e).__name__}"
+        row["error"] = type(e).__name__
 
-    results.append({
-        "n": n, "label": acc.get("label", ""), "status": r_status,
-        "util_5h": util_5h, "util_7d": util_7d
-    })
+    results.append(row)
 
-print(f"  #  {'Label':<20} {'5h':<6} {'7d':<6} Status")
-for r in results:
-    marker = "*" if r["n"] == active else " "
-    label = r["label"][:20]
-    u5 = r.get("util_5h", "-")
-    u7 = r.get("util_7d", "-")
-    print(f"  {marker}{r['n']}  {label:<20} {u5:<6} {u7:<6} {r['status']}")
+if store_dirty[0]:
+    with open(store_path, "w") as f:
+        json.dump(store, f, indent=2)
+
+# ---------- tabla ----------
+
+W_N = 3
+# Cuenta a lo ancho del label mas largo (el usuario quiere el nombre completo)
+W_LB = max([14] + [len(a.get("label", "")) for a in accounts if len(a.get("label", "")) <= 40])
+W_PL = 6            # plan: MAX20X / MAX5X / PRO / FREE
+W_BAR = BAR_W + 5   # barra + espacio + "100%"
+W_RST = 6
+NCAL, CW = 8, 7     # hoy..+7: el reset 7d puede caer justo a 7 dias
+DAY_INITIALS = "LMXJVSD"
+
+def plan_cell(tier):
+    if tier is None:
+        return paint(GREY, pad("?", W_PL))
+    t = tier.lower()
+    if "max_20x" in t:
+        return paint(CYAN, pad("MAX20X", W_PL))
+    if "max_5x" in t:
+        return paint(CYAN, pad("MAX5X", W_PL))
+    if "pro" in t:
+        return paint(GREEN, pad("PRO", W_PL))
+    if "free" in t or t in ("", "default_claude_ai"):
+        return paint(GREY, pad("FREE", W_PL))
+    return paint(GREY, pad(trunc(tier.replace("default_claude_", ""), W_PL), W_PL))
+
+today = datetime.now().date()
+cal_days = [today + timedelta(days=k) for k in range(NCAL)]
+
+def trunc(s, w):
+    return s if len(s) <= w else s[:w - 1] + "…"
+
+def day_slot(dt):
+    if dt is None:
+        return None
+    k = (dt.date() - today).days
+    return k if 0 <= k < NCAL else None
+
+def left_part(*cells):
+    return "  ".join(cells) + " "
+
+header = left_part(
+    pad(" #", W_N), pad("Cuenta", W_LB), pad("Plan", W_PL),
+    pad("5h", W_BAR), pad("reset", W_RST),
+    pad("7d", W_BAR), pad("Fable", W_BAR))
+cal_header = "".join(center(f"{DAY_INITIALS[d.weekday()]}{d.day}", CW) for d in cal_days)
+split = vlen(header)
+
+print(paint(BOLD, header) + "│" + paint(BOLD, cal_header))
+print("─" * split + "┼" + "─" * (NCAL * CW))
+
+def render_row(row):
+    marker = "*" if row["n"] == active else " "
+    num = pad(f"{marker}{row['n']}", W_N, right=True)
+    name = trunc(row["label"], W_LB)
+
+    if row["disabled"]:
+        return (left_part(paint(GREY, num), paint(GREY, pad(name, W_LB)),
+                          plan_cell(row["plan"]))
+                + paint(GREY, "— desactivada —"))
+
+    if row["error"] == "RATE LIMITED":
+        num, name_cell = paint(RED, num), paint(RED, pad(name, W_LB))
+    else:
+        name_cell = pad(name, W_LB)
+
+    # celda del calendario = hora del reset semanal en el dia que cae:
+    # amarillo = reset 7d; magenta = reset Fable solo si cae en dia distinto
+    cells = {}
+    s7 = day_slot(row["r7"])
+    sf = day_slot(row["rf"])
+    if s7 is not None:
+        cells[s7] = paint(YELLOW, row["r7"].strftime("%H:%M"))
+    if sf is not None and sf != s7:
+        cells[sf] = paint(MAG, row["rf"].strftime("%H:%M"))
+    cal = "".join(center(cells.get(k, paint(GREY, "·")), CW) for k in range(NCAL))
+
+    line = left_part(
+        num, name_cell, plan_cell(row["plan"]),
+        pct_cell(row["u5"]), reset5_cell(row["r5"]),
+        pct_cell(row["u7"]), pct_cell(row["fable"])) + "│" + cal
+
+    if row["error"] and row["error"] != "RATE LIMITED":
+        line += "  " + paint(RED, row["error"])
+    return line
+
+for row in results:
+    print(render_row(row))
+
+print()
+print("  calendario: hora del reset " + paint(YELLOW, "7d") + " · "
+      + paint(MAG, "Fable") + " si cae en dia distinto"
+      + paint(GREY, "   │   barras: <50% verde · 50–80% amarillo · ≥80% rojo"))
+
+# ---------- estrategia de swaps: misma tabla, reordenada ----------
+# Prioridad: consumir antes la cuenta cuyo limite semanal antes renueva
+# (lo gastado vuelve antes); el % solo desempata.
+
+usable = [r for r in results if not r["disabled"] and r["error"] is None]
+
+def eta(dt):
+    return dt.timestamp() if dt else float("inf")
+
+fable_rows = sorted(
+    [r for r in usable if isinstance(r["fable"], (int, float)) and r["fable"] < 100],
+    key=lambda r: (eta(r["rf"]), r["fable"]))
+gen_rows = sorted(
+    [r for r in usable if r["u5"] is not None],
+    key=lambda r: (eta(r["r7"]), r["u7"] or 0))
+
+for title, rows in [("Estrategia Fable", fable_rows),
+                    ("Estrategia General 7d", gen_rows)]:
+    print()
+    print(paint(BOLD, f"  {title}")
+          + paint(GREY, " — primero la que antes renueva (excluye rate-limited"
+                        + (" y Fable 100%)" if "Fable" in title else ")")))
+    if not rows:
+        print(paint(GREY, "    ninguna cuenta disponible"))
+    else:
+        for r in rows:
+            print(render_row(r))
 PYEOF
 }
 
@@ -364,7 +578,7 @@ active = store.get("active", 0)
 results = []
 for i, acc in enumerate(accounts):
     n = i + 1
-    if not acc.get("token"):
+    if not acc.get("token") or acc.get("disabled"):
         continue
 
     data = json.dumps({
@@ -593,6 +807,180 @@ print(len(d['accounts']))
   echo "Account $count added (expires in 365d)"
 }
 
+cmd_key() {
+  check_store
+  local target="$1"
+  [ -n "$target" ] || { echo "Usage: claude-swap key <n>"; exit 1; }
+
+  echo "Pega el sessionKey de claude.ai de esa cuenta."
+  echo "  (Chrome logueado en claude.ai > DevTools > Application > Cookies"
+  echo "   > https://claude.ai > sessionKey — empieza por sk-ant-sid)"
+  echo ""
+  local sk
+  read -r -p "sessionKey: " sk
+  case "$sk" in
+    sk-ant-sid*) ;;
+    *) echo "Error: debe empezar por 'sk-ant-sid'"; exit 1 ;;
+  esac
+
+  python3 - "$STORE" "$target" "$sk" <<'PYEOF'
+import json, sys
+store_path, target, sk = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(store_path) as f:
+    d = json.load(f)
+accounts = d.get("accounts", [])
+if target < 1 or target > len(accounts):
+    print(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
+    sys.exit(1)
+acc = accounts[target - 1]
+acc["session_key"] = sk
+acc.pop("org_id", None)  # se recachea en el proximo check
+with open(store_path, "w") as f:
+    json.dump(d, f, indent=2)
+print(f"sessionKey guardado para cuenta {target} ({acc.get('label','?')}).")
+print("El proximo 'claude-swap check' mostrara el % de Fable real.")
+PYEOF
+}
+
+cmd_keys_sync() {
+  check_store
+  python3 - "$STORE" <<'PYEOF'
+import json, sys, os, glob, shutil, tempfile, urllib.request, urllib.error
+
+try:
+    import browser_cookie3
+except ImportError:
+    print("Falta browser_cookie3. Instala con:  pip3 install --user browser_cookie3")
+    sys.exit(1)
+
+def read_session_key(db):
+    """Lee sessionKey de un Cookies de Chrome via copia temporal (DB+WAL).
+
+    Chrome mantiene la DB bloqueada y las escrituras recientes en el WAL;
+    leer el fichero en vivo falla de forma intermitente y pierde cookies
+    recien escritas. La copia incluye -wal/-shm para que sqlite lo replaye.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        shutil.copy(db, os.path.join(tmp, "Cookies"))
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(db + ext):
+                shutil.copy(db + ext, os.path.join(tmp, "Cookies") + ext)
+        cj = browser_cookie3.chrome(domain_name="claude.ai",
+                                    cookie_file=os.path.join(tmp, "Cookies"))
+        return next((c.value for c in cj if c.name == "sessionKey"), None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+store_path = sys.argv[1]
+with open(store_path) as f:
+    store = json.load(f)
+accounts = store.get("accounts", [])
+
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+
+def get(url, sk):
+    req = urllib.request.Request(url, headers={
+        "Cookie": f"sessionKey={sk}", "User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.load(r)
+
+bases = [
+    os.path.expanduser("~/Library/Application Support/Google/Chrome"),  # macOS
+    os.path.expanduser("~/.config/google-chrome"),                      # Linux
+]
+
+print("Escaneando perfiles de Chrome...")
+seen = {}  # email -> (session_key, profile)
+for base in bases:
+    for db in sorted(glob.glob(os.path.join(base, "*", "Cookies"))):
+        prof = os.path.basename(os.path.dirname(db))
+        try:
+            sk = read_session_key(db)
+            if not sk:
+                continue
+            try:
+                boot = get("https://claude.ai/api/bootstrap", sk)
+                email = (boot.get("account") or {}).get("email_address")
+            except urllib.error.HTTPError as e:
+                print(f"  {prof}: sessionKey CADUCADA (HTTP {e.code}) — re-loguea claude.ai en ese perfil")
+                continue
+            except Exception as e:
+                print(f"  {prof}: error {type(e).__name__}")
+                continue
+            if email:
+                tier = None
+                for m in (boot.get("account") or {}).get("memberships") or []:
+                    o = m.get("organization") or {}
+                    if "chat" in (o.get("capabilities") or []):
+                        tier = o.get("rate_limit_tier") or ""
+                        break
+                seen[email.lower()] = (sk, prof, tier)
+                print(f"  {prof}: {email} OK")
+        except Exception as e:
+            print(f"  {prof}: extraccion fallida ({type(e).__name__})")
+
+print()
+updated = 0
+for i, acc in enumerate(accounts):
+    if acc.get("disabled"):
+        continue
+    em = (acc.get("email") or "").lower()
+    if em and em in seen:
+        sk, prof, tier = seen[em]
+        if tier is not None and acc.get("plan") != tier:
+            acc["plan"] = tier
+            updated += 1
+        if acc.get("session_key") != sk:
+            acc["session_key"] = sk
+            acc.pop("org_id", None)
+            updated += 1
+            print(f"  Cuenta {i+1} ({em}): sessionKey actualizada (desde {prof})")
+        else:
+            print(f"  Cuenta {i+1} ({em}): ya al dia")
+
+if updated:
+    with open(store_path, "w") as f:
+        json.dump(store, f, indent=2)
+
+missing = [f"{i+1} ({acc.get('email') or acc.get('label') or '?'})"
+           for i, acc in enumerate(accounts)
+           if not acc.get("session_key") and not acc.get("disabled")]
+if missing:
+    print()
+    print("Sin sessionKey (loguea claude.ai en un perfil de Chrome y repite, o usa 'claude-swap key <n>'):")
+    for m in missing:
+        print(f"  - {m}")
+PYEOF
+}
+
+cmd_set_disabled() {
+  check_store
+  local target="$1" val="$2"
+  [ -n "$target" ] || { echo "Usage: claude-swap $3 <n>"; exit 1; }
+
+  python3 - "$STORE" "$target" "$val" <<'PYEOF'
+import json, sys
+store_path, target, val = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+with open(store_path) as f:
+    d = json.load(f)
+accounts = d.get("accounts", [])
+if target < 1 or target > len(accounts):
+    print(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
+    sys.exit(1)
+acc = accounts[target - 1]
+if val:
+    acc["disabled"] = True
+else:
+    acc.pop("disabled", None)
+with open(store_path, "w") as f:
+    json.dump(d, f, indent=2)
+who = acc.get("label") or acc.get("email") or "?"
+print(f"Cuenta {target} ({who}) {'desactivada: check/auto/keys-sync la saltaran' if val else 'reactivada'}.")
+PYEOF
+}
+
 cmd_remove() {
   check_store
   local target="$1"
@@ -690,6 +1078,18 @@ case "${1:-}" in
     ;;
   remove|rm)
     cmd_remove "${2:-}"
+    ;;
+  key)
+    cmd_key "${2:-}"
+    ;;
+  keys-sync|ks)
+    cmd_keys_sync
+    ;;
+  disable)
+    cmd_set_disabled "${2:-}" 1 disable
+    ;;
+  enable)
+    cmd_set_disabled "${2:-}" 0 enable
     ;;
   "")
     cmd_interactive
