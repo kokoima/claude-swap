@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -1024,6 +1024,12 @@ for base in bases:
             except Exception as e:
                 print(f"  {prof}: error {type(e).__name__}")
                 continue
+            # An expired cookie does not always 401/403: claude.ai also answers 200
+            # with an anonymous bootstrap (account: null). Without this branch the
+            # profile would drop out of the report silently.
+            if not email:
+                print(f"  {prof}: sessionKey EXPIRED (anonymous session) — log claude.ai back in on that profile")
+                continue
             if email:
                 tier = None
                 for m in (boot.get("account") or {}).get("memberships") or []:
@@ -1059,13 +1065,25 @@ if updated:
     with open(store_path, "w") as f:
         json.dump(store, f, indent=2)
 
-missing = [f"{i+1} ({acc.get('email') or acc.get('label') or '?'})"
-           for i, acc in enumerate(accounts)
-           if not acc.get("session_key") and not acc.get("disabled")]
+def _who(i, acc):
+    return f"{i+1} ({acc.get('email') or acc.get('label') or '?'})"
+
+live = [(i, acc) for i, acc in enumerate(accounts) if not acc.get("disabled")]
+missing = [_who(i, acc) for i, acc in live if not acc.get("session_key")]
+# A stored key nobody re-confirmed this scan is the silent failure case: it stays
+# in the store looking configured while claude.ai already rejects it.
+stale = [_who(i, acc) for i, acc in live
+         if acc.get("session_key") and (acc.get("email") or "").lower() not in seen]
+
 if missing:
     print()
     print("No sessionKey (log claude.ai in on a Chrome profile and re-run, or use 'claude-swap key <n>'):")
     for m in missing:
+        print(f"  - {m}")
+if stale:
+    print()
+    print("Stored sessionKey NOT confirmed (no logged-in Chrome profile for it — it may be expired):")
+    for m in stale:
         print(f"  - {m}")
 PYEOF
 }

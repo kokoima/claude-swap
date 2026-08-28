@@ -124,7 +124,9 @@ logged-in claude.ai session. Two ways to feed it:
 
 Cookies expire every few weeks. When the Fable column shows `-`, log
 claude.ai back in on that Chrome profile and run `keys-sync` again — it
-reports which sessions are `EXPIRED` and which accounts it updated.
+reports which sessions are `EXPIRED` and which accounts it updated, plus
+any account whose stored cookie no logged-in profile backs any more (the
+usual sign that the one in the store has quietly expired).
 
 **Option B — manual: DevTools**
 
