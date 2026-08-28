@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -960,7 +960,7 @@ PYEOF
 cmd_keys_sync() {
   check_store
   python3 - "$STORE" <<'PYEOF'
-import json, sys, os, glob, shutil, tempfile, urllib.request, urllib.error
+import json, sys, os, glob, shutil, tempfile, time, urllib.request, urllib.error
 
 try:
     import browser_cookie3
@@ -1001,6 +1001,27 @@ def get(url, sk):
     with urllib.request.urlopen(req, timeout=12) as r:
         return json.load(r)
 
+def identify(sk):
+    """(bootstrap payload, failure reason) — exactly one of the two is set.
+
+    claude.ai throttles bursts with a 403 that looks exactly like an expired
+    cookie, and one scan makes a call per Chrome profile, so back off and
+    retry before writing a live session off as dead.
+    """
+    reason = None
+    for attempt in range(3):
+        try:
+            return get("https://claude.ai/api/bootstrap", sk), None
+        except urllib.error.HTTPError as e:
+            reason = f"HTTP {e.code}"
+            if e.code not in (403, 429):
+                break
+        except Exception as e:
+            reason = type(e).__name__
+        if attempt < 2:
+            time.sleep(5 * (attempt + 1))
+    return None, reason
+
 bases = [
     os.path.expanduser("~/Library/Application Support/Google/Chrome"),  # macOS
     os.path.expanduser("~/.config/google-chrome"),                      # Linux
@@ -1015,30 +1036,26 @@ for base in bases:
             sk = read_session_key(db)
             if not sk:
                 continue
-            try:
-                boot = get("https://claude.ai/api/bootstrap", sk)
-                email = (boot.get("account") or {}).get("email_address")
-            except urllib.error.HTTPError as e:
-                print(f"  {prof}: sessionKey EXPIRED (HTTP {e.code}) — log claude.ai back in on that profile")
+            boot, reason = identify(sk)
+            if reason:
+                print(f"  {prof}: could not read session ({reason} after retries) — expired cookie, or claude.ai still throttling")
                 continue
-            except Exception as e:
-                print(f"  {prof}: error {type(e).__name__}")
-                continue
+            email = (boot.get("account") or {}).get("email_address")
             # An expired cookie does not always 401/403: claude.ai also answers 200
             # with an anonymous bootstrap (account: null). Without this branch the
             # profile would drop out of the report silently.
             if not email:
                 print(f"  {prof}: sessionKey EXPIRED (anonymous session) — log claude.ai back in on that profile")
                 continue
-            if email:
-                tier = None
-                for m in (boot.get("account") or {}).get("memberships") or []:
-                    o = m.get("organization") or {}
-                    if "chat" in (o.get("capabilities") or []):
-                        tier = o.get("rate_limit_tier") or ""
-                        break
-                seen[email.lower()] = (sk, prof, tier)
-                print(f"  {prof}: {email} OK")
+            time.sleep(1)  # space out the scan so claude.ai does not start 403ing
+            tier = None
+            for m in (boot.get("account") or {}).get("memberships") or []:
+                o = m.get("organization") or {}
+                if "chat" in (o.get("capabilities") or []):
+                    tier = o.get("rate_limit_tier") or ""
+                    break
+            seen[email.lower()] = (sk, prof, tier)
+            print(f"  {prof}: {email} OK")
         except Exception as e:
             print(f"  {prof}: extraction failed ({type(e).__name__})")
 
