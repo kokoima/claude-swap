@@ -17,7 +17,7 @@
 
 set -e
 
-VERSION="1.4.2"
+VERSION="1.5.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -62,7 +62,7 @@ cmd_help() {
   echo "  claude-swap              Interactive: status + check + select"
   echo "  claude-swap <n>          Rotate to account N"
   echo "  claude-swap status       Show current account state"
-  echo "  claude-swap check        Status + API rate limit check"
+  echo "  claude-swap check        Status + usage dashboard (all accounts, 0 tokens)"
   echo "  claude-swap auto [fable|general]  Auto-rotate to best available account"
   echo "  claude-swap af           Alias for 'auto fable'"
   echo "  claude-swap watch start [fable|general]  Background auto-switch at 99% (pre-warning at 95%)"
@@ -70,13 +70,18 @@ cmd_help() {
   echo "  claude-swap watch status Watcher status + log"
   echo "  claude-swap add          Add a new account"
   echo "  claude-swap remove <n>   Remove an account"
-  echo "  claude-swap key <n>      Set claude.ai sessionKey (enables Fable % in check)"
+  echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/Fable for that account)"
   echo "  claude-swap keys-sync    Auto-import sessionKeys from Chrome profiles (by email)"
   echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
   echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
+  echo ""
+  echo "  Usage figures come from claude.ai with the stored sessionKey: one"
+  echo "  free request per account carries 5h, 7d and every per-model window."
+  echo "  Accounts with no valid cookie fall back to a billed probe that"
+  echo "  reports 5h/7d only, so keep the cookies fresh with keys-sync."
 }
 
 cmd_init() {
@@ -306,23 +311,27 @@ store_dirty = [False]
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
-def fetch_fable(acc):
-    """Fable's own weekly counter via claude.ai (sessionKey cookie).
+def fetch_web_usage(acc):
+    """Full usage snapshot from claude.ai (sessionKey cookie).
 
-    Needs acc['session_key'] (claude-swap key <n> / keys-sync). Returns
-    (pct, reset_datetime_local) — either may be None. Setup tokens are no
-    use here: /api/oauth/usage requires the user:profile scope. claude.ai
-    throttles bursts -> 1 retry with a pause.
+    Primary source for every window: one request, zero tokens. Returns a
+    dict with u5/u7/fable percentages and their reset times, or None when
+    the account has no cookie or the call fails (caller falls back to the
+    ratelimit headers). /api/oauth/usage is not an option: it demands the
+    user:profile scope that `claude setup-token` does not mint, and it
+    rate-limits an hour at a time. claude.ai throttles bursts -> 1 retry.
     """
     sk = acc.get("session_key")
     if not sk:
-        return None, None
+        return None
+
     def get(url):
         req = urllib.request.Request(url, headers={
             "Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
             "Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.load(r)
+
     for attempt in range(2):
         try:
             org = acc.get("org_id")
@@ -340,17 +349,27 @@ def fetch_fable(acc):
                 except Exception:
                     pass  # e.g. free accounts return 403 here; don't break the rest
             if not org:
-                return None, None
+                return None
             d = get(f"https://claude.ai/api/organizations/{org}/usage")
+            out = {"u5": None, "r5": None, "u7": None, "r7": None,
+                   "fable": None, "rf": None}
+            for key, pk, rk in (("five_hour", "u5", "r5"),
+                                ("seven_day", "u7", "r7")):
+                w = d.get(key) or {}
+                out[pk] = w.get("utilization")
+                out[rk] = parse_iso(w.get("resets_at"))
+            # Model-scoped weekly windows come as a list tagged by display
+            # name, so a new model with its own quota appears on its own.
             for l in d.get("limits", []):
                 m = (l.get("scope") or {}).get("model") or {}
                 if (m.get("display_name") or "").lower() == "fable":
-                    return l.get("percent"), parse_iso(l.get("resets_at"))
-            return None, None
+                    out["fable"] = l.get("percent")
+                    out["rf"] = parse_iso(l.get("resets_at"))
+            return out
         except Exception:
             if attempt == 0:
                 time.sleep(2)
-    return None, None
+    return None
 
 def parse_epoch(ts):
     try:
@@ -365,7 +384,11 @@ def parse_iso(s):
         dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
         if dt.tzinfo:
             dt = dt.astimezone().replace(tzinfo=None)
-        return dt
+        # claude.ai returns ...:59.75, which would print as 21:59 where the
+        # ratelimit headers printed 22:00. Round to the minute so both
+        # sources render the same clock time.
+        dt += timedelta(seconds=30)
+        return dt.replace(second=0, microsecond=0)
     except (ValueError, TypeError):
         return None
 
@@ -431,7 +454,8 @@ for i, acc in enumerate(accounts):
     n = i + 1
     row = {"n": n, "label": acc.get("label", ""), "error": None,
            "u5": None, "u7": None, "fable": None, "plan": acc.get("plan"),
-           "r5": None, "r7": None, "rf": None, "disabled": False}
+           "r5": None, "r7": None, "rf": None, "disabled": False,
+           "src": None}
 
     if acc.get("disabled"):
         row["disabled"] = True
@@ -442,6 +466,22 @@ for i, acc in enumerate(accounts):
         results.append(row)
         continue
 
+    web = fetch_web_usage(acc)
+    row["plan"] = acc.get("plan")  # fetch_web_usage may have just cached it
+    if web:
+        row["fable"], row["rf"] = web["fable"], web["rf"]
+
+    # The cookie carries every window in one free request, so the billed
+    # probe below only runs when it came back empty (no cookie, expired,
+    # or a plan with no 5h window).
+    if web and web["u5"] is not None:
+        row["u5"], row["r5"] = web["u5"], web["r5"]
+        row["u7"], row["r7"] = web["u7"], web["r7"]
+        row["src"] = "web"
+        results.append(row)
+        continue
+
+    row["src"] = "hdr"
     data = json.dumps({
         "model": "claude-haiku-4-5",
         "max_tokens": 5,
@@ -458,9 +498,6 @@ for i, acc in enumerate(accounts):
             "content-type": "application/json"
         }
     )
-
-    row["fable"], row["rf"] = fetch_fable(acc)
-    row["plan"] = acc.get("plan")  # fetch_fable may have just cached it
 
     def take_limits(headers):
         u5 = headers.get("anthropic-ratelimit-unified-5h-utilization")
@@ -498,6 +535,25 @@ for i, acc in enumerate(accounts):
 if store_dirty[0]:
     with open(store_path, "w") as f:
         json.dump(store, f, indent=2)
+
+# ---------- cache for read-only consumers (statusline) ----------
+# Written atomically so a half-written file never reaches a reader that
+# runs on every prompt. A failure here must never break the dashboard.
+try:
+    cache_path = os.path.expanduser("~/.claude/claude-swap-usage.json")
+    snapshot = {
+        "updated": time.time(),
+        "active": active,
+        "accounts": [{k: r.get(k) for k in
+                      ("n", "label", "u5", "u7", "fable",
+                       "plan", "error", "disabled", "src")}
+                     for r in results],
+    }
+    with open(cache_path + ".tmp", "w") as f:
+        json.dump(snapshot, f)
+    os.replace(cache_path + ".tmp", cache_path)
+except Exception:
+    pass
 
 # ---------- tabla ----------
 
@@ -646,32 +702,48 @@ active = store.get("active", 0)
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
-def fetch_fable(acc):
-    """(Fable %, reset epoch) via claude.ai; (None, None) without cookie/org."""
+def fetch_web_usage(acc):
+    """Full usage snapshot via claude.ai; None without cookie/org or on error.
+
+    Percentages are 0-100 and resets are epoch seconds, which is what the
+    rest of this rotation pass expects. One request replaces both the
+    billed ratelimit probe and the old Fable-only call.
+    """
     sk, org = acc.get("session_key"), acc.get("org_id")
     if not sk or not org:
-        return None, None
+        return None
     req = urllib.request.Request(
         f"https://claude.ai/api/organizations/{org}/usage",
         headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
                  "Accept": "application/json"})
+
+    def epoch(v):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(
+                str(v).replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            return None
+
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.load(r)
-        for l in d.get("limits", []):
-            m = (l.get("scope") or {}).get("model") or {}
-            if (m.get("display_name") or "").lower() == "fable":
-                ts = None
-                if l.get("resets_at"):
-                    try:
-                        ts = datetime.fromisoformat(
-                            str(l["resets_at"]).replace("Z", "+00:00")).timestamp()
-                    except (ValueError, TypeError):
-                        pass
-                return l.get("percent"), ts
     except Exception:
-        pass
-    return None, None
+        return None
+    out = {"u5": None, "r5": None, "u7": None, "r7": None,
+           "fable": None, "rf": None}
+    for key, pk, rk in (("five_hour", "u5", "r5"),
+                        ("seven_day", "u7", "r7")):
+        w = d.get(key) or {}
+        out[pk] = w.get("utilization")
+        out[rk] = epoch(w.get("resets_at"))
+    for l in d.get("limits", []):
+        m = (l.get("scope") or {}).get("model") or {}
+        if (m.get("display_name") or "").lower() == "fable":
+            out["fable"] = l.get("percent")
+            out["rf"] = epoch(l.get("resets_at"))
+    return out
 
 results = []
 for i, acc in enumerate(accounts):
@@ -679,6 +751,33 @@ for i, acc in enumerate(accounts):
     if not acc.get("token") or acc.get("disabled"):
         continue
 
+    entry = {"n": n, "label": acc.get("label", ""), "rate_limited": False,
+             "util_5h": 1.0, "util_7d": 1.0, "retry_after": 999999}
+
+    # Cookie first: one free request carries 5h, 7d and Fable at once.
+    web = fetch_web_usage(acc)
+    if web and web["u5"] is not None:
+        entry["util_5h"] = web["u5"] / 100.0
+        entry["util_7d"] = (web["u7"] or 0) / 100.0
+        entry["fable"], entry["rf"] = web["fable"], web["rf"]
+        # A window at 100% is spent, which is what rate_limited means here.
+        for pct, reset in ((web["u5"], web["r5"]), (web["u7"], web["r7"])):
+            if pct is not None and pct >= 100:
+                entry["rate_limited"] = True
+                if reset:
+                    entry["retry_after"] = min(entry["retry_after"],
+                                               max(0, int(reset - time.time())))
+        results.append(entry)
+        sys.stderr.write(
+            f"  Checked {n}: {entry['label']:<20} "
+            f"{'SPENT' if entry['rate_limited'] else 'OK'} "
+            f"(5h={entry['util_5h']*100:.0f}%"
+            + (f", fable={entry['fable']:.0f}%" if entry.get("fable") is not None else "")
+            + ")\n")
+        time.sleep(1.2)  # claude.ai throttles bursts
+        continue
+
+    # No cookie, or a plan with no 5h window: fall back to the billed probe.
     data = json.dumps({
         "model": "claude-haiku-4-5",
         "max_tokens": 5,
@@ -695,9 +794,6 @@ for i, acc in enumerate(accounts):
             "content-type": "application/json"
         }
     )
-
-    entry = {"n": n, "label": acc.get("label", ""), "rate_limited": False,
-             "util_5h": 1.0, "util_7d": 1.0, "retry_after": 999999}
 
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -728,7 +824,9 @@ for i, acc in enumerate(accounts):
         entry["rate_limited"] = True
 
     if strategy == "fable" and not entry["rate_limited"]:
-        entry["fable"], entry["rf"] = fetch_fable(acc)
+        w = fetch_web_usage(acc)
+        if w:
+            entry["fable"], entry["rf"] = w["fable"], w["rf"]
         time.sleep(1.5)  # claude.ai throttles bursts
     results.append(entry)
     extra = ""
@@ -1184,6 +1282,7 @@ store_path, self_bin, strategy, state_path = sys.argv[1], sys.argv[2], sys.argv[
 
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+CACHE_PATH = os.path.expanduser("~/.claude/claude-swap-usage.json")
 
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
@@ -1196,12 +1295,64 @@ def notify(msg):
                     f'display notification "{m}" with title "claude-swap" sound name "Glass"'],
                    capture_output=True)
 
+def web_usage(acc):
+    """5h/7d/Fable via claude.ai in one free request; None on failure."""
+    sk, org = acc.get("session_key"), acc.get("org_id")
+    if not sk or not org:
+        return None
+    req = urllib.request.Request(
+        f"https://claude.ai/api/organizations/{org}/usage",
+        headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
+                 "Accept": "application/json"})
+
+    def epoch(v):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(
+                str(v).replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None}
+    five, seven = d.get("five_hour") or {}, d.get("seven_day") or {}
+    out["u5"], out["u7"] = five.get("utilization"), seven.get("utilization")
+    out["r7"] = epoch(seven.get("resets_at"))
+    for l in d.get("limits", []):
+        m = (l.get("scope") or {}).get("model") or {}
+        if (m.get("display_name") or "").lower() == "fable":
+            out["fable"] = l.get("percent")
+            out["rf"] = epoch(l.get("resets_at"))
+    return out
+
 def probe(acc):
-    """Minimal Haiku probe: 5h/7d %, reset epochs and rate_limited flag."""
-    out = {"u5": None, "u7": None, "r7": None, "rate_limited": False, "error": None}
+    """5h/7d/Fable %, 7d reset epoch and rate_limited flag.
+
+    Reads claude.ai with the stored cookie, which costs nothing and brings
+    every window back at once. Only when that is unavailable does it fall
+    back to the billed Haiku call, which yields no Fable figure.
+    """
+    out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None,
+           "rate_limited": False, "error": None, "src": None}
     if not acc.get("token"):
         out["error"] = "NO TOKEN"
         return out
+
+    w = web_usage(acc)
+    if w and w["u5"] is not None:
+        out.update(w)
+        out["src"] = "web"
+        # A window at 100% is spent, which is what rate_limited means here.
+        if (w["u5"] or 0) >= 100 or (w["u7"] or 0) >= 100:
+            out["rate_limited"] = True
+        return out
+
+    out["src"] = "hdr"
     data = json.dumps({
         "model": "claude-haiku-4-5", "max_tokens": 5,
         "system": "Reply ok.", "messages": [{"role": "user", "content": "ok"}]
@@ -1238,60 +1389,57 @@ def probe(acc):
         out["error"] = type(e).__name__
     return out
 
-def fable(acc):
-    """(Fable %, reset epoch) via claude.ai; (None, None) without cookie/org."""
-    sk, org = acc.get("session_key"), acc.get("org_id")
-    if not sk or not org:
-        return None, None
-    req = urllib.request.Request(
-        f"https://claude.ai/api/organizations/{org}/usage",
-        headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
-                 "Accept": "application/json"})
+def probe_all(store):
+    """Probe every enabled account and publish the snapshot for the statusline."""
+    rows = []
+    for i, acc in enumerate(store.get("accounts", [])):
+        n = i + 1
+        if acc.get("disabled") or not acc.get("token"):
+            rows.append({"n": n, "label": acc.get("label", ""), "u5": None,
+                         "u7": None, "r7": None, "fable": None, "rf": None,
+                         "rate_limited": False, "plan": acc.get("plan"),
+                         "error": None, "disabled": bool(acc.get("disabled")),
+                         "src": None})
+            continue
+        r = probe(acc)
+        r.update({"n": n, "label": acc.get("label") or acc.get("email") or "?",
+                  "plan": acc.get("plan"), "disabled": False})
+        rows.append(r)
+        time.sleep(1.2)  # claude.ai throttles bursts
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            d = json.load(r)
-        for l in d.get("limits", []):
-            m = (l.get("scope") or {}).get("model") or {}
-            if (m.get("display_name") or "").lower() == "fable":
-                ts = None
-                if l.get("resets_at"):
-                    try:
-                        ts = datetime.fromisoformat(
-                            str(l["resets_at"]).replace("Z", "+00:00")).timestamp()
-                    except (ValueError, TypeError):
-                        pass
-                return l.get("percent"), ts
+        snapshot = {"updated": time.time(), "active": store.get("active", 0),
+                    "accounts": [{k: r.get(k) for k in
+                                  ("n", "label", "u5", "u7", "fable",
+                                   "plan", "error", "disabled", "src")}
+                                 for r in rows]}
+        with open(CACHE_PATH + ".tmp", "w") as f:
+            json.dump(snapshot, f)
+        os.replace(CACHE_PATH + ".tmp", CACHE_PATH)
     except Exception:
-        pass
-    return None, None
+        pass  # the watch must never die because the cache could not be written
+    return rows
 
 def eta(ts):
     return ts if ts else float("inf")
 
-def choose_target(store, exclude_n):
+def choose_target(rows, exclude_n):
+    """Best target among the accounts already probed this cycle."""
     cands = []
-    for i, acc in enumerate(store.get("accounts", [])):
-        n = i + 1
-        if n == exclude_n or acc.get("disabled") or not acc.get("token"):
+    for r in rows:
+        if r["n"] == exclude_n or r["disabled"] or r["error"]:
             continue
-        p = probe(acc)
-        if p["rate_limited"] or p["error"]:
+        if r["rate_limited"] or r["u5"] is None:
             continue
-        fp, fr = (None, None)
-        if strategy == "fable":
-            fp, fr = fable(acc)
-            time.sleep(1.5)  # claude.ai throttles bursts
-            if fp is not None and fp >= 99:
-                continue
-        cands.append({"n": n, "label": acc.get("label") or acc.get("email") or "?",
-                      "u7": p["u7"] or 0, "r7": p["r7"], "fable": fp, "rf": fr})
+        if strategy == "fable" and r["fable"] is not None and r["fable"] >= 99:
+            continue
+        cands.append(r)
     if not cands:
         return None
     if strategy == "fable":
         cands.sort(key=lambda c: (eta(c["rf"]),
                                   c["fable"] if c["fable"] is not None else 101))
     else:
-        cands.sort(key=lambda c: (eta(c["r7"]), c["u7"]))
+        cands.sort(key=lambda c: (eta(c["r7"]), c["u7"] or 0))
     return cands[0]
 
 state = {"strategy": strategy, "prewarned": False,
@@ -1317,17 +1465,20 @@ while True:
             log("no valid active account — retrying in 5 min")
             time.sleep(300)
             continue
-        acc = accounts[active - 1]
-        p = probe(acc)
+        # Every account is probed each cycle: reading claude.ai costs
+        # nothing, it keeps the statusline cache honest for all of them,
+        # and a rotation can then pick a target without probing again.
+        rows = probe_all(store)
+        p = next((r for r in rows if r["n"] == active),
+                 {"u5": None, "u7": None, "fable": None,
+                  "rate_limited": False, "error": "NOT FOUND"})
         metrics = {}
         if p["u5"] is not None:
             metrics["5h"] = p["u5"]
         if p["u7"] is not None:
             metrics["7d"] = p["u7"]
-        if strategy == "fable":
-            fp, _ = fable(acc)
-            if fp is not None:
-                metrics["Fable"] = float(fp)
+        if p.get("fable") is not None:
+            metrics["Fable"] = float(p["fable"])
         desc = " · ".join(f"{k} {v:.0f}%" for k, v in metrics.items()) or "no data"
         peak = max(metrics.values()) if metrics else None
         state.update({"active": active, "last": desc,
@@ -1343,7 +1494,7 @@ while True:
             reason = "RATE LIMITED" if p["rate_limited"] else desc
             log(f"#{active} at the limit ({reason}) — picking a target ({strategy})")
             notify(f"Account #{active} at the limit ({reason}). Looking for a swap…")
-            target = choose_target(store, active)
+            target = choose_target(rows, active)
             if target:
                 log(f"rotating #{active} -> #{target['n']} ({target['label']})")
                 r = subprocess.run([self_bin, str(target["n"])],

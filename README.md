@@ -13,7 +13,7 @@ hit the wall.
 ```
 $ claude-swap check
 
-claude-swap v1.4.0
+claude-swap v1.5.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% · 7d 44% · Fable 65%
@@ -55,7 +55,7 @@ when the active account runs dry.
 - **Python 3** (pre-installed on macOS)
 - **Claude Code** installed
 - One or more **Claude Max** accounts
-- Optional, for the Fable % / plan columns via Chrome:
+- Recommended, so the dashboard reads your usage for free (see below):
   `pip3 install --user browser_cookie3`
 
 ---
@@ -98,12 +98,25 @@ login replaces the previous one — that's fine, the tokens keep working).
 When you're done, `claude-swap 1` (or any number) to settle on the
 account you want active.
 
-### 3. Enable the Fable % and plan columns (sessionKeys)
+### 3. Free usage readings (sessionKeys)
 
-The Anthropic API only exposes the unified 5h/7d windows. The per-model
-**Fable weekly counter** and your **subscription tier** come from
-claude.ai's own web API, which needs the `sessionKey` cookie of a
-logged-in claude.ai session. Two ways to feed it:
+Every figure in the dashboard — the 5h and 7d windows, each per-model
+weekly counter such as **Fable**, and your **subscription tier** — comes
+from claude.ai's own web API in a single request per account, which
+needs the `sessionKey` cookie of a logged-in claude.ai session. That
+request costs **no tokens**.
+
+An account with no valid cookie falls back to a minimal billed API call
+that reads the rate-limit response headers. It still yields 5h and 7d,
+but no per-model counter, and it spends a handful of tokens per check.
+So cookies are what make the dashboard both complete and free.
+
+> Don't bother with `api.anthropic.com/api/oauth/usage`: it requires the
+> `user:profile` scope that `claude setup-token` does not mint, and it
+> answers `429` with an hour-long `retry-after` even for a token that
+> does carry the scope.
+
+Two ways to feed the cookie:
 
 **Option A — automatic, recommended: Chrome profiles + `keys-sync`**
 
@@ -122,7 +135,8 @@ logged-in claude.ai session. Two ways to feed it:
    the first run may trigger a Keychain prompt ("Chrome Safe Storage") —
    that's browser_cookie3 decrypting Chrome's cookies; allow it.
 
-Cookies expire every few weeks. When the Fable column shows `-`, log
+Cookies expire every few weeks. When a row falls back to `-` columns or
+stops showing its per-model counter, log
 claude.ai back in on that Chrome profile and run `keys-sync` again — it
 reports which sessions are `EXPIRED` and which accounts it updated, plus
 any account whose stored cookie no logged-in profile backs any more (the
@@ -177,7 +191,8 @@ stop watcher, `ws` = watcher status, Enter = exit.
 - **Plan** — subscription tier (MAX20X / MAX5X / PRO / FREE), cached in
   the store, refreshed by `keys-sync`.
 - **5h / 7d / Fable** — color bars: green <50%, yellow 50–80%, red ≥80%.
-  `-` means no data (usually an expired sessionKey for Fable).
+  `-` means no data: an expired sessionKey, or a plan with no such
+  window.
 - **reset** — exact time the 5h window resets (`+HH:MM` = tomorrow).
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
@@ -196,8 +211,10 @@ claude-swap watch stop
 ```
 
 A small daemon (plain process + pidfile, log in
-`~/.claude/claude-swap-watch.log`) probes **only the active account** on
-an adaptive schedule — every 10 min below 80%, every 3 min at 80–95%,
+`~/.claude/claude-swap-watch.log`) probes **every account** each cycle,
+which is free over the cookie, so a rotation can pick its target from
+figures it already has. The active account sets the pace on an adaptive
+schedule — every 10 min below 80%, every 3 min at 80–95%,
 every minute above 95%. Consumption is negligible: one ~5-token Haiku
 call per probe, and the Fable check costs zero tokens (claude.ai cookie
 API).
@@ -262,6 +279,7 @@ Everything lives locally under `~/.claude/`:
 |------|----------|
 | `claude-swap.json` | Accounts: labels, emails, setup tokens, sessionKeys, cached org/plan (`600` perms) |
 | `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe, log |
+| `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages and labels only, no credentials — meant for read-only consumers such as a status line |
 
 Tokens are only ever sent to `api.anthropic.com`; sessionKeys only to
 `claude.ai`. Nothing goes to any third party.
