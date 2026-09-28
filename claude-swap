@@ -10,6 +10,7 @@
 #   claude-swap status       Show current account state
 #   claude-swap check        Status + API rate limit check
 #   claude-swap auto         Auto-rotate to best available account
+#   claude-swap reset <n>    Spend account N's free limit reset
 #   claude-swap add          Add a new account
 #   claude-swap remove <n>   Remove an account
 #   claude-swap init         First-time setup
@@ -17,7 +18,7 @@
 
 set -e
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -68,6 +69,7 @@ cmd_help() {
   echo "  claude-swap watch start [fable|general]  Background auto-switch at 99% (pre-warning at 95%)"
   echo "  claude-swap watch stop   Stop the watcher"
   echo "  claude-swap watch status Watcher status + log"
+  echo "  claude-swap reset <n>    Spend account N's free limit reset (asks first; cannot be undone)"
   echo "  claude-swap add          Add a new account"
   echo "  claude-swap remove <n>   Remove an account"
   echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/Fable for that account)"
@@ -82,6 +84,9 @@ cmd_help() {
   echo "  free request per account carries 5h, 7d and every per-model window."
   echo "  Accounts with no valid cookie fall back to a billed probe that"
   echo "  reports 5h/7d only, so keep the cookies fresh with keys-sync."
+  echo ""
+  echo "  The same request reports free limit resets (the Rst column), which"
+  echo "  Anthropic grants now and then and which empty the 5h and 7d windows."
 }
 
 cmd_init() {
@@ -315,11 +320,12 @@ def fetch_web_usage(acc):
     """Full usage snapshot from claude.ai (sessionKey cookie).
 
     Primary source for every window: one request, zero tokens. Returns a
-    dict with u5/u7/fable percentages and their reset times, or None when
-    the account has no cookie or the call fails (caller falls back to the
-    ratelimit headers). /api/oauth/usage is not an option: it demands the
-    user:profile scope that `claude setup-token` does not mint, and it
-    rate-limits an hour at a time. claude.ai throttles bursts -> 1 retry.
+    dict with u5/u7/fable percentages, their reset times and the free
+    limit resets, or None when the account has no cookie or the call fails
+    (caller falls back to the ratelimit headers). /api/oauth/usage is not
+    an option: it demands the user:profile scope that `claude setup-token`
+    does not mint, and it rate-limits an hour at a time. claude.ai
+    throttles bursts -> 1 retry.
     """
     sk = acc.get("session_key")
     if not sk:
@@ -332,27 +338,42 @@ def fetch_web_usage(acc):
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.load(r)
 
+    def refresh_org():
+        """Cache the chat org and its plan, noting a plan that changed."""
+        try:
+            orgs = get("https://claude.ai/api/organizations")
+        except Exception:
+            return  # e.g. free accounts return 403 here; don't break the rest
+        o = next((o for o in orgs if "chat" in (o.get("capabilities") or [])),
+                 orgs[0] if orgs else None)
+        if not o:
+            return
+        old, new = acc.get("plan"), o.get("rate_limit_tier") or ""
+        if old is not None and old != new:
+            plan_changes.append((acc, old, new))
+        acc.update({"org_id": o["uuid"], "plan": new,
+                    "plan_checked": int(time.time())})
+        store_dirty[0] = True
+
+    def plan_age():
+        return time.time() - acc.get("plan_checked", 0)
+
     for attempt in range(2):
         try:
+            if not acc.get("org_id") or "plan" not in acc or plan_age() > PLAN_TTL:
+                refresh_org()
             org = acc.get("org_id")
-            if not org or "plan" not in acc:
-                try:
-                    orgs = get("https://claude.ai/api/organizations")
-                    o = next((o for o in orgs
-                              if "chat" in (o.get("capabilities") or [])),
-                             orgs[0] if orgs else None)
-                    if o:
-                        org = o["uuid"]
-                        acc["org_id"] = org
-                        acc["plan"] = o.get("rate_limit_tier") or ""
-                        store_dirty[0] = True
-                except Exception:
-                    pass  # e.g. free accounts return 403 here; don't break the rest
             if not org:
                 return None
-            d = get(f"https://claude.ai/api/organizations/{org}/usage")
+            d = get(f"https://claude.ai/api/organizations/{org}/{USAGE_QS}")
+            # A plan that contradicts the reply (usage windows on a free
+            # plan, none on a paid one) changed since it was cached.
+            has_windows = bool(d.get("five_hour") or d.get("limits"))
+            if has_windows == is_free(acc.get("plan")) and plan_age() > 3600:
+                refresh_org()
             out = {"u5": None, "r5": None, "u7": None, "r7": None,
-                   "fable": None, "rf": None}
+                   "fable": None, "rf": None,
+                   "resets": parse_resets(d.get("cedar_ember"))}
             for key, pk, rk in (("five_hour", "u5", "r5"),
                                 ("seven_day", "u7", "r7")):
                 w = d.get(key) or {}
@@ -370,6 +391,42 @@ def fetch_web_usage(acc):
             if attempt == 0:
                 time.sleep(2)
     return None
+
+# cedar_ember=1 makes the reply carry the free limit resets ("cedar_ember"
+# is their codename; plain /usage leaves the block null). skip_spend=1 drops
+# the billing blocks, which nothing here reads. The windows are unchanged.
+USAGE_QS = "usage?cedar_ember=1&skip_spend=1"
+
+# The plan is re-read daily, which is what catches MAX20X -> MAX5X (both
+# keep every window); a drop to FREE shows sooner, as a contradiction.
+PLAN_TTL = 86400
+plan_changes = []  # (account, old tier, new tier) seen during this check
+
+def is_free(tier):
+    t = (tier or "").lower()
+    return "free" in t or t in ("", "default_claude_ai")
+
+def parse_resets(ce):
+    """Free limit resets from the cedar_ember block; None if it was absent.
+
+    left counts the unspent resets across live grants and ends is the
+    earliest expiry among them. Paused or expired grants do not count.
+    """
+    if not isinstance(ce, dict):
+        return None
+    out = {"eligible": ce.get("eligible") is True,
+           "reason": ce.get("ineligible_reason"), "left": 0, "ends": None}
+    now = datetime.now()
+    for g in ce.get("grants") or []:
+        if not isinstance(g, dict) or g.get("paused"):
+            continue
+        left, ends = g.get("resets_left"), parse_iso(g.get("ends_at"))
+        if not isinstance(left, int) or left <= 0 or (ends and ends <= now):
+            continue
+        out["left"] += left
+        if ends and (out["ends"] is None or ends < out["ends"]):
+            out["ends"] = ends
+    return out
 
 def parse_epoch(ts):
     try:
@@ -455,7 +512,7 @@ for i, acc in enumerate(accounts):
     row = {"n": n, "label": acc.get("label", ""), "error": None,
            "u5": None, "u7": None, "fable": None, "plan": acc.get("plan"),
            "r5": None, "r7": None, "rf": None, "disabled": False,
-           "src": None}
+           "src": None, "resets": None}
 
     if acc.get("disabled"):
         row["disabled"] = True
@@ -470,6 +527,7 @@ for i, acc in enumerate(accounts):
     row["plan"] = acc.get("plan")  # fetch_web_usage may have just cached it
     if web:
         row["fable"], row["rf"] = web["fable"], web["rf"]
+        row["resets"] = web["resets"]
 
     # The cookie carries every window in one free request, so the billed
     # probe below only runs when it came back empty (no cookie, expired,
@@ -539,15 +597,20 @@ if store_dirty[0]:
 # ---------- cache for read-only consumers (statusline) ----------
 # Written atomically so a half-written file never reaches a reader that
 # runs on every prompt. A failure here must never break the dashboard.
+def cache_row(r):
+    c = {k: r.get(k) for k in ("n", "label", "u5", "u7", "fable",
+                               "plan", "error", "disabled", "src")}
+    res = r.get("resets")
+    c["resets"] = res["left"] if res else None
+    c["resets_ends"] = res["ends"].timestamp() if res and res["ends"] else None
+    return c
+
 try:
     cache_path = os.path.expanduser("~/.claude/claude-swap-usage.json")
     snapshot = {
         "updated": time.time(),
         "active": active,
-        "accounts": [{k: r.get(k) for k in
-                      ("n", "label", "u5", "u7", "fable",
-                       "plan", "error", "disabled", "src")}
-                     for r in results],
+        "accounts": [cache_row(r) for r in results],
     }
     with open(cache_path + ".tmp", "w") as f:
         json.dump(snapshot, f)
@@ -563,22 +626,39 @@ W_LB = max([14] + [len(a.get("label", "")) for a in accounts if len(a.get("label
 W_PL = 6            # plan: MAX20X / MAX5X / PRO / FREE
 W_BAR = BAR_W + 5   # bar + space + "100%"
 W_RST = 6
+W_RS = 3            # free limit resets left
 NCAL, CW = 8, 7     # today..+7: the 7d reset can fall exactly 7 days out
 DAY_NAMES = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 
-def plan_cell(tier):
+def plan_name(tier):
+    """(short name, colour) for a rate_limit_tier."""
     if tier is None:
-        return paint(GREY, pad("?", W_PL))
+        return "?", GREY
     t = tier.lower()
     if "max_20x" in t:
-        return paint(CYAN, pad("MAX20X", W_PL))
+        return "MAX20X", CYAN
     if "max_5x" in t:
-        return paint(CYAN, pad("MAX5X", W_PL))
+        return "MAX5X", CYAN
     if "pro" in t:
-        return paint(GREEN, pad("PRO", W_PL))
-    if "free" in t or t in ("", "default_claude_ai"):
-        return paint(GREY, pad("FREE", W_PL))
-    return paint(GREY, pad(trunc(tier.replace("default_claude_", ""), W_PL), W_PL))
+        return "PRO", GREEN
+    if is_free(t):
+        return "FREE", GREY
+    return trunc(tier.replace("default_claude_", ""), W_PL), GREY
+
+def plan_cell(tier):
+    name, col = plan_name(tier)
+    return paint(col, pad(name, W_PL))
+
+def resets_cell(res):
+    """Green count = resets waiting; 0 = all spent; - = none offered;
+    ? = unknown, because only a working cookie can read them."""
+    if res is None:
+        return paint(GREY, pad("?", W_RS, right=True))
+    if not res["eligible"]:
+        return paint(GREY, pad("-", W_RS, right=True))
+    if res["left"] <= 0:
+        return paint(GREY, pad("0", W_RS, right=True))
+    return paint(GREEN, pad(str(res["left"]), W_RS, right=True))
 
 today = datetime.now().date()
 cal_days = [today + timedelta(days=k) for k in range(NCAL)]
@@ -598,7 +678,7 @@ def left_part(*cells):
 header = left_part(
     pad(" #", W_N), pad("Account", W_LB), pad("Plan", W_PL),
     pad("5h", W_BAR), pad("reset", W_RST),
-    pad("7d", W_BAR), pad("Fable", W_BAR))
+    pad("7d", W_BAR), pad("Fable", W_BAR), pad("Rst", W_RS, right=True))
 cal_header = "".join(center(f"{DAY_NAMES[d.weekday()]}{d.day}", CW) for d in cal_days)
 split = vlen(header)
 
@@ -634,7 +714,8 @@ def render_row(row):
     line = left_part(
         num, name_cell, plan_cell(row["plan"]),
         pct_cell(row["u5"]), reset5_cell(row["r5"]),
-        pct_cell(row["u7"]), pct_cell(row["fable"])) + "│" + cal
+        pct_cell(row["u7"]), pct_cell(row["fable"]),
+        resets_cell(row["resets"])) + "│" + cal
 
     if row["error"] and row["error"] != "RATE LIMITED":
         line += "  " + paint(RED, row["error"])
@@ -646,7 +727,40 @@ for row in results:
 print()
 print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
       + paint(MAG, "Fable") + " when it falls on a different day"
-      + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"))
+      + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
+                    "   │   Rst: free limit resets left (? = no valid cookie)"))
+
+for acc, old, new in plan_changes:
+    n = next(i for i, a in enumerate(accounts, 1) if a is acc)
+    (o, oc), (w, wc) = plan_name(old), plan_name(new)
+    print("  " + paint(YELLOW, "Plan changed: ")
+          + f"#{n} {acc.get('label', '?')} " + paint(oc, o) + " → " + paint(wc, w))
+
+# ---------- free limit resets: who holds one and when it lapses ----------
+# The weekly renewal never moves, so a reset is worth most on an account at
+# its limit with days still to go; the line only says what is there.
+held = [r for r in results if r["resets"] and r["resets"]["left"] > 0
+        and not r["disabled"]]
+if held:
+    def lapse(dt):
+        if dt is None:
+            return "no expiry"
+        hours = (dt - datetime.now()).total_seconds() / 3600
+        col = RED if hours < 24 else (YELLOW if hours < 72 else GREY)
+        return paint(col, "until " + dt.strftime("%a %d %b %H:%M"))
+    def short(label):
+        # 'Cuenta 3 (Gmail)' -> 'Gmail': the part in brackets names it best
+        m = re.search(r"\(([^()]+)\)\s*$", label or "")
+        return trunc(m.group(1).strip() if m else (label or "?"), 18)
+    ends = {r["resets"]["ends"] for r in held}
+    shared = len(ends) == 1
+    who = ", ".join(
+        f"#{r['n']} {short(r['label'])} ×{r['resets']['left']}"
+        + ("" if shared else " " + lapse(r["resets"]["ends"]))
+        for r in held)
+    print("  " + paint(GREEN, "Free limit resets: ") + who
+          + (" · " + lapse(next(iter(ends))) if shared else "")
+          + paint(GREY, " · spend one: claude-swap reset <n>"))
 
 # ---------- swap strategies: same table, reordered ----------
 # Priority: consume first the account whose weekly limit renews soonest
@@ -712,8 +826,9 @@ def fetch_web_usage(acc):
     sk, org = acc.get("session_key"), acc.get("org_id")
     if not sk or not org:
         return None
+    # cedar_ember=1 also brings the free limit resets (see _deep_check)
     req = urllib.request.Request(
-        f"https://claude.ai/api/organizations/{org}/usage",
+        f"https://claude.ai/api/organizations/{org}/usage?cedar_ember=1&skip_spend=1",
         headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
                  "Accept": "application/json"})
 
@@ -731,8 +846,12 @@ def fetch_web_usage(acc):
             d = json.load(r)
     except Exception:
         return None
+    ce = d.get("cedar_ember") or {}
     out = {"u5": None, "r5": None, "u7": None, "r7": None,
-           "fable": None, "rf": None}
+           "fable": None, "rf": None,
+           "resets": sum(g.get("resets_left") or 0
+                         for g in ce.get("grants") or []
+                         if ce.get("eligible") and not g.get("paused"))}
     for key, pk, rk in (("five_hour", "u5", "r5"),
                         ("seven_day", "u7", "r7")):
         w = d.get(key) or {}
@@ -760,6 +879,7 @@ for i, acc in enumerate(accounts):
         entry["util_5h"] = web["u5"] / 100.0
         entry["util_7d"] = (web["u7"] or 0) / 100.0
         entry["fable"], entry["rf"] = web["fable"], web["rf"]
+        entry["resets"] = web["resets"]
         # A window at 100% is spent, which is what rate_limited means here.
         for pct, reset in ((web["u5"], web["r5"]), (web["u7"], web["r7"])):
             if pct is not None and pct >= 100:
@@ -862,6 +982,10 @@ else:
     mins = soonest["retry_after"] // 60
     sys.stderr.write(f"\n  All accounts rate limited.\n")
     sys.stderr.write(f"  Account {soonest['n']} ({soonest['label']}) unblocks soonest (retry in {mins}m)\n")
+    for r in results:
+        if r.get("resets"):
+            sys.stderr.write(f"  Account {r['n']} ({r['label']}) holds a free limit reset: "
+                             f"claude-swap reset {r['n']}\n")
     print("BLOCKED")
 PYEOF
   )
@@ -1165,23 +1289,41 @@ for i, acc in enumerate(accounts):
     em = (acc.get("email") or "").lower()
     if em and em in seen:
         sk, prof, tier = seen[em]
+        notes = []
         if tier is not None and acc.get("plan") != tier:
+            notes.append(f"plan {acc.get('plan') or '?'} -> {tier}")
             acc["plan"] = tier
+            acc["plan_checked"] = int(time.time())
             updated += 1
         if acc.get("session_key") != sk:
             acc["session_key"] = sk
             acc.pop("org_id", None)
             updated += 1
-            print(f"  Account {i+1} ({em}): sessionKey updated (from {prof})")
-        else:
-            print(f"  Account {i+1} ({em}): up to date")
+            notes.append(f"sessionKey updated (from {prof})")
+        print(f"  Account {i+1} ({em}): " + (", ".join(notes) or "up to date"))
 
 if updated:
     with open(store_path, "w") as f:
         json.dump(store, f, indent=2)
 
+def chrome_profile(email):
+    """Chrome profile named after this email: where to log claude.ai back in."""
+    for base in bases:
+        try:
+            with open(os.path.join(base, "Local State")) as f:
+                info = json.load(f)["profile"]["info_cache"]
+        except Exception:
+            continue
+        for prof, p in sorted(info.items()):
+            if email and email.lower() in ((p.get("user_name") or "").lower(),
+                                           (p.get("name") or "").lower()):
+                return prof
+    return None
+
 def _who(i, acc):
-    return f"{i+1} ({acc.get('email') or acc.get('label') or '?'})"
+    prof = chrome_profile(acc.get("email"))
+    return (f"{i+1} ({acc.get('email') or acc.get('label') or '?'})"
+            + (f" — log claude.ai in on Chrome '{prof}'" if prof else ""))
 
 live = [(i, acc) for i, acc in enumerate(accounts) if not acc.get("disabled")]
 missing = [_who(i, acc) for i, acc in live if not acc.get("session_key")]
@@ -1200,6 +1342,222 @@ if stale:
     print("Stored sessionKey NOT confirmed (no logged-in Chrome profile for it — it may be expired):")
     for m in stale:
         print(f"  - {m}")
+PYEOF
+}
+
+# --- Free limit resets ---
+
+cmd_reset() {
+  check_store
+  local target="$1"
+  case "$target" in
+    ''|*[!0-9]*) echo "Usage: claude-swap reset <n>"; exit 1 ;;
+  esac
+
+  local grant
+  grant=$(_reset_run inspect "$target") || exit 1
+  echo ""
+  read -r -p "Spend it now? This cannot be undone. Type 'yes' to confirm: " confirm
+  if [ "$confirm" != "yes" ]; then
+    echo "Cancelled — the reset is still there."
+    return
+  fi
+  _reset_run claim "$target" "$grant"
+}
+
+_reset_run() {
+  # inspect: describe the reset the server would spend next and print its
+  #          grant id on stdout (everything else goes to stderr).
+  # claim:   spend that grant, then re-read claude.ai to report the outcome.
+  python3 - "$STORE" "$@" <<'PYEOF'
+import json, os, sys, time, uuid
+import urllib.request, urllib.error
+from datetime import datetime
+
+store_path, mode, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
+grant_id = sys.argv[4] if len(sys.argv) > 4 else None
+
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+CACHE_PATH = os.path.expanduser("~/.claude/claude-swap-usage.json")
+WINDOW_NAMES = {"five_hour": "5h", "seven_day": "7d",
+                "seven_day_overage_included": "7d overage-included (tracks Fable)",
+                "seven_day_opus": "7d Opus", "seven_day_sonnet": "7d Sonnet"}
+
+def say(msg=""):
+    sys.stderr.write(msg + "\n")
+
+def fail(msg):
+    say(msg)
+    sys.exit(1)
+
+with open(store_path) as f:
+    store = json.load(f)
+accounts = store.get("accounts", [])
+if not 1 <= target <= len(accounts):
+    fail(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
+acc = accounts[target - 1]
+who = f"#{target} {acc.get('label') or acc.get('email') or '?'}"
+sk, org = acc.get("session_key"), acc.get("org_id")
+if not sk or not org:
+    fail(f"{who} has no claude.ai sessionKey or org cached — run "
+         "'claude-swap keys-sync' and then 'claude-swap check'.")
+
+HEADERS = {"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
+           "Accept": "application/json"}
+BASE = f"https://claude.ai/api/organizations/{org}"
+
+def local(iso):
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone()
+    except (ValueError, TypeError):
+        return None
+
+def fmt(dt):
+    return dt.strftime("%a %d %b %H:%M") if dt else "?"
+
+def until(dt):
+    s = max(0, int((dt - datetime.now().astimezone()).total_seconds()))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f"{d}d {h}h" if d else (f"{h}h {m}m" if h else f"{m}m")
+
+def read_usage():
+    req = urllib.request.Request(f"{BASE}/usage?cedar_ember=1&skip_spend=1",
+                                 headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+def windows(d):
+    fable = next((l.get("percent") for l in d.get("limits", [])
+                  if (((l.get("scope") or {}).get("model") or {})
+                      .get("display_name") or "").lower() == "fable"), None)
+    return ((d.get("five_hour") or {}).get("utilization"),
+            (d.get("seven_day") or {}), fable)
+
+def pct(v):
+    return "-" if v is None else f"{v:.0f}%"
+
+def resets_left(d, gid=None):
+    ce = d.get("cedar_ember") or {}
+    return sum(g.get("resets_left") or 0 for g in ce.get("grants") or []
+               if gid is None or g.get("id") == gid)
+
+def usage_or_fail():
+    try:
+        return read_usage()
+    except urllib.error.HTTPError as e:
+        fail(f"claude.ai answered HTTP {e.code} for {who} — a free plan (no usage"
+             " limits to reset) or an expired sessionKey ('claude-swap keys-sync').")
+    except Exception as e:
+        fail(f"Could not reach claude.ai ({type(e).__name__}).")
+
+if mode == "inspect":
+    d = usage_or_fail()
+    ce = d.get("cedar_ember")
+    if not isinstance(ce, dict):
+        fail(f"claude.ai did not report limit resets for {who}.")
+    if not ce.get("eligible"):
+        fail(f"{who} is not offered limit resets "
+             f"(claude.ai: {ce.get('ineligible_reason') or 'no reason given'}).")
+    cooldown = local(ce.get("cooldown_until"))
+    if cooldown and cooldown > datetime.now().astimezone():
+        fail(f"{who}: resets are cooling down until {fmt(cooldown)}.")
+    gid = ce.get("next_grant_id")
+    grant = next((g for g in ce.get("grants") or [] if g.get("id") == gid), None)
+    if grant is None:
+        if resets_left(d) == 0:
+            fail(f"{who} has no free limit resets left.")
+        fail(f"{who} holds a reset, but claude.ai says none can be spent right "
+             "now (some only work once the account is at a limit).")
+
+    u5, seven, fable = windows(d)
+    u7, r7 = seven.get("utilization"), local(seven.get("resets_at"))
+    clears = [WINDOW_NAMES.get(c, c) for c in grant.get("clears") or []]
+    say(f"Free limit reset — {who}")
+    say(f"  {grant.get('label') or gid}")
+    say(f"  Left:   {grant.get('resets_left')} of {grant.get('resets_total')}"
+        f" · lapses {fmt(local(grant.get('ends_at')))}")
+    say(f"  Clears: {', '.join(clears) or '?'}")
+    say(f"  Now:    5h {pct(u5)} · 7d {pct(u7)}"
+        + (f" (renews {fmt(r7)}, in {until(r7)})" if r7 else "")
+        + f" · Fable {pct(fable)}")
+    say("  The weekly renewal does not move: the reset only empties the windows now.")
+    if r7 and (r7 - datetime.now().astimezone()).total_seconds() < 48 * 3600:
+        say(f"  ! The 7d window renews anyway in {until(r7)} — little to gain here;"
+            " a reset is worth more on an account with days to go.")
+    elif max(u5 or 0, u7 or 0) < 80:
+        say("  ! This account is still far from its limits — a reset is worth"
+            " more once it is spent.")
+    print(gid)
+    sys.exit(0)
+
+# ---------- claim ----------
+before = resets_left(usage_or_fail(), grant_id)
+body = json.dumps({"program": "cedar_ember", "grant_id": grant_id,
+                   "request_id": str(uuid.uuid4())}).encode()
+req = urllib.request.Request(
+    f"{BASE}/reset_rate_limits", data=body, method="POST",
+    headers={**HEADERS, "Content-Type": "application/json",
+             "Origin": "https://claude.ai",
+             "Referer": "https://claude.ai/settings/usage",
+             "anthropic-client-platform": "web_claude_ai"})
+reply, failure = {}, None
+try:
+    with urllib.request.urlopen(req, timeout=35) as r:
+        reply = json.load(r)
+except urllib.error.HTTPError as e:
+    failure = f"HTTP {e.code}"
+    try:
+        reply = json.loads(e.read())
+    except Exception:
+        pass
+except Exception as e:
+    failure = type(e).__name__
+result = reply.get("result") if isinstance(reply, dict) else None
+
+# The reply can be lost (timeout) after the server already spent the reset,
+# so the re-read decides; it also brings the fresh windows.
+time.sleep(2)
+try:
+    after_d = read_usage()
+except Exception:
+    after_d = None
+spent = after_d is not None and resets_left(after_d, grant_id) < before
+
+if result == "reset" or spent:
+    u5, seven, fable = windows(after_d) if after_d else (None, {}, None)
+    say(f"Done — limits reset on {who}.")
+    say(f"  Now: 5h {pct(u5)} · 7d {pct(seven.get('utilization'))} · Fable {pct(fable)}")
+    try:
+        # patch the snapshot so the statusline shows it without waiting
+        with open(CACHE_PATH) as f:
+            snap = json.load(f)
+        for row in snap.get("accounts", []):
+            if row.get("n") == target and after_d:
+                row.update({"u5": u5, "u7": seven.get("utilization"),
+                            "fable": fable, "resets": resets_left(after_d)})
+        with open(CACHE_PATH + ".tmp", "w") as f:
+            json.dump(snap, f)
+        os.replace(CACHE_PATH + ".tmp", CACHE_PATH)
+    except Exception:
+        pass
+    sys.exit(0)
+
+reason = reply.get("reason") if isinstance(reply, dict) else None
+cooldown = local(reply.get("cooldown_until")) if isinstance(reply, dict) else None
+explain = {
+    "already_used": "this reset was already spent",
+    "not_limited": "this reset only works once the account is at a limit",
+    "cooldown": f"resets are cooling down until {fmt(cooldown)}",
+    "ineligible": "the account is not eligible",
+    "unavailable": "resets are unavailable right now — try again later",
+}.get(result, failure or "unexpected reply")
+say(f"Not reset — claude.ai: {explain}" + (f" ({reason})" if reason else "") + ".")
+if result is None and isinstance(reply, dict) and reply:
+    say(f"  reply: {json.dumps(reply)[:300]}")
+if after_d is not None:
+    say(f"  Nothing was spent: {resets_left(after_d, grant_id)} reset(s) left on that grant.")
+sys.exit(1)
 PYEOF
 }
 
@@ -1296,12 +1654,18 @@ def notify(msg):
                    capture_output=True)
 
 def web_usage(acc):
-    """5h/7d/Fable via claude.ai in one free request; None on failure."""
+    """5h/7d/Fable and free limit resets via claude.ai in one free request.
+
+    None on failure. resets is the unspent count across live grants and
+    resets_ends the earliest expiry among them (epoch), both None when the
+    reply carried no cedar_ember block.
+    """
     sk, org = acc.get("session_key"), acc.get("org_id")
     if not sk or not org:
         return None
+    # cedar_ember=1 also brings the free limit resets (see _deep_check)
     req = urllib.request.Request(
-        f"https://claude.ai/api/organizations/{org}/usage",
+        f"https://claude.ai/api/organizations/{org}/usage?cedar_ember=1&skip_spend=1",
         headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
                  "Accept": "application/json"})
 
@@ -1319,7 +1683,8 @@ def web_usage(acc):
             d = json.load(r)
     except Exception:
         return None
-    out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None}
+    out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None,
+           "resets": None, "resets_ends": None}
     five, seven = d.get("five_hour") or {}, d.get("seven_day") or {}
     out["u5"], out["u7"] = five.get("utilization"), seven.get("utilization")
     out["r7"] = epoch(seven.get("resets_at"))
@@ -1328,6 +1693,17 @@ def web_usage(acc):
         if (m.get("display_name") or "").lower() == "fable":
             out["fable"] = l.get("percent")
             out["rf"] = epoch(l.get("resets_at"))
+    ce = d.get("cedar_ember")
+    if isinstance(ce, dict):
+        out["resets"] = 0
+        for g in (ce.get("grants") or []) if ce.get("eligible") else []:
+            left, ends = g.get("resets_left"), epoch(g.get("ends_at"))
+            if g.get("paused") or not isinstance(left, int) or left <= 0 \
+                    or (ends and ends <= time.time()):
+                continue
+            out["resets"] += left
+            if ends and (out["resets_ends"] is None or ends < out["resets_ends"]):
+                out["resets_ends"] = ends
     return out
 
 def probe(acc):
@@ -1338,12 +1714,16 @@ def probe(acc):
     back to the billed Haiku call, which yields no Fable figure.
     """
     out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None,
+           "resets": None, "resets_ends": None,
            "rate_limited": False, "error": None, "src": None}
     if not acc.get("token"):
         out["error"] = "NO TOKEN"
         return out
 
     w = web_usage(acc)
+    if w:
+        # kept even when the windows fall back to the billed probe below
+        out["resets"], out["resets_ends"] = w["resets"], w["resets_ends"]
     if w and w["u5"] is not None:
         out.update(w)
         out["src"] = "web"
@@ -1397,6 +1777,7 @@ def probe_all(store):
         if acc.get("disabled") or not acc.get("token"):
             rows.append({"n": n, "label": acc.get("label", ""), "u5": None,
                          "u7": None, "r7": None, "fable": None, "rf": None,
+                         "resets": None, "resets_ends": None,
                          "rate_limited": False, "plan": acc.get("plan"),
                          "error": None, "disabled": bool(acc.get("disabled")),
                          "src": None})
@@ -1410,7 +1791,8 @@ def probe_all(store):
         snapshot = {"updated": time.time(), "active": store.get("active", 0),
                     "accounts": [{k: r.get(k) for k in
                                   ("n", "label", "u5", "u7", "fable",
-                                   "plan", "error", "disabled", "src")}
+                                   "plan", "error", "disabled", "src",
+                                   "resets", "resets_ends")}
                                  for r in rows]}
         with open(CACHE_PATH + ".tmp", "w") as f:
             json.dump(snapshot, f)
@@ -1444,6 +1826,13 @@ def choose_target(rows, exclude_n):
 
 state = {"strategy": strategy, "prewarned": False,
          "started": datetime.now().isoformat(timespec="seconds")}
+try:
+    # carried over so a restart does not repeat the same expiry reminders
+    prev = json.load(open(state_path)).get("reset_warned")
+    if isinstance(prev, list):
+        state["reset_warned"] = prev
+except Exception:
+    pass
 
 def save_state():
     try:
@@ -1451,6 +1840,33 @@ def save_state():
             json.dump(state, f)
     except Exception:
         pass
+
+RESET_REMIND_H = (72, 24)  # nudge twice before an unspent reset lapses
+
+def remind_expiring(rows):
+    """Notify once per account and threshold before a free limit reset lapses.
+
+    Only a reminder: spending one is irreversible and its value depends on
+    timing (it does not move the weekly renewal), so that stays manual.
+    """
+    now = time.time()
+    warned = [k for k in state.get("reset_warned", [])
+              if float(k.split(":")[1]) > now]
+    for r in rows:
+        ends = r.get("resets_ends")
+        if not r.get("resets") or not ends or ends <= now:
+            continue
+        keys = [f"{r['n']}:{int(ends)}:{h}" for h in RESET_REMIND_H
+                if ends - now <= h * 3600]
+        if keys and not set(keys) <= set(warned):
+            when = datetime.fromtimestamp(ends).strftime("%a %d %b %H:%M")
+            log(f"reset reminder: #{r['n']} {r['label']} — unspent reset lapses {when}")
+            notify(f"Free limit reset on #{r['n']} {r['label']} lapses {when}"
+                   f" — claude-swap reset {r['n']}")
+            warned.extend(k for k in keys if k not in warned)
+    if warned != state.get("reset_warned", []):
+        state["reset_warned"] = warned
+        save_state()
 
 log(f"watch started — strategy {strategy}, PID {os.getpid()}")
 notify(f"Watch running (strategy {strategy})")
@@ -1469,6 +1885,7 @@ while True:
         # nothing, it keeps the statusline cache honest for all of them,
         # and a rotation can then pick a target without probing again.
         rows = probe_all(store)
+        remind_expiring(rows)
         p = next((r for r in rows if r["n"] == active),
                  {"u5": None, "u7": None, "fable": None,
                   "rate_limited": False, "error": "NOT FOUND"})
@@ -1511,8 +1928,11 @@ while True:
                     notify("Rotation failed — check the watch log")
                     time.sleep(300)
             else:
-                log("no accounts available — retrying in 10 min")
-                notify("All accounts at the limit — retrying in 10 min")
+                holders = [f"#{r['n']}" for r in rows if r.get("resets")]
+                hint = (f" — free limit reset on {', '.join(holders)}"
+                        " (claude-swap reset <n>)") if holders else ""
+                log("no accounts available — retrying in 10 min" + hint)
+                notify("All accounts at the limit" + (hint or " — retrying in 10 min"))
                 time.sleep(600)
             continue
 
@@ -1683,6 +2103,9 @@ case "${1:-}" in
     ;;
   keys-sync|ks)
     cmd_keys_sync
+    ;;
+  reset)
+    cmd_reset "${2:-}"
     ;;
   disable)
     cmd_set_disabled "${2:-}" 1 disable

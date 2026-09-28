@@ -13,26 +13,27 @@ hit the wall.
 ```
 $ claude-swap check
 
-claude-swap v1.5.0
+claude-swap v1.6.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% · 7d 44% · Fable 65%
 
- #   Account       Plan    5h           reset   7d           Fable       │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
-─────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100% │   ·      ·    22:00    ·      ·      ·      ·      ·
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100% │   ·      ·      ·      ·      ·    17:00    ·      ·
+ #   Account       Plan    5h           reset   7d           Fable        Rst │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
+──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
+  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00    ·      ·      ·      ·      ·
+ *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
+  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·
   4  Old Account   FREE   — disabled —
 
-  calendar: 7d reset time · Fable when it falls on a different day   │   bars: <50% green · 50–80% yellow · ≥80% red
+  calendar: 7d reset time · Fable when it falls on a different day   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
+  Free limit resets: #1 Personal ×1 · until Thu 22 Oct 18:00 · spend one: claude-swap reset <n>
 
   Fable strategy — soonest renewal first (excludes rate-limited and Fable 100%)
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
+ *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
 
   General 7d strategy — soonest renewal first (excludes rate-limited)
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100% │   ·      ·      ·      ·      ·    17:00    ·      ·
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62% │   ·      ·      ·      ·      ·      ·    08:00    ·
+  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·
+ *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
 ```
 
 </details>
@@ -180,6 +181,7 @@ claude-swap 2          # switch to account 2
 claude-swap auto       # switch to the best account (general strategy)
 claude-swap af         # switch to the best account for Fable
 claude-swap check      # dashboard without switching
+claude-swap reset 3    # spend account 3's free limit reset (asks first)
 ```
 
 Interactive menu shortcuts: a number switches account, `a` = auto,
@@ -189,11 +191,18 @@ stop watcher, `ws` = watcher status, Enter = exit.
 ## Reading the dashboard
 
 - **Plan** — subscription tier (MAX20X / MAX5X / PRO / FREE), cached in
-  the store, refreshed by `keys-sync`.
+  the store. `check` re-reads it once a day, and straight away when the
+  usage reply contradicts it (windows on a FREE plan, none on a paid
+  one); a change prints a `Plan changed: #4 … MAX20X → FREE` line.
 - **5h / 7d / Fable** — color bars: green <50%, yellow 50–80%, red ≥80%.
   `-` means no data: an expired sessionKey, or a plan with no such
   window.
 - **reset** — exact time the 5h window resets (`+HH:MM` = tomorrow).
+- **Rst** — free limit resets left on the account (green). `0` = all
+  spent, `-` = the plan is not offered any, `?` = unknown because the
+  account has no working sessionKey. When any account holds one, a
+  `Free limit resets:` line lists them and when they lapse (yellow under
+  72 h, red under 24 h). See [free limit resets](#free-limit-resets).
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
   it falls on a different day.
@@ -215,15 +224,19 @@ A small daemon (plain process + pidfile, log in
 which is free over the cookie, so a rotation can pick its target from
 figures it already has. The active account sets the pace on an adaptive
 schedule — every 10 min below 80%, every 3 min at 80–95%,
-every minute above 95%. Consumption is negligible: one ~5-token Haiku
-call per probe, and the Fable check costs zero tokens (claude.ai cookie
-API).
+every minute above 95%. Probes read claude.ai with the cookie and cost
+zero tokens; only an account without a working cookie falls back to a
+~5-token Haiku call.
 
 - At **95%** it sends a macOS notification (pre-warning, once per crossing).
 - At **99%** (or on rate-limit) it probes the rest, picks the best target
   with the chosen strategy (soonest weekly renewal first), rotates, and
-  notifies. If everything is exhausted it tells you and keeps retrying.
+  notifies. If everything is exhausted it tells you and keeps retrying —
+  and names any account that still holds a free limit reset.
 - After rotating it watches the new active account automatically.
+- An unspent free limit reset gets a reminder 72 h and 24 h before it
+  lapses. The watcher never spends one itself: that is irreversible, and
+  what it is worth depends on timing.
 
 On Linux there are no notifications — everything still lands in the log.
 
@@ -240,6 +253,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap watch start [fable\|general]` | Background auto-switcher (99% trigger, 95% pre-warning) |
 | `claude-swap watch stop` | Stop the watcher |
 | `claude-swap watch status` | Watcher state + last probe + log tail |
+| `claude-swap reset <n>` | Spend account N's free limit reset (shows what it clears, asks for `yes`) |
 | `claude-swap add` | Add a new account |
 | `claude-swap remove <n>` | Remove an account |
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
@@ -265,11 +279,37 @@ When you run `claude-swap <n>`, it:
 
 Data sources for the dashboard:
 
-- **5h/7d % and resets** — response headers of a minimal Haiku request
-  to `api.anthropic.com` (one per account per check).
-- **Fable % / renewal and plan tier** — claude.ai's
-  `/api/organizations/<org>/usage` and `/api/bootstrap`, authenticated
-  with the account's `sessionKey` cookie. Zero token cost.
+- **Everything per account** — one request to claude.ai's
+  `/api/organizations/<org>/usage?cedar_ember=1&skip_spend=1`,
+  authenticated with the account's `sessionKey` cookie: 5h, 7d, every
+  per-model window (Fable) and the free limit resets. Zero token cost.
+- **Plan tier** — `/api/organizations` (daily, or when the usage reply
+  contradicts it) and `/api/bootstrap` during `keys-sync`.
+- **Fallback** — an account with no working cookie gets 5h/7d from the
+  response headers of a minimal Haiku request to `api.anthropic.com`.
+
+### Free limit resets
+
+Anthropic occasionally grants subscription plans a free **limit reset**
+(for example, one per Pro/Max account at the Opus 5.5 launch). Spending
+it empties the windows it lists (5h and 7d; the `seven_day_overage_included`
+window it also clears tracks the Fable counter) straight away. The weekly
+renewal day does not move, you do not need to be at a limit, and it
+cannot be undone. Unspent resets lapse on the date shown. Anthropic's
+help page: [What is a limit reset?](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)
+
+- claude.ai only fills the `cedar_ember` block of the usage reply when
+  asked with `cedar_ember=1`; that is how `check` and the watcher read it.
+- `claude-swap reset <n>` re-reads that block, shows the grant, what it
+  clears and when the 7d window would renew anyway, warns when a reset
+  would buy little (7d renewing within 48 h, or the account far from its
+  limits) and, after you type `yes`, posts
+  `{"program": "cedar_ember", "grant_id": …, "request_id": …}` to
+  `/api/organizations/<org>/reset_rate_limits` — what claude.ai's own
+  "Reset for free" button sends. It then re-reads the usage to confirm,
+  so a lost reply is not reported as a failure.
+- Best use: an account at its limit with days left until its weekly
+  renewal, before the grant lapses.
 
 ## Storage & security
 
@@ -279,16 +319,21 @@ Everything lives locally under `~/.claude/`:
 |------|----------|
 | `claude-swap.json` | Accounts: labels, emails, setup tokens, sessionKeys, cached org/plan (`600` perms) |
 | `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe, log |
-| `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages and labels only, no credentials — meant for read-only consumers such as a status line |
+| `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 
 Tokens are only ever sent to `api.anthropic.com`; sessionKeys only to
 `claude.ai`. Nothing goes to any third party.
 
 ## Troubleshooting
 
-**Fable column shows `-`** — the sessionKey is missing or expired. Log
-claude.ai back in on a Chrome profile with that account and run
-`claude-swap keys-sync` (or paste one with `key <n>`).
+**Fable column shows `-`, or Rst shows `?`** — the sessionKey is missing
+or expired. Log claude.ai back in on a Chrome profile with that account
+and run `claude-swap keys-sync` (or paste one with `key <n>`). When a
+Chrome profile is named after the account's email, `keys-sync` names it.
+
+**Plan column is wrong** — it is cached. `check` corrects it within a
+day (sooner for a drop to FREE), and `keys-sync` corrects it at once and
+says so.
 
 **`keys-sync` finds the cookie but doesn't update my account** — matching
 is by the account's **email** field in the store. Make sure it equals the
@@ -323,10 +368,10 @@ as well once they refresh credentials.
 `claude setup-token`. It lasts 1 year and works like `claude login`,
 without needing to re-authenticate.
 
-**Does polling waste my quota?** The watcher probes only the active
-account with a ~5-token Haiku call (adaptive, 1–10 min). That's a few
-thousand tokens per day at worst — noise compared to any real session.
-The Fable probe costs zero tokens.
+**Does polling waste my quota?** No. Every probe reads claude.ai with
+the account's cookie, which costs zero tokens. Only an account with no
+working cookie falls back to a ~5-token Haiku call, a few thousand tokens
+per day at worst — noise compared to any real session.
 
 **Can I use this with the Claude desktop app?** No — `claude-swap` only
 manages Claude Code (CLI) credentials.
