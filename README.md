@@ -13,7 +13,7 @@ hit the wall.
 ```
 $ claude-swap check
 
-claude-swap v1.6.0
+claude-swap v1.7.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% · 7d 44% · Fable 65%
@@ -26,7 +26,8 @@ Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% �
   4  Old Account   FREE   — disabled —
 
   calendar: 7d reset time · Fable when it falls on a different day   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
-  Free limit resets: #1 Personal ×1 · until Thu 22 Oct 18:00 · spend one: claude-swap reset <n>
+  Plan ending: #1 Personal MAX20X cancelled, ends Fri 02 Oct 11:06 (in 3d)
+  Free limit resets: #1 Personal ×1 · until Fri 02 Oct 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
 
   Fable strategy — soonest renewal first (excludes rate-limited and Fable 100%)
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
@@ -194,6 +195,10 @@ stop watcher, `ws` = watcher status, Enter = exit.
   the store. `check` re-reads it once a day, and straight away when the
   usage reply contradicts it (windows on a FREE plan, none on a paid
   one); a change prints a `Plan changed: #4 … MAX20X → FREE` line.
+  A **yellow** plan is about to stop: a `Plan ending: … cancelled, ends
+  Fri 02 Oct 11:06 (in 3d)` line gives the cancellation date claude.ai's
+  billing page shows, and `Plan downgrade: … MAX20X → PRO on …` a booked
+  step down. Both are read daily from `/subscription_details`.
 - **5h / 7d / Fable** — color bars: green <50%, yellow 50–80%, red ≥80%.
   `-` means no data: an expired sessionKey, or a plan with no such
   window.
@@ -202,7 +207,8 @@ stop watcher, `ws` = watcher status, Enter = exit.
   spent, `-` = the plan is not offered any, `?` = unknown because the
   account has no working sessionKey. When any account holds one, a
   `Free limit resets:` line lists them and when they lapse (yellow under
-  72 h, red under 24 h). See [free limit resets](#free-limit-resets).
+  72 h, red under 24 h) — the plan's end date when that comes first,
+  marked `— plan ends`. See [free limit resets](#free-limit-resets).
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
   it falls on a different day.
@@ -295,8 +301,10 @@ Anthropic occasionally grants subscription plans a free **limit reset**
 it empties the windows it lists (5h and 7d; the `seven_day_overage_included`
 window it also clears tracks the Fable counter) straight away. The weekly
 renewal day does not move, you do not need to be at a limit, and it
-cannot be undone. Unspent resets lapse on the date shown. Anthropic's
-help page: [What is a limit reset?](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)
+cannot be undone. Unspent resets lapse on the date shown, and are lost
+earlier if the plan is cancelled or downgraded first — `check`, the
+watcher's reminders and `reset <n>` all count down to whichever comes
+first. Anthropic's help page: [What is a limit reset?](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)
 
 - claude.ai only fills the `cedar_ember` block of the usage reply when
   asked with `cedar_ember=1`; that is how `check` and the watcher read it.
@@ -317,7 +325,7 @@ Everything lives locally under `~/.claude/`:
 
 | File | Contents |
 |------|----------|
-| `claude-swap.json` | Accounts: labels, emails, setup tokens, sessionKeys, cached org/plan (`600` perms) |
+| `claude-swap.json` | Accounts: labels, emails, setup tokens, sessionKeys, cached org/plan and plan end date (`600` perms) |
 | `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe, log |
 | `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 

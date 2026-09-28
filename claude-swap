@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -351,8 +351,36 @@ def fetch_web_usage(acc):
         old, new = acc.get("plan"), o.get("rate_limit_tier") or ""
         if old is not None and old != new:
             plan_changes.append((acc, old, new))
+            acc.pop("sub_checked", None)  # a new plan: re-read its end date too
         acc.update({"org_id": o["uuid"], "plan": new,
                     "plan_checked": int(time.time())})
+        store_dirty[0] = True
+
+    def refresh_sub(org):
+        """Cancellation date and scheduled downgrade of the subscription.
+
+        plan_ending_at is what claude.ai's billing page shows as "Your
+        subscription ends on …"; a step down to a smaller plan comes as
+        scheduled_downgrade instead.
+        """
+        try:
+            s = get(f"https://claude.ai/api/organizations/{org}/subscription_details")
+        except urllib.error.HTTPError as e:
+            # free plans have no subscription to describe (403); on a paid
+            # one a 403 is claude.ai throttling, so try again next check
+            if e.code in (403, 404) and is_free(acc.get("plan")):
+                acc.update({"plan_ends": None, "plan_next": None,
+                            "sub_checked": int(time.time())})
+                store_dirty[0] = True
+            return
+        except Exception:
+            return
+        down = s.get("scheduled_downgrade") or {}
+        acc.update({"plan_ends": s.get("plan_ending_at"),
+                    "plan_next": ({"plan": down.get("plan_type"),
+                                   "date": down.get("date")}
+                                  if down.get("plan_type") else None),
+                    "sub_checked": int(time.time())})
         store_dirty[0] = True
 
     def plan_age():
@@ -371,6 +399,8 @@ def fetch_web_usage(acc):
             has_windows = bool(d.get("five_hour") or d.get("limits"))
             if has_windows == is_free(acc.get("plan")) and plan_age() > 3600:
                 refresh_org()
+            if time.time() - acc.get("sub_checked", 0) > PLAN_TTL:
+                refresh_sub(org)
             out = {"u5": None, "r5": None, "u7": None, "r7": None,
                    "fable": None, "rf": None,
                    "resets": parse_resets(d.get("cedar_ember"))}
@@ -405,6 +435,14 @@ plan_changes = []  # (account, old tier, new tier) seen during this check
 def is_free(tier):
     t = (tier or "").lower()
     return "free" in t or t in ("", "default_claude_ai")
+
+def plan_end(acc):
+    """When the current plan stops: cancellation or scheduled downgrade."""
+    dates = [parse_iso(acc.get("plan_ends"))]
+    if acc.get("plan_next"):
+        dates.append(parse_iso(acc["plan_next"].get("date")))
+    dates = [d for d in dates if d and d > datetime.now()]
+    return min(dates) if dates else None
 
 def parse_resets(ce):
     """Free limit resets from the cedar_ember block; None if it was absent.
@@ -512,7 +550,7 @@ for i, acc in enumerate(accounts):
     row = {"n": n, "label": acc.get("label", ""), "error": None,
            "u5": None, "u7": None, "fable": None, "plan": acc.get("plan"),
            "r5": None, "r7": None, "rf": None, "disabled": False,
-           "src": None, "resets": None}
+           "src": None, "resets": None, "plan_end": None}
 
     if acc.get("disabled"):
         row["disabled"] = True
@@ -525,9 +563,15 @@ for i, acc in enumerate(accounts):
 
     web = fetch_web_usage(acc)
     row["plan"] = acc.get("plan")  # fetch_web_usage may have just cached it
+    row["plan_end"] = plan_end(acc)
     if web:
         row["fable"], row["rf"] = web["fable"], web["rf"]
-        row["resets"] = web["resets"]
+        row["resets"] = res = web["resets"]
+        # An unspent reset is lost with the plan it came with, so the plan
+        # ending first is its real deadline.
+        if res and res["left"] and row["plan_end"] and (
+                res["ends"] is None or row["plan_end"] < res["ends"]):
+            res["ends"], res["by_plan"] = row["plan_end"], True
 
     # The cookie carries every window in one free request, so the billed
     # probe below only runs when it came back empty (no cookie, expired,
@@ -645,9 +689,10 @@ def plan_name(tier):
         return "FREE", GREY
     return trunc(tier.replace("default_claude_", ""), W_PL), GREY
 
-def plan_cell(tier):
+def plan_cell(tier, ending=False):
+    """Yellow when the plan is cancelled or has a downgrade booked."""
     name, col = plan_name(tier)
-    return paint(col, pad(name, W_PL))
+    return paint(YELLOW if ending else col, pad(name, W_PL))
 
 def resets_cell(res):
     """Green count = resets waiting; 0 = all spent; - = none offered;
@@ -712,7 +757,7 @@ def render_row(row):
     cal = "".join(center(cells.get(k, paint(GREY, "·")), CW) for k in range(NCAL))
 
     line = left_part(
-        num, name_cell, plan_cell(row["plan"]),
+        num, name_cell, plan_cell(row["plan"], row["plan_end"] is not None),
         pct_cell(row["u5"]), reset5_cell(row["r5"]),
         pct_cell(row["u7"]), pct_cell(row["fable"]),
         resets_cell(row["resets"])) + "│" + cal
@@ -730,11 +775,38 @@ print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
       + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
                     "   │   Rst: free limit resets left (? = no valid cookie)"))
 
+def short(label):
+    # 'Cuenta 3 (Gmail)' -> 'Gmail': the part in brackets names it best
+    m = re.search(r"\(([^()]+)\)\s*$", label or "")
+    return trunc(m.group(1).strip() if m else (label or "?"), 18)
+
+def deadline(dt, verb):
+    """'<verb> Tue 13 Oct 23:10 (in 15d)': yellow under 72 h, red under 24 h."""
+    hours = (dt - datetime.now()).total_seconds() / 3600
+    col = RED if hours < 24 else (YELLOW if hours < 72 else GREY)
+    left = f"{int(hours // 24)}d" if hours >= 24 else f"{max(0, int(hours))}h"
+    return paint(col, f"{verb} {dt.strftime('%a %d %b %H:%M')} (in {left})")
+
 for acc, old, new in plan_changes:
     n = next(i for i, a in enumerate(accounts, 1) if a is acc)
     (o, oc), (w, wc) = plan_name(old), plan_name(new)
     print("  " + paint(YELLOW, "Plan changed: ")
           + f"#{n} {acc.get('label', '?')} " + paint(oc, o) + " → " + paint(wc, w))
+
+# ---------- subscriptions that stop: cancelled, or a smaller plan booked ----------
+for r in results:
+    if r["disabled"] or not r["plan_end"]:
+        continue
+    name, col = plan_name(r["plan"])
+    nxt = accounts[r["n"] - 1].get("plan_next")
+    head = f"#{r['n']} {r['label']} " + paint(col, name)
+    if nxt and parse_iso(nxt.get("date")) == r["plan_end"]:
+        to, tc = plan_name(nxt.get("plan"))
+        print("  " + paint(YELLOW, "Plan downgrade: ") + head + " → "
+              + paint(tc, to) + " " + deadline(r["plan_end"], "on"))
+    else:
+        print("  " + paint(YELLOW, "Plan ending: ") + head
+              + " cancelled, " + deadline(r["plan_end"], "ends"))
 
 # ---------- free limit resets: who holds one and when it lapses ----------
 # The weekly renewal never moves, so a reset is worth most on an account at
@@ -742,24 +814,19 @@ for acc, old, new in plan_changes:
 held = [r for r in results if r["resets"] and r["resets"]["left"] > 0
         and not r["disabled"]]
 if held:
-    def lapse(dt):
-        if dt is None:
+    def lapse(res):
+        if res["ends"] is None:
             return "no expiry"
-        hours = (dt - datetime.now()).total_seconds() / 3600
-        col = RED if hours < 24 else (YELLOW if hours < 72 else GREY)
-        return paint(col, "until " + dt.strftime("%a %d %b %H:%M"))
-    def short(label):
-        # 'Cuenta 3 (Gmail)' -> 'Gmail': the part in brackets names it best
-        m = re.search(r"\(([^()]+)\)\s*$", label or "")
-        return trunc(m.group(1).strip() if m else (label or "?"), 18)
-    ends = {r["resets"]["ends"] for r in held}
+        return (deadline(res["ends"], "until")
+                + (paint(YELLOW, " — plan ends") if res.get("by_plan") else ""))
+    ends = {(r["resets"]["ends"], r["resets"].get("by_plan")) for r in held}
     shared = len(ends) == 1
     who = ", ".join(
         f"#{r['n']} {short(r['label'])} ×{r['resets']['left']}"
-        + ("" if shared else " " + lapse(r["resets"]["ends"]))
+        + ("" if shared else " " + lapse(r["resets"]))
         for r in held)
     print("  " + paint(GREEN, "Free limit resets: ") + who
-          + (" · " + lapse(next(iter(ends))) if shared else "")
+          + (" · " + lapse(held[0]["resets"]) if shared else "")
           + paint(GREY, " · spend one: claude-swap reset <n>"))
 
 # ---------- swap strategies: same table, reordered ----------
@@ -1477,6 +1544,15 @@ if mode == "inspect":
     say(f"  {grant.get('label') or gid}")
     say(f"  Left:   {grant.get('resets_left')} of {grant.get('resets_total')}"
         f" · lapses {fmt(local(grant.get('ends_at')))}")
+    # cached by `check`: an unspent reset is lost when its plan stops
+    now = datetime.now().astimezone()
+    stops = [p for p in (local(acc.get("plan_ends")),
+                         local((acc.get("plan_next") or {}).get("date")))
+             if p and p > now]
+    grant_end = local(grant.get("ends_at"))
+    if stops and (grant_end is None or min(stops) < grant_end):
+        say(f"  ! The plan stops {fmt(min(stops))} (cancelled or downgraded):"
+            " the reset is lost then if still unspent.")
     say(f"  Clears: {', '.join(clears) or '?'}")
     say(f"  Now:    5h {pct(u5)} · 7d {pct(u7)}"
         + (f" (renews {fmt(r7)}, in {until(r7)})" if r7 else "")
@@ -1653,6 +1729,14 @@ def notify(msg):
                     f'display notification "{m}" with title "claude-swap" sound name "Glass"'],
                    capture_output=True)
 
+def iso_epoch(v):
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
 def web_usage(acc):
     """5h/7d/Fable and free limit resets via claude.ai in one free request.
 
@@ -1785,6 +1869,14 @@ def probe_all(store):
         r = probe(acc)
         r.update({"n": n, "label": acc.get("label") or acc.get("email") or "?",
                   "plan": acc.get("plan"), "disabled": False})
+        # An unspent reset is lost with its plan: a cancellation or booked
+        # downgrade (cached by `check`) that comes first is its deadline.
+        stops = [e for e in (iso_epoch(acc.get("plan_ends")),
+                             iso_epoch((acc.get("plan_next") or {}).get("date")))
+                 if e and e > time.time()]
+        if r.get("resets") and stops and (
+                r["resets_ends"] is None or min(stops) < r["resets_ends"]):
+            r["resets_ends"] = min(stops)
         rows.append(r)
         time.sleep(1.2)  # claude.ai throttles bursts
     try:
