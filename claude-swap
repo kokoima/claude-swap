@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.9.0"
+VERSION="1.9.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -233,18 +233,19 @@ def timeline(r, days):
     ("end", t) on the day the plan stops and ("gone", None) on every day
     after it; ("down", t) on a downgrade; ("renew", t) on the weekly
     renewal and ("fable", t) on a Fable one on another day, both only if
-    they come before the end, since after it they never happen. One mark
+    they come before the end. A weekly renewal after the end shows as
+    ("would_renew", t): it only comes if the plan is renewed. One mark
     per day: end beats downgrade beats renewal beats Fable. None = nothing.
     """
-    cancel = r.get("cancel_at")
+    cancel, r7 = r.get("cancel_at"), r.get("r7")
     events = [("end", cancel), ("down", r.get("down_at"))]
-    events += [(kind, t) for kind, t in (("renew", r.get("r7")),
-                                         ("fable", r.get("rf")))
+    events += [(kind, t) for kind, t in (("renew", r7), ("fable", r.get("rf")))
                if t and not (cancel and t >= cancel)]
     marks = []
     for start, end in days:
         if cancel and start >= cancel:
-            marks.append(("gone", None))
+            later = r7 and r7 >= cancel and start <= r7 < end
+            marks.append(("would_renew", r7) if later else ("gone", None))
             continue
         marks.append(next(((kind, t) for kind, t in events
                            if t and start <= t < end), None))
@@ -1009,7 +1010,8 @@ def trunc(s, w):
     return s if len(s) <= w else s[:w - 1] + "…"
 
 # yellow = 7d renewal · magenta = Fable renewal on another day ·
-# cyan ↓ = downgrade · red ✕ = plan ends, and a line on the days without one
+# cyan ↓ = downgrade · red ✕ = plan ends, and a line on the days without one,
+# carrying in grey the renewal that only comes if the plan is renewed
 CAL_MARKS = {"renew": (YELLOW, ""), "fable": (MAG, ""),
              "down": (CYAN, "↓"), "end": (RED, "✕")}
 
@@ -1019,6 +1021,8 @@ def cal_cell(mark):
     kind, t = mark
     if kind == "gone":
         return paint(GREY, "─" * CW)
+    if kind == "would_renew":
+        return paint(GREY, datetime.fromtimestamp(t).strftime("%H:%M").center(CW, "─"))
     col, sign = CAL_MARKS[kind]
     return paint(col, sign + datetime.fromtimestamp(t).strftime("%H:%M"))
 
@@ -1076,7 +1080,8 @@ print()
 print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
       + paint(MAG, "Fable") + " when it falls on a different day · "
       + paint(CYAN, "↓") + " downgrade · " + paint(RED, "✕") + " plan ends"
-      + paint(GREY, " ───") + " no plan"
+      + paint(GREY, " ───") + " no plan (" + paint(GREY, "─22:00─")
+      + " renews if resubscribed)"
       + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
                     "   │   Rst: free limit resets left (? = no valid cookie)"))
 

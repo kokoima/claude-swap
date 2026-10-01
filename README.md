@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.9.0
+claude-swap v1.9.1
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -25,7 +25,7 @@ Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe
   3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·
   4  Old Account   FREE   — disabled —
 
-  calendar: 7d reset time · Fable when it falls on a different day · ↓ downgrade · ✕ plan ends ─── no plan   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
+  calendar: 7d reset time · Fable when it falls on a different day · ↓ downgrade · ✕ plan ends ─── no plan (─22:00─ renews if resubscribed)   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
   Plan ending: #1 Personal MAX20X cancelled, ends Sun 26 Sep 11:06 (in 3d) · renews Sat 25 22:00 → 13h 6m until then
   Free limit resets: #1 Personal ×1 · until Sun 26 Sep 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
 
@@ -218,10 +218,11 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
   it falls on a different day. A cancelled plan shows `✕HH:MM` in red on
-  the day it ends and a line on every day after it, and drops the
-  renewals that fall after the end, since they never come; a booked
-  downgrade shows `↓HH:MM` in cyan and the row goes on. One mark per
-  day: the end beats a downgrade, which beats a renewal.
+  the day it ends and a line on every day after it; a weekly renewal
+  that falls after the end stays on that line in grey (`─17:00─`), since
+  it only comes if you renew the plan. A booked downgrade shows
+  `↓HH:MM` in cyan and the row goes on. One mark per day: the end beats
+  a downgrade, which beats a renewal.
 - **Watcher order** — the same rows in the order the watcher (and
   `auto`) consumes them, each with the reason: when its quota is lost
   (`renews …` or `plan ends …`), `last day`, `holds a reset`, `little

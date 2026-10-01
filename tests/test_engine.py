@@ -274,11 +274,16 @@ class Timeline(unittest.TestCase):
         self.assertEqual(m[:2] + m[3:], [None] * 7)
 
     def test_plan_end_on_its_day_and_no_plan_after(self):
-        m = marks(r7=NOW + 139 * H, cancel_at=NOW + 37 * H)
+        m = marks(cancel_at=NOW + 37 * H)
         self.assertEqual(m[0], None)
         self.assertEqual(m[1], ("end", NOW + 37 * H))
-        # #3: the Tue renewal never comes, the plan is gone by then
         self.assertEqual(m[2:], [GONE] * 6)
+
+    def test_a_renewal_after_the_end_shows_as_one_if_resubscribed(self):
+        # #3: the Tue renewal only comes if the plan is renewed
+        m = marks(r7=NOW + 139 * H, cancel_at=NOW + 37 * H)
+        self.assertEqual(m[5], ("would_renew", NOW + 139 * H))
+        self.assertEqual(m[2:5] + m[6:], [GONE] * 5)
 
     def test_end_wins_over_a_renewal_the_same_day(self):
         # #8 renews Sat 06:00 and its plan ends 07:56
