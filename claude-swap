@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.9.1"
+VERSION="1.9.2"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -307,6 +307,20 @@ def subs_due(accounts, now, tried):
             continue
         due.append(n)
     return due
+
+
+def needs_billed_probe(free, web_ok, has_windows):
+    """Whether check falls back to the billed ratelimit probe (Haiku call).
+
+    Not when the cookie reply brought the windows, and not for a free plan
+    that answered without any: Claude Code refuses free plans (403
+    permission_error), so the probe would only print that refusal. With no
+    working cookie it stays, being the only source, and the way a free
+    account that moved to a paid plan gets noticed.
+    """
+    if web_ok and (has_windows or free):
+        return False
+    return True
 PYEOF
 export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
@@ -874,6 +888,11 @@ for i, acc in enumerate(accounts):
         row["src"] = "web"
         results.append(row)
         continue
+    # here the reply, if any, lacks the 5h window the dashboard needs
+    if not engine.needs_billed_probe(is_free(row["plan"]), web is not None, False):
+        row["note"] = "free plan · Claude Code needs Pro/Max"
+        results.append(row)
+        continue
 
     row["src"] = "hdr"
     data = json.dumps({
@@ -1071,6 +1090,8 @@ def render_row(row):
 
     if row["error"] and row["error"] != "RATE LIMITED":
         line += "  " + paint(RED, row["error"])
+    elif row.get("note"):
+        line += "  " + paint(GREY, row["note"])
     return line
 
 for row in results:

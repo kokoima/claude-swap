@@ -391,5 +391,28 @@ class Subscription(unittest.TestCase):
                          {"plan_ends": None, "plan_next": None})
 
 
+class BilledProbe(unittest.TestCase):
+    """Whether check falls back to the billed ratelimit probe."""
+
+    def needed(self, free, web_ok, has_windows):
+        return E["needs_billed_probe"](free, web_ok, has_windows)
+
+    def test_not_when_the_cookie_brought_the_windows(self):
+        self.assertFalse(self.needed(False, True, True))
+
+    def test_not_for_a_free_plan_that_answered_without_windows(self):
+        # #4/#6: claude.ai says free, and Claude Code refuses free plans
+        # (403 permission_error), so the probe would only print that refusal
+        self.assertFalse(self.needed(True, True, False))
+
+    def test_paid_plan_without_windows_is_still_probed(self):
+        self.assertTrue(self.needed(False, True, False))
+
+    def test_without_a_working_cookie_it_is_the_only_source(self):
+        # also how a free account that moved to a paid plan gets noticed
+        self.assertTrue(self.needed(True, False, False))
+        self.assertTrue(self.needed(False, False, False))
+
+
 if __name__ == "__main__":
     unittest.main()

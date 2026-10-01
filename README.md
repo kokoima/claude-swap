@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.9.1
+claude-swap v1.9.2
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -395,10 +395,17 @@ claude.ai login email (re-add the account or edit
 **`keys-sync` says "browser_cookie3 missing"** —
 `pip3 install --user browser_cookie3`.
 
+**A check row shows `free plan · Claude Code needs Pro/Max`** — claude.ai
+says the account is on the free plan, and Claude Code refuses free plans
+(the API answers `403 permission_error: OAuth authentication is
+currently not allowed for this organization`), so there is nothing to
+read or rotate to. Leave it if you may subscribe again — `check` notices
+the paid plan by itself — or `claude-swap disable <n>` to hide it.
+
 **A check row shows `permission_error`** — that account's setup token
-can't call the API (revoked, or the account has no active Max
-subscription). Regenerate it with `claude setup-token`, or
-`claude-swap disable <n>` if it's a free account.
+can't call the API and claude.ai could not tell why (no working
+sessionKey): revoked, or no active subscription. Regenerate it with
+`claude setup-token`, or refresh the cookie with `keys-sync`.
 
 **`Watch: stale pidfile`** — the watcher died (e.g. reboot). Run
 `claude-swap watch stop` to clean up, then `watch start` again.
