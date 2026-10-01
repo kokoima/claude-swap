@@ -13,4 +13,7 @@ uninstall:
 	@echo "Removed $(PREFIX)/claude-swap"
 	@echo "Note: ~/.claude/claude-swap.json was preserved"
 
-.PHONY: install uninstall
+test:
+	python3 -m unittest discover -s tests -v
+
+.PHONY: install uninstall test

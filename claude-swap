@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -27,6 +27,192 @@ WATCH_LOG="$HOME/.claude/claude-swap-watch.log"
 WATCH_STATE="$HOME/.claude/claude-swap-watch.state"
 IS_MACOS=false
 [ "$(uname -s)" = "Darwin" ] && IS_MACOS=true
+
+# --- Decision engine (general strategy) ---
+# Which account to be on, shared by check, auto and watch: each Python block
+# runs exec(os.environ["CLAUDE_SWAP_ENGINE"]). Pure — rows in, decision out,
+# the clock passed in — so tests/test_engine.py can replay any situation.
+read -r -d '' ENGINE_PY <<'PYEOF' || true
+# A row: n, label, u5/u7 (% or None), r5/r7 (window resets, epoch or None),
+# plan_end (cancellation or downgrade, epoch or None), free, disabled, error,
+# rate_limited, resets (spendable count or None), resets_ends (when they
+# lapse, epoch or None), reset_cooldown (epoch or None).
+#
+# Consume first the quota that is lost first. A week is lost at its renewal,
+# or earlier if the plan stops, so that is each account's deadline. Within
+# that: quota that dies within a day goes first (now or never), then accounts
+# holding a free reset (reaching the limit early is what makes the reset
+# worth a whole week), then the rest.
+
+LEAVE = 98                  # leave an account once its 5h or 7d reaches this %
+ROOM_5H = 80                # worth switching to: 5h at or below this...
+ROOM_7D = 95                # ...and 7d at or below this
+LAST_DAY = 24 * 3600        # quota expiring within this goes first
+MIN_DWELL = 15 * 60         # no voluntary switch sooner than this after the last
+RESET_MIN_LEFT = 24 * 3600  # a week renewing sooner than this refills for free
+RESET_RETRY = 6 * 3600      # at most one reset per account in this span
+ERROR_RETRY = 300           # probe failed on the active account: look again
+
+INF = float("inf")
+
+
+def deadline(r, now):
+    """When the account's unused quota is lost: weekly renewal or plan end."""
+    ends = [t for t in (r.get("r7"), r.get("plan_end")) if t and t > now]
+    return min(ends) if ends else INF
+
+
+def eligible(r):
+    return (not (r.get("disabled") or r.get("free") or r.get("error"))
+            and r.get("u5") is not None)
+
+
+def blocked(r):
+    return (bool(r.get("rate_limited")) or (r.get("u5") or 0) >= LEAVE
+            or (r.get("u7") or 0) >= LEAVE)
+
+
+def holds_reset(r, now):
+    ends = r.get("resets_ends")
+    return (r.get("resets") or 0) > 0 and (ends is None or ends > now)
+
+
+def roomy(r, now):
+    # A reset holder needs no 7d room: its reset refills it at the limit.
+    return (r.get("u5") or 0) <= ROOM_5H and (
+        (r.get("u7") or 0) <= ROOM_7D or holds_reset(r, now))
+
+
+def load(r):
+    return max(r.get("u5") or 0, r.get("u7") or 0)
+
+
+def tier(r, now):
+    if deadline(r, now) - now < LAST_DAY:
+        return 0
+    return 1 if holds_reset(r, now) else 2
+
+
+def priority(r, now):
+    return (tier(r, now), deadline(r, now))
+
+
+def rank(rows, now):
+    """Eligible accounts in consumption order, blocked ones included."""
+    return sorted((r for r in rows if eligible(r)),
+                  key=lambda r: (priority(r, now), load(r), r["n"]))
+
+
+def unblock_at(r):
+    """When a blocked account is usable again; None if unknown."""
+    times = []
+    if (r.get("u5") or 0) >= LEAVE:
+        times.append(r.get("r5"))
+    if (r.get("u7") or 0) >= LEAVE:
+        times.append(r.get("r7"))
+    if not times or None in times:
+        return None
+    return max(times)
+
+
+def reset_due(r, now, state):
+    """Aggressive policy: spend a free reset as soon as the week is spent."""
+    if (r.get("u7") or 0) < LEAVE or not holds_reset(r, now):
+        return False
+    if (r.get("reset_cooldown") or 0) > now:
+        return False
+    if r["n"] in (state.get("reset_failed") or []):
+        return False
+    tried = (state.get("reset_tried") or {}).get(str(r["n"]))
+    if tried and now - tried < RESET_RETRY:
+        return False
+    r7 = r.get("r7")
+    if r7 and r7 - now < RESET_MIN_LEFT:
+        # the week refills for free soon: spend only if the reset lapses first
+        ends = r.get("resets_ends")
+        return bool(ends and ends <= r7)
+    return True
+
+
+def next_event(rows, now):
+    """Soonest instant at which a block lifts or the order can change."""
+    times = []
+    for r in rows:
+        if not eligible(r):
+            continue
+        d = deadline(r, now)
+        times += [r.get("r5"), r.get("r7"), r.get("plan_end"),
+                  r.get("reset_cooldown"), d - LAST_DAY if d < INF else None]
+    times = [t for t in times if t and t > now]
+    return min(times) if times else None
+
+
+def usage(r):
+    if r.get("u5") is None:
+        return "no data"
+    return f"5h {r['u5']:.0f}% · 7d {(r.get('u7') or 0):.0f}%"
+
+
+def decide(rows, active, now, state, auto_reset=False):
+    """What to do now: stay, switch, spend a reset, or wait at the wall.
+
+    state carries last_switch (epoch), manual (the active account was picked
+    by hand), reset_tried ({"n": epoch}) and reset_failed ([n]). Returns
+    {"action", "target", "reason", "wake"}; wake is the next instant worth
+    looking again, or None.
+    """
+    def out(action, target, reason, wake=None):
+        ev = next_event(rows, now)
+        if wake is None or (ev is not None and ev < wake):
+            wake = ev
+        return {"action": action, "target": target, "reason": reason,
+                "wake": wake}
+
+    cur = next((r for r in rows if r["n"] == active), None)
+    ranked = rank(rows, now)
+
+    if auto_reset:
+        for r in ranked:
+            if reset_due(r, now, state):
+                return out("reset", r["n"],
+                           f"#{r['n']} spent its week ({usage(r)}) and holds a reset")
+
+    if (cur is not None and cur.get("error")
+            and not (cur.get("disabled") or cur.get("free"))):
+        return out("stay", active, f"#{active} probe failed ({cur['error']})",
+                   now + ERROR_RETRY)
+
+    usable = [r for r in ranked if not blocked(r)]
+    best = next((r for r in usable if roomy(r, now)), None)
+
+    if cur is None or not eligible(cur) or blocked(cur):
+        if cur is None:
+            why = "no active account"
+        elif not eligible(cur):
+            why = f"#{active} is no longer usable"
+        else:
+            why = f"#{active} at its limit ({usage(cur)})"
+        target = best or min(usable, key=lambda r: (load(r), priority(r, now)),
+                             default=None)
+        if target is None:
+            waits = [t for t in (unblock_at(r) for r in ranked) if t and t > now]
+            return out("wall", None, why + " and every account is at its limit",
+                       min(waits) if waits else None)
+        return out("switch", target["n"], why)
+
+    if best and best["n"] != active and priority(best, now) < priority(cur, now):
+        ahead = f"#{best['n']} goes first ({usage(best)})"
+        if state.get("manual"):
+            return out("stay", active, f"#{active} picked by hand; {ahead}")
+        last = state.get("last_switch") or 0
+        if now - last < MIN_DWELL:
+            return out("stay", active, f"{ahead}, after the dwell time",
+                       last + MIN_DWELL)
+        return out("switch", best["n"], ahead)
+
+    return out("stay", active, f"#{active} goes first")
+PYEOF
+export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
 # --- Checks ---
 
@@ -66,7 +252,8 @@ cmd_help() {
   echo "  claude-swap check        Status + usage dashboard (all accounts, 0 tokens)"
   echo "  claude-swap auto [fable|general]  Auto-rotate to best available account"
   echo "  claude-swap af           Alias for 'auto fable'"
-  echo "  claude-swap watch start [fable|general]  Background auto-switch at 99% (pre-warning at 95%)"
+  echo "  claude-swap watch start [general|fable] [--auto-reset]"
+  echo "                           Background auto-switch (general: see below)"
   echo "  claude-swap watch stop   Stop the watcher"
   echo "  claude-swap watch status Watcher status + log"
   echo "  claude-swap reset <n>    Spend account N's free limit reset (asks first; cannot be undone)"
@@ -87,6 +274,15 @@ cmd_help() {
   echo ""
   echo "  The same request reports free limit resets (the Rst column), which"
   echo "  Anthropic grants now and then and which empty the 5h and 7d windows."
+  echo ""
+  echo "  General strategy (auto, watch): consume first the quota that is lost"
+  echo "  first — each account's weekly renewal, or its plan end if sooner."
+  echo "  Quota dying within a day goes first, then accounts holding a free"
+  echo "  reset, then the rest. The watch leaves an account at 98% of its 5h"
+  echo "  or 7d and goes back to a higher one once it has room again. With"
+  echo "  --auto-reset it spends a free reset as soon as an account's week is"
+  echo "  spent (unless the week renews within a day). On macOS the watch runs"
+  echo "  as a LaunchAgent, so it survives reboots."
 }
 
 cmd_init() {
@@ -155,10 +351,10 @@ with open('$STORE', 'w') as f:
 
     # --- Onboarding: watcher ---
     echo ""
-    read -r -p "Start the auto-switcher? It rotates at 99% usage, pre-warns at 95% (y/n) " w
+    read -r -p "Start the auto-switcher? It switches at 98% of 5h or 7d, spending first what expires first (y/n) " w
     case "$w" in
-      [yY]*) cmd_watch_start fable ;;
-      *) echo "You can start it later with: claude-swap watch start fable" ;;
+      [yY]*) cmd_watch_start general ;;
+      *) echo "You can start it later with: claude-swap watch start" ;;
     esac
 
     echo ""
@@ -223,9 +419,11 @@ try:
 except Exception:
     ws = {}
 if walive:
-    parts = [f"RUNNING ({ws.get('strategy', '?')}, PID {wpid})"]
+    extra = " + auto-reset" if ws.get("auto_reset") else ""
+    parts = [f"RUNNING ({ws.get('strategy', '?')}{extra}, PID {wpid})"]
     if ws.get("active"):
-        parts.append(f"watching #{ws['active']}")
+        parts.append(f"watching #{ws['active']}"
+                     + (" (picked by hand)" if ws.get("manual") else ""))
     if ws.get("last"):
         parts.append(f"last probe {ws.get('last_time', '?')}: {ws['last']}")
     print("Watch:  " + " — ".join(parts))
@@ -300,9 +498,12 @@ cmd_check() {
 
 _deep_check() {
   python3 - "$STORE" <<'PYEOF'
-import json, os, re, sys, time
+import json, os, re, sys, time, types
 import urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
+
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 
 store_path = sys.argv[1]
 with open(store_path) as f:
@@ -829,33 +1030,71 @@ if held:
           + (" · " + lapse(held[0]["resets"]) if shared else "")
           + paint(GREY, " · spend one: claude-swap reset <n>"))
 
-# ---------- swap strategies: same table, reordered ----------
-# Priority: consume first the account whose weekly limit renews soonest
-# (what you spend there comes back first); % is only the tiebreaker.
+# ---------- watcher order: the general strategy, same table reordered ----------
+# The decision engine the watch and `auto` use: consume first the quota that
+# is lost first. Blocked accounts follow, by when they free up.
 
-usable = [r for r in results if not r["disabled"] and r["error"] is None]
+def ep(dt):
+    return dt.timestamp() if dt else None
 
-def eta(dt):
-    return dt.timestamp() if dt else float("inf")
+def when(ts):
+    return datetime.fromtimestamp(ts).strftime("%a %d %H:%M")
 
-fable_rows = sorted(
-    [r for r in usable if isinstance(r["fable"], (int, float)) and r["fable"] < 100],
-    key=lambda r: (eta(r["rf"]), r["fable"]))
-gen_rows = sorted(
-    [r for r in usable if r["u5"] is not None],
-    key=lambda r: (eta(r["r7"]), r["u7"] or 0))
+now_ts = time.time()
+eng_rows = []
+for r in results:
+    res = r["resets"]
+    cancel = parse_iso(accounts[r["n"] - 1].get("plan_ends"))
+    limited = r["error"] == "RATE LIMITED"
+    eng_rows.append({
+        "n": r["n"], "label": r["label"], "u5": r["u5"], "u7": r["u7"],
+        "r5": ep(r["r5"]), "r7": ep(r["r7"]), "plan_end": ep(r["plan_end"]),
+        # a cancelled plan past its end date is free, whatever is cached
+        "free": is_free(r["plan"]) or bool(cancel and cancel <= datetime.now()),
+        "disabled": r["disabled"], "error": None if limited else r["error"],
+        "rate_limited": limited,
+        "resets": (res["left"] if res["eligible"] else 0) if res else None,
+        "resets_ends": ep(res["ends"]) if res else None,
+        "reset_cooldown": None})
 
-for title, rows in [("Fable strategy", fable_rows),
-                    ("General 7d strategy", gen_rows)]:
-    print()
-    print(paint(BOLD, f"  {title}")
-          + paint(GREY, " — soonest renewal first (excludes rate-limited"
-                        + (" and Fable 100%)" if "Fable" in title else ")")))
-    if not rows:
-        print(paint(GREY, "    no accounts available"))
+order = engine.rank(eng_rows, now_ts)
+blocked = sorted((e for e in order if engine.blocked(e)),
+                 key=lambda e: engine.unblock_at(e) or float("inf"))
+by_n = {r["n"]: r for r in results}
+
+def note(e):
+    """Why the account sits there: when its quota is lost, or frees up."""
+    if engine.blocked(e):
+        t = engine.unblock_at(e)
+        return paint(RED, "blocked" + (f" until {when(t)}" if t else ""))
+    d = engine.deadline(e, now_ts)
+    if d == float("inf"):
+        txt = "no week running"
     else:
-        for r in rows:
-            print(render_row(r))
+        txt = ("plan ends " if d == e["plan_end"] else "renews ") + when(d)
+    tags = {0: [paint(YELLOW, "last day")], 1: [paint(GREEN, "holds a reset")]}.get(
+        engine.tier(e, now_ts), [])
+    if not engine.roomy(e, now_ts):
+        tags.append(paint(GREY, "little room"))
+    return paint(GREY, txt) + ("  " + " · ".join(tags) if tags else "")
+
+print()
+print(paint(BOLD, "  Watcher order")
+      + paint(GREY, f" — what is lost first goes first · leaves at {engine.LEAVE}%"
+                    " of 5h or 7d, comes back once there is room"))
+if not order:
+    print(paint(GREY, "    no accounts available"))
+for e in [e for e in order if not engine.blocked(e)] + blocked:
+    print(render_row(by_n[e["n"]]) + "  " + note(e))
+
+d = engine.decide(eng_rows, active, now_ts, {}, False)
+if d["action"] == "stay":
+    head = f"stay on #{active}"
+elif d["action"] == "switch":
+    head = f"switch to #{d['target']}"
+else:
+    head = "wait" + (f" until {when(d['wake'])}" if d["wake"] else "")
+print("  " + paint(BOLD, "Now: " + head) + paint(GREY, f" — {d['reason']}"))
 PYEOF
 }
 
@@ -868,9 +1107,12 @@ cmd_auto() {
   esac
   local result
   result=$(python3 - "$STORE" "$strategy" <<'PYEOF'
-import json, os, sys, time
+import json, os, sys, time, types
 import urllib.request, urllib.error
 from datetime import datetime
+
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 
 store_path = sys.argv[1]
 strategy = sys.argv[2]
@@ -915,10 +1157,16 @@ def fetch_web_usage(acc):
         return None
     ce = d.get("cedar_ember") or {}
     out = {"u5": None, "r5": None, "u7": None, "r7": None,
-           "fable": None, "rf": None,
-           "resets": sum(g.get("resets_left") or 0
-                         for g in ce.get("grants") or []
-                         if ce.get("eligible") and not g.get("paused"))}
+           "fable": None, "rf": None, "resets": 0, "resets_ends": None,
+           "reset_cooldown": epoch(ce.get("cooldown_until"))}
+    for g in (ce.get("grants") or []) if ce.get("eligible") else []:
+        left, ends = g.get("resets_left"), epoch(g.get("ends_at"))
+        if g.get("paused") or not isinstance(left, int) or left <= 0 \
+                or (ends and ends <= time.time()):
+            continue
+        out["resets"] += left
+        if ends and (out["resets_ends"] is None or ends < out["resets_ends"]):
+            out["resets_ends"] = ends
     for key, pk, rk in (("five_hour", "u5", "r5"),
                         ("seven_day", "u7", "r7")):
         w = d.get(key) or {}
@@ -931,14 +1179,37 @@ def fetch_web_usage(acc):
             out["rf"] = epoch(l.get("resets_at"))
     return out
 
+def iso_epoch(v):
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+def is_free(tier):
+    t = (tier or "").lower()
+    return "free" in t or t in ("", "default_claude_ai")
+
 results = []
 for i, acc in enumerate(accounts):
     n = i + 1
     if not acc.get("token") or acc.get("disabled"):
         continue
+    # when the plan stops (cancellation or booked downgrade, cached by check):
+    # a cancellation in the past leaves the account free
+    cancel = iso_epoch(acc.get("plan_ends")) if acc.get("plan_ends") else None
+    down = iso_epoch((acc.get("plan_next") or {}).get("date")) \
+        if acc.get("plan_next") else None
+    future = [t for t in (cancel, down) if t and t > time.time()]
+    if is_free(acc.get("plan")) or (cancel and cancel <= time.time()):
+        continue  # free plans have no windows to use
 
     entry = {"n": n, "label": acc.get("label", ""), "rate_limited": False,
-             "util_5h": 1.0, "util_7d": 1.0, "retry_after": 999999}
+             "util_5h": 1.0, "util_7d": 1.0, "retry_after": 999999,
+             # what the decision engine reads (general strategy)
+             "u5": None, "u7": None, "r5": None, "r7": None,
+             "plan_end": min(future) if future else None, "free": False,
+             "disabled": False, "error": None, "resets": None,
+             "resets_ends": None, "reset_cooldown": None}
 
     # Cookie first: one free request carries 5h, 7d and Fable at once.
     web = fetch_web_usage(acc)
@@ -946,7 +1217,12 @@ for i, acc in enumerate(accounts):
         entry["util_5h"] = web["u5"] / 100.0
         entry["util_7d"] = (web["u7"] or 0) / 100.0
         entry["fable"], entry["rf"] = web["fable"], web["rf"]
-        entry["resets"] = web["resets"]
+        for k in ("u5", "u7", "r5", "r7", "resets", "resets_ends", "reset_cooldown"):
+            entry[k] = web[k]
+        # An unspent reset is lost with its plan
+        if entry["resets"] and entry["plan_end"] and (
+                entry["resets_ends"] is None or entry["plan_end"] < entry["resets_ends"]):
+            entry["resets_ends"] = entry["plan_end"]
         # A window at 100% is spent, which is what rate_limited means here.
         for pct, reset in ((web["u5"], web["r5"]), (web["u7"], web["r7"])):
             if pct is not None and pct >= 100:
@@ -982,6 +1258,17 @@ for i, acc in enumerate(accounts):
         }
     )
 
+    def take_engine(headers):
+        for k, hdr in (("u5", "5h"), ("u7", "7d")):
+            v = headers.get(f"anthropic-ratelimit-unified-{hdr}-utilization")
+            if v:
+                entry[k] = float(v) * 100
+        for k, hdr in (("r5", "5h"), ("r7", "7d")):
+            try:
+                entry[k] = int(headers.get(f"anthropic-ratelimit-unified-{hdr}-reset", ""))
+            except (ValueError, TypeError):
+                pass
+
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             headers = dict(r.headers)
@@ -989,8 +1276,10 @@ for i, acc in enumerate(accounts):
             u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
             entry["util_5h"] = float(u5) if u5 else 0.0
             entry["util_7d"] = float(u7) if u7 else 0.0
+            take_engine(headers)
     except urllib.error.HTTPError as e:
         headers = dict(e.headers)
+        take_engine(headers)
         try:
             body = json.loads(e.read())
             et = body.get("error", {}).get("type", "?")
@@ -1007,8 +1296,10 @@ for i, acc in enumerate(accounts):
             entry["util_7d"] = float(u7) if u7 else 1.0
         else:
             entry["rate_limited"] = True
-    except Exception:
+            entry["error"] = et
+    except Exception as e:
         entry["rate_limited"] = True
+        entry["error"] = type(e).__name__
 
     if strategy == "fable" and not entry["rate_limited"]:
         w = fetch_web_usage(acc)
@@ -1020,6 +1311,29 @@ for i, acc in enumerate(accounts):
     if strategy == "fable" and entry.get("fable") is not None:
         extra = f", fable={entry['fable']:.0f}%"
     sys.stderr.write(f"  Checked {n}: {entry['label']:<20} {'RATE LIMITED' if entry['rate_limited'] else 'OK'} (5h={entry['util_5h']*100:.0f}%{extra})\n")
+
+if strategy == "general":
+    # the same decision the watch makes (minus its memory of past switches)
+    d = engine.decide(results, active, time.time(), {}, False)
+    names = {r["n"]: r["label"] for r in results}
+    if d["action"] == "stay":
+        sys.stderr.write(f"\n  Already on the right account: {d['reason']}\n")
+        print("STAY")
+    elif d["action"] == "switch":
+        sys.stderr.write(f"\n  Best account: {d['target']} ({names.get(d['target'], '?')})"
+                         f" — {d['reason']}\n")
+        print(f"ROTATE {d['target']}")
+    else:
+        sys.stderr.write(f"\n  All accounts at their limit.\n")
+        if d["wake"]:
+            when = datetime.fromtimestamp(d["wake"]).strftime("%a %H:%M")
+            sys.stderr.write(f"  The first one frees up {when}.\n")
+        for r in results:
+            if r.get("resets"):
+                sys.stderr.write(f"  Account {r['n']} ({r['label']}) holds a free limit reset: "
+                                 f"claude-swap reset {r['n']}\n")
+        print("BLOCKED")
+    sys.exit(0)
 
 available = [r for r in results if not r["rate_limited"]]
 if strategy == "fable":
@@ -1416,18 +1730,25 @@ PYEOF
 
 cmd_reset() {
   check_store
-  local target="$1"
+  local target="$1" assume_yes="${2:-}"
   case "$target" in
-    ''|*[!0-9]*) echo "Usage: claude-swap reset <n>"; exit 1 ;;
+    ''|*[!0-9]*) echo "Usage: claude-swap reset <n> [--yes]"; exit 1 ;;
+  esac
+  case "$assume_yes" in
+    ''|--yes) ;;
+    *) echo "Usage: claude-swap reset <n> [--yes]"; exit 1 ;;
   esac
 
   local grant
   grant=$(_reset_run inspect "$target") || exit 1
-  echo ""
-  read -r -p "Spend it now? This cannot be undone. Type 'yes' to confirm: " confirm
-  if [ "$confirm" != "yes" ]; then
-    echo "Cancelled — the reset is still there."
-    return
+  # --yes is how the watcher spends one (watch start --auto-reset)
+  if [ "$assume_yes" != "--yes" ]; then
+    echo ""
+    read -r -p "Spend it now? This cannot be undone. Type 'yes' to confirm: " confirm
+    if [ "$confirm" != "yes" ]; then
+      echo "Cancelled — the reset is still there."
+      return
+    fi
   fi
   _reset_run claim "$target" "$grant"
 }
@@ -1638,36 +1959,130 @@ PYEOF
 }
 
 # --- Watcher ---
+# On macOS a LaunchAgent runs it: it starts at login and launchd restarts it
+# if it dies. Elsewhere it is a nohup'd process. Either way the Python loop
+# writes its own pidfile, which is what status and the statusline read.
+
+WATCH_LABEL="com.claude-swap.watch"
+WATCH_PLIST="$HOME/Library/LaunchAgents/$WATCH_LABEL.plist"
 
 watch_alive() {
   [ -f "$WATCH_PID" ] || return 1
   kill -0 "$(cat "$WATCH_PID" 2>/dev/null)" 2>/dev/null
 }
 
+_launchd_unload() {
+  launchctl bootout "gui/$(id -u)/$WATCH_LABEL" >/dev/null 2>&1 || true
+}
+
+_launchd_install() {
+  # $1 = absolute path of this script, the rest = its arguments
+  local py
+  py="$(python3 -c 'import sys; print(sys.executable)')"
+  _launchd_unload
+  mkdir -p "$(dirname "$WATCH_PLIST")"
+  # PATH pins the python3 this shell uses: launchd's bare PATH would pick
+  # another one (or none)
+  python3 - "$WATCH_PLIST" "$WATCH_LABEL" "$WATCH_LOG" \
+    "$(dirname "$py"):$(dirname "$1"):/usr/bin:/bin:/usr/sbin:/sbin" "$@" <<'PYEOF'
+import os, plistlib, sys
+path, label, log, path_env, *argv = sys.argv[1:]
+env = {"PATH": path_env}
+if os.environ.get("CLAUDE_SWAP_STORE"):
+    env["CLAUDE_SWAP_STORE"] = os.environ["CLAUDE_SWAP_STORE"]
+with open(path, "wb") as f:
+    plistlib.dump({"Label": label, "ProgramArguments": argv,
+                   "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 60,
+                   "StandardOutPath": log, "StandardErrorPath": log,
+                   "EnvironmentVariables": env}, f)
+PYEOF
+  launchctl bootstrap "gui/$(id -u)" "$WATCH_PLIST"
+}
+
+_watch_state_forget() {
+  # drop keys from the watch state, e.g. so a fresh start retries failed resets
+  [ -f "$WATCH_STATE" ] || return 0
+  python3 - "$WATCH_STATE" "$@" <<'PYEOF'
+import json, sys
+path, keys = sys.argv[1], sys.argv[2:]
+try:
+    with open(path) as f:
+        s = json.load(f)
+except Exception:
+    sys.exit(0)
+for k in keys:
+    s.pop(k, None)
+with open(path, "w") as f:
+    json.dump(s, f)
+PYEOF
+}
+
+_watch_args() {
+  # parse [general|fable] [--auto-reset] into WATCH_STRATEGY / WATCH_AUTO_RESET
+  WATCH_STRATEGY="general"
+  WATCH_AUTO_RESET=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      general|fable) WATCH_STRATEGY="$arg" ;;
+      --auto-reset) WATCH_AUTO_RESET=1 ;;
+      *) echo "Usage: claude-swap watch start [general|fable] [--auto-reset]"; exit 1 ;;
+    esac
+  done
+}
+
 cmd_watch_start() {
   check_store
-  local strategy="${1:-fable}"
-  case "$strategy" in
-    fable|general) ;;
-    *) echo "Invalid strategy: $strategy (use fable or general)"; exit 1 ;;
-  esac
+  _watch_args "$@"
   if watch_alive; then
     echo "Watch already running (PID $(cat "$WATCH_PID")). Stop it first with 'claude-swap watch stop'."
     return
   fi
   rm -f "$WATCH_PID"
+  # a fresh start gives every account another chance at a reset that failed
+  _watch_state_forget reset_failed
   local self
   self="$(command -v claude-swap || echo "$0")"
-  nohup "$self" watch run "$strategy" >> "$WATCH_LOG" 2>&1 &
-  echo $! > "$WATCH_PID"
-  echo "Watch started — strategy $strategy, PID $(cat "$WATCH_PID")"
-  echo "  log: $WATCH_LOG"
+  self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+  local args=(watch run "$WATCH_STRATEGY")
+  [ "$WATCH_AUTO_RESET" = 1 ] && args+=(--auto-reset)
+
+  if [ "$IS_MACOS" = true ]; then
+    _launchd_install "$self" "${args[@]}"
+  else
+    nohup "$self" "${args[@]}" >> "$WATCH_LOG" 2>&1 &
+  fi
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    watch_alive && break
+    sleep 0.5
+  done
+  if ! watch_alive; then
+    echo "Watch did not come up — see $WATCH_LOG"
+    exit 1
+  fi
+  local extra=""
+  [ "$WATCH_AUTO_RESET" = 1 ] && extra=", spends free resets on its own"
+  echo "Watch started — strategy $WATCH_STRATEGY$extra, PID $(cat "$WATCH_PID")"
+  if [ "$IS_MACOS" = true ]; then
+    echo "  runs as a LaunchAgent: starts at login, restarts if it dies"
+  fi
+  echo "  log:  $WATCH_LOG"
   echo "  stop: claude-swap watch stop  (or 'wp' in the interactive menu)"
 }
 
 cmd_watch_stop() {
+  local stopped=false
+  if [ "$IS_MACOS" = true ] && [ -f "$WATCH_PLIST" ]; then
+    _launchd_unload
+    rm -f "$WATCH_PLIST"
+    stopped=true
+  fi
   if watch_alive; then
-    kill "$(cat "$WATCH_PID")" 2>/dev/null
+    kill "$(cat "$WATCH_PID")" 2>/dev/null || true
+    stopped=true
+  fi
+  if [ "$stopped" = true ]; then
     rm -f "$WATCH_PID"
     echo "Watch stopped."
   elif [ -f "$WATCH_PID" ]; then
@@ -1680,20 +2095,32 @@ cmd_watch_stop() {
 
 cmd_watch_status() {
   if watch_alive; then
-    echo "Watch RUNNING (PID $(cat "$WATCH_PID"))"
+    local how=""
+    [ "$IS_MACOS" = true ] && [ -f "$WATCH_PLIST" ] && how=" · LaunchAgent"
+    echo "Watch RUNNING (PID $(cat "$WATCH_PID")$how)"
   elif [ -f "$WATCH_PID" ]; then
     echo "Watch DEAD (stale pidfile — clean up with 'claude-swap watch stop')"
   else
     echo "Watch not running."
   fi
   if [ -f "$WATCH_STATE" ]; then
-    python3 -c "
-import json
+    python3 - "$WATCH_STATE" <<'PYEOF'
+import json, sys
 try:
-    s = json.load(open('$WATCH_STATE'))
-    print(f\"  strategy {s.get('strategy','?')} · watching #{s.get('active','?')} · last probe {s.get('last_time','?')} ({s.get('last','no data')})\")
+    with open(sys.argv[1]) as f:
+        s = json.load(f)
 except Exception:
-    pass"
+    sys.exit(0)
+bits = [f"strategy {s.get('strategy', '?')}"]
+if s.get("auto_reset"):
+    bits.append("spends free resets")
+bits.append(f"watching #{s.get('active', '?')}"
+            + (" (picked by hand)" if s.get("manual") else ""))
+bits.append(f"last probe {s.get('last_time', '?')} ({s.get('last', 'no data')})")
+print("  " + " · ".join(bits))
+if s.get("decision"):
+    print(f"  {s['decision']}")
+PYEOF
   fi
   if [ -f "$WATCH_LOG" ]; then
     echo ""
@@ -1704,15 +2131,21 @@ except Exception:
 
 cmd_watch_run() {
   check_store
-  local strategy="${1:-fable}"
-  # exec: python replaces this bash and keeps its PID — so the pidfile
-  # written by 'watch start' points at the real process and 'watch stop' kills it
-  exec python3 - "$STORE" "$(command -v claude-swap || echo "$0")" "$strategy" "$WATCH_STATE" <<'PYEOF'
-import json, os, subprocess, sys, time
+  _watch_args "$@"
+  # exec: python replaces this bash and keeps its PID, so launchd (or
+  # nohup) tracks the real process
+  exec python3 - "$STORE" "$(command -v claude-swap || echo "$0")" \
+    "$WATCH_STRATEGY" "$WATCH_STATE" "$WATCH_AUTO_RESET" "$WATCH_PID" <<'PYEOF'
+import json, os, signal, subprocess, sys, time, types
 import urllib.request, urllib.error
 from datetime import datetime
 
-store_path, self_bin, strategy, state_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
+
+store_path, self_bin, strategy, state_path = sys.argv[1:5]
+auto_reset = sys.argv[5] == "1"
+pid_path = sys.argv[6]
 
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
@@ -1737,6 +2170,10 @@ def iso_epoch(v):
     except (ValueError, TypeError):
         return None
 
+def is_free(tier):
+    t = (tier or "").lower()
+    return "free" in t or t in ("", "default_claude_ai")
+
 def web_usage(acc):
     """5h/7d/Fable and free limit resets via claude.ai in one free request.
 
@@ -1752,36 +2189,29 @@ def web_usage(acc):
         f"https://claude.ai/api/organizations/{org}/usage?cedar_ember=1&skip_spend=1",
         headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
                  "Accept": "application/json"})
-
-    def epoch(v):
-        if not v:
-            return None
-        try:
-            return datetime.fromisoformat(
-                str(v).replace("Z", "+00:00")).timestamp()
-        except (ValueError, TypeError):
-            return None
-
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.load(r)
     except Exception:
         return None
-    out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None,
-           "resets": None, "resets_ends": None}
+    out = {"u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
+           "rf": None, "resets": None, "resets_ends": None,
+           "reset_cooldown": None}
     five, seven = d.get("five_hour") or {}, d.get("seven_day") or {}
     out["u5"], out["u7"] = five.get("utilization"), seven.get("utilization")
-    out["r7"] = epoch(seven.get("resets_at"))
+    out["r5"] = iso_epoch(five.get("resets_at"))
+    out["r7"] = iso_epoch(seven.get("resets_at"))
     for l in d.get("limits", []):
         m = (l.get("scope") or {}).get("model") or {}
         if (m.get("display_name") or "").lower() == "fable":
             out["fable"] = l.get("percent")
-            out["rf"] = epoch(l.get("resets_at"))
+            out["rf"] = iso_epoch(l.get("resets_at"))
     ce = d.get("cedar_ember")
     if isinstance(ce, dict):
         out["resets"] = 0
+        out["reset_cooldown"] = iso_epoch(ce.get("cooldown_until"))
         for g in (ce.get("grants") or []) if ce.get("eligible") else []:
-            left, ends = g.get("resets_left"), epoch(g.get("ends_at"))
+            left, ends = g.get("resets_left"), iso_epoch(g.get("ends_at"))
             if g.get("paused") or not isinstance(left, int) or left <= 0 \
                     or (ends and ends <= time.time()):
                 continue
@@ -1791,15 +2221,16 @@ def web_usage(acc):
     return out
 
 def probe(acc):
-    """5h/7d/Fable %, 7d reset epoch and rate_limited flag.
+    """Every window of one account, plus its rate_limited flag.
 
     Reads claude.ai with the stored cookie, which costs nothing and brings
     every window back at once. Only when that is unavailable does it fall
     back to the billed Haiku call, which yields no Fable figure.
     """
-    out = {"u5": None, "u7": None, "r7": None, "fable": None, "rf": None,
-           "resets": None, "resets_ends": None,
-           "rate_limited": False, "error": None, "src": None}
+    out = {"u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
+           "rf": None, "resets": None, "resets_ends": None,
+           "reset_cooldown": None, "rate_limited": False, "error": None,
+           "src": None}
     if not acc.get("token"):
         out["error"] = "NO TOKEN"
         return out
@@ -1808,6 +2239,7 @@ def probe(acc):
     if w:
         # kept even when the windows fall back to the billed probe below
         out["resets"], out["resets_ends"] = w["resets"], w["resets_ends"]
+        out["reset_cooldown"] = w["reset_cooldown"]
     if w and w["u5"] is not None:
         out.update(w)
         out["src"] = "web"
@@ -1832,10 +2264,11 @@ def probe(acc):
         u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
         if u5: out["u5"] = float(u5) * 100
         if u7: out["u7"] = float(u7) * 100
-        try:
-            out["r7"] = int(headers.get("anthropic-ratelimit-unified-7d-reset", ""))
-        except (ValueError, TypeError):
-            pass
+        for key, hdr in (("r5", "5h"), ("r7", "7d")):
+            try:
+                out[key] = int(headers.get(f"anthropic-ratelimit-unified-{hdr}-reset", ""))
+            except (ValueError, TypeError):
+                pass
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             take(dict(r.headers))
@@ -1853,31 +2286,42 @@ def probe(acc):
         out["error"] = type(e).__name__
     return out
 
+def plan_dates(acc):
+    """(when the current plan stops, epoch or None; whether it has stopped).
+
+    Both come from what `check` caches: a cancellation ends the paid plan,
+    a booked downgrade only shrinks it, so only the former leaves it free.
+    """
+    now = time.time()
+    cancel = iso_epoch(acc.get("plan_ends"))
+    down = iso_epoch((acc.get("plan_next") or {}).get("date"))
+    future = [t for t in (cancel, down) if t and t > now]
+    return (min(future) if future else None), bool(cancel and cancel <= now)
+
 def probe_all(store):
-    """Probe every enabled account and publish the snapshot for the statusline."""
+    """Probe every usable account and publish the snapshot for the statusline."""
     rows = []
     for i, acc in enumerate(store.get("accounts", [])):
-        n = i + 1
-        if acc.get("disabled") or not acc.get("token"):
-            rows.append({"n": n, "label": acc.get("label", ""), "u5": None,
-                         "u7": None, "r7": None, "fable": None, "rf": None,
-                         "resets": None, "resets_ends": None,
-                         "rate_limited": False, "plan": acc.get("plan"),
-                         "error": None, "disabled": bool(acc.get("disabled")),
-                         "src": None})
+        plan_end, ended = plan_dates(acc)
+        row = {"n": i + 1, "label": acc.get("label") or acc.get("email") or "?",
+               "plan": acc.get("plan"), "plan_end": plan_end,
+               "disabled": bool(acc.get("disabled")),
+               "free": is_free(acc.get("plan")) or ended,
+               "u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
+               "rf": None, "resets": None, "resets_ends": None,
+               "reset_cooldown": None, "rate_limited": False, "error": None,
+               "src": None}
+        # free plans only answer permission_error: nothing to read there
+        if row["disabled"] or row["free"] or not acc.get("token"):
+            rows.append(row)
             continue
-        r = probe(acc)
-        r.update({"n": n, "label": acc.get("label") or acc.get("email") or "?",
-                  "plan": acc.get("plan"), "disabled": False})
+        row.update(probe(acc))
         # An unspent reset is lost with its plan: a cancellation or booked
         # downgrade (cached by `check`) that comes first is its deadline.
-        stops = [e for e in (iso_epoch(acc.get("plan_ends")),
-                             iso_epoch((acc.get("plan_next") or {}).get("date")))
-                 if e and e > time.time()]
-        if r.get("resets") and stops and (
-                r["resets_ends"] is None or min(stops) < r["resets_ends"]):
-            r["resets_ends"] = min(stops)
-        rows.append(r)
+        if row["resets"] and plan_end and (
+                row["resets_ends"] is None or plan_end < row["resets_ends"]):
+            row["resets_ends"] = plan_end
+        rows.append(row)
         time.sleep(1.2)  # claude.ai throttles bursts
     try:
         snapshot = {"updated": time.time(), "active": store.get("active", 0),
@@ -1896,33 +2340,40 @@ def probe_all(store):
 def eta(ts):
     return ts if ts else float("inf")
 
-def choose_target(rows, exclude_n):
-    """Best target among the accounts already probed this cycle."""
-    cands = []
-    for r in rows:
-        if r["n"] == exclude_n or r["disabled"] or r["error"]:
-            continue
-        if r["rate_limited"] or r["u5"] is None:
-            continue
-        if strategy == "fable" and r["fable"] is not None and r["fable"] >= 99:
-            continue
-        cands.append(r)
+def fable_decide(rows, active):
+    """The Fable strategy, unchanged: leave at 99% of 5h, 7d or Fable."""
+    p = next((r for r in rows if r["n"] == active), None)
+    if p is None or p["error"]:
+        return {"action": "stay", "target": active, "wake": time.time() + 300,
+                "reason": f"#{active} probe error ({p['error'] if p else 'not found'})"}
+    peak = max([v for v in (p["u5"], p["u7"], p["fable"]) if v is not None],
+               default=None)
+    if not (p["rate_limited"] or (peak is not None and peak >= 99)):
+        return {"action": "stay", "target": active, "wake": None,
+                "reason": f"#{active} below 99%"}
+    cands = [r for r in rows
+             if r["n"] != active and not (r["disabled"] or r["free"] or r["error"])
+             and not r["rate_limited"] and r["u5"] is not None
+             and not (r["fable"] is not None and r["fable"] >= 99)]
+    reason = f"#{active} at the limit"
     if not cands:
-        return None
-    if strategy == "fable":
-        cands.sort(key=lambda c: (eta(c["rf"]),
-                                  c["fable"] if c["fable"] is not None else 101))
-    else:
-        cands.sort(key=lambda c: (eta(c["r7"]), c["u7"] or 0))
-    return cands[0]
+        return {"action": "wall", "target": None, "wake": time.time() + 600,
+                "reason": reason + " and every account is at its limit"}
+    cands.sort(key=lambda c: (eta(c["rf"]),
+                              c["fable"] if c["fable"] is not None else 101))
+    return {"action": "switch", "target": cands[0]["n"], "wake": None,
+            "reason": reason}
 
-state = {"strategy": strategy, "prewarned": False,
+state = {"strategy": strategy, "auto_reset": auto_reset, "prewarned": False,
          "started": datetime.now().isoformat(timespec="seconds")}
 try:
-    # carried over so a restart does not repeat the same expiry reminders
-    prev = json.load(open(state_path)).get("reset_warned")
-    if isinstance(prev, list):
-        state["reset_warned"] = prev
+    # carried over so a restart neither repeats reminders nor retries a
+    # reset too soon; the active account is adopted afresh below
+    with open(state_path) as f:
+        prev = json.load(f)
+    for k in ("reset_warned", "reset_tried", "reset_failed", "last_switch"):
+        if k in prev:
+            state[k] = prev[k]
 except Exception:
     pass
 
@@ -1936,11 +2387,7 @@ def save_state():
 RESET_REMIND_H = (72, 24)  # nudge twice before an unspent reset lapses
 
 def remind_expiring(rows):
-    """Notify once per account and threshold before a free limit reset lapses.
-
-    Only a reminder: spending one is irreversible and its value depends on
-    timing (it does not move the weekly renewal), so that stays manual.
-    """
+    """Notify once per account and threshold before a free limit reset lapses."""
     now = time.time()
     warned = [k for k in state.get("reset_warned", [])
               if float(k.split(":")[1]) > now]
@@ -1960,86 +2407,133 @@ def remind_expiring(rows):
         state["reset_warned"] = warned
         save_state()
 
-log(f"watch started — strategy {strategy}, PID {os.getpid()}")
+def clock(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M" if ts - time.time() < 20 * 3600
+                                               else "%a %H:%M")
+
+def run_logged(args):
+    r = subprocess.run(args, capture_output=True, text=True)
+    for line in ((r.stdout or "") + (r.stderr or "")).strip().splitlines():
+        if line.strip():
+            log(f"  {line.strip()}")
+    return r.returncode == 0
+
+def spend_reset(n, store, rows):
+    """Spend account n's free reset, then check the 7d really emptied."""
+    label = next((r["label"] for r in rows if r["n"] == n), "?")
+    log(f"spending the free reset on #{n} {label}")
+    ok = run_logged([self_bin, "reset", str(n), "--yes"])
+    state.setdefault("reset_tried", {})[str(n)] = time.time()
+    if not ok:
+        notify(f"Free reset on #{n} {label} not spent — see the watch log")
+    else:
+        after = probe(store["accounts"][n - 1])
+        if after.get("u7") is not None and after["u7"] < 50:
+            log(f"reset done: #{n} now {engine.usage(after)}")
+            notify(f"Free reset spent on #{n} {label} — now {engine.usage(after)}")
+        else:
+            state.setdefault("reset_failed", []).append(n)
+            log(f"reset on #{n} reported done but it reads {engine.usage(after)}"
+                " — no more resets there until the next 'watch start'")
+            notify(f"Reset on #{n} {label} did not empty the week — see the watch log")
+    save_state()
+
+# launchd and `watch stop` send SIGTERM: leave through the same door as ^C
+signal.signal(signal.SIGTERM, signal.default_int_handler)
+try:
+    with open(pid_path, "w") as f:
+        f.write(str(os.getpid()))
+except Exception:
+    pass
+
+log(f"watch started — strategy {strategy}"
+    + (", spends free resets" if auto_reset else "") + f", PID {os.getpid()}")
 notify(f"Watch running (strategy {strategy})")
 
 while True:
     try:
         with open(store_path) as f:
             store = json.load(f)
-        accounts = store.get("accounts", [])
         active = store.get("active", 0)
-        if not (1 <= active <= len(accounts)):
-            log("no valid active account — retrying in 5 min")
-            time.sleep(300)
-            continue
-        # Every account is probed each cycle: reading claude.ai costs
-        # nothing, it keeps the statusline cache honest for all of them,
-        # and a rotation can then pick a target without probing again.
+        # A switch the watch did not make is the user's pick: it is kept
+        # until that account reaches its limit.
+        if state.get("set_by_watch") is None:
+            state["set_by_watch"] = active
+        elif active != state["set_by_watch"]:
+            state.update({"set_by_watch": active, "manual": True})
+            log(f"#{active} picked by hand — kept until it reaches its limit")
+
         rows = probe_all(store)
         remind_expiring(rows)
-        p = next((r for r in rows if r["n"] == active),
-                 {"u5": None, "u7": None, "fable": None,
-                  "rate_limited": False, "error": "NOT FOUND"})
-        metrics = {}
-        if p["u5"] is not None:
-            metrics["5h"] = p["u5"]
-        if p["u7"] is not None:
-            metrics["7d"] = p["u7"]
-        if p.get("fable") is not None:
-            metrics["Fable"] = float(p["fable"])
-        desc = " · ".join(f"{k} {v:.0f}%" for k, v in metrics.items()) or "no data"
-        peak = max(metrics.values()) if metrics else None
-        state.update({"active": active, "last": desc,
+        p = next((r for r in rows if r["n"] == active), None)
+        if strategy == "general":
+            d = engine.decide(rows, active, time.time(), state, auto_reset)
+            desc = engine.usage(p) if p else "no data"
+            peak = engine.load(p) if p and p["u5"] is not None else 0
+        else:
+            d = fable_decide(rows, active)
+            metrics = {k: v for k, v in (("5h", p and p["u5"]), ("7d", p and p["u7"]),
+                                         ("Fable", p and p["fable"])) if v is not None}
+            desc = " · ".join(f"{k} {v:.0f}%" for k, v in metrics.items()) or "no data"
+            peak = max(metrics.values()) if metrics else 0
+        state.update({"active": active, "last": desc, "decision": d["reason"],
                       "last_time": datetime.now().strftime("%H:%M")})
         save_state()
 
-        if p["error"]:
-            log(f"#{active} probe error: {p['error']} — retrying in 5 min")
-            time.sleep(300)
+        if d["action"] == "reset":
+            spend_reset(d["target"], store, rows)
+            time.sleep(5)
             continue
 
-        if p["rate_limited"] or (peak is not None and peak >= 99):
-            reason = "RATE LIMITED" if p["rate_limited"] else desc
-            log(f"#{active} at the limit ({reason}) — picking a target ({strategy})")
-            notify(f"Account #{active} at the limit ({reason}). Looking for a swap…")
-            target = choose_target(rows, active)
-            if target:
-                log(f"rotating #{active} -> #{target['n']} ({target['label']})")
-                r = subprocess.run([self_bin, str(target["n"])],
-                                   capture_output=True, text=True)
-                for line in (r.stdout or r.stderr or "").strip().splitlines():
-                    log(f"  {line.strip()}")
-                if r.returncode == 0:
-                    notify(f"Switched to #{target['n']} {target['label']}")
-                    state["prewarned"] = False
-                    save_state()
-                    time.sleep(120)
-                else:
-                    log(f"rotation failed (rc={r.returncode})")
-                    notify("Rotation failed — check the watch log")
-                    time.sleep(300)
+        if d["action"] == "switch":
+            tgt = next((r for r in rows if r["n"] == d["target"]), {})
+            log(f"switch #{active} -> #{d['target']} {tgt.get('label', '')}: {d['reason']}")
+            if run_logged([self_bin, str(d["target"])]):
+                notify(f"Switched to #{d['target']} {tgt.get('label', '')} — {d['reason']}")
+                state.update({"last_switch": time.time(), "set_by_watch": d["target"],
+                              "manual": False, "wall_noted": False,
+                              "prewarned": False, "active": d["target"]})
+                save_state()
+                time.sleep(60)
             else:
-                holders = [f"#{r['n']}" for r in rows if r.get("resets")]
-                hint = (f" — free limit reset on {', '.join(holders)}"
-                        " (claude-swap reset <n>)") if holders else ""
-                log("no accounts available — retrying in 10 min" + hint)
-                notify("All accounts at the limit" + (hint or " — retrying in 10 min"))
-                time.sleep(600)
+                log("rotation failed")
+                notify("Rotation failed — check the watch log")
+                time.sleep(300)
             continue
 
-        if peak is not None and peak >= 95 and not state.get("prewarned"):
-            notify(f"Account #{active} at {peak:.0f}% ({desc}) — will rotate at 99%")
-            log(f"pre-warning: #{active} {desc}")
-            state["prewarned"] = True
-            save_state()
-        elif peak is not None and peak < 90 and state.get("prewarned"):
-            state["prewarned"] = False
+        cadence = 600 if peak < 80 else (180 if peak < 95 else 60)
+        if d["action"] == "wall":
+            cadence = 600  # nothing to switch to: no point probing every minute
+            if not state.get("wall_noted"):
+                when = f" — first one free at {clock(d['wake'])}" if d["wake"] else ""
+                holders = [f"#{r['n']}" for r in rows if r.get("resets")]
+                hint = (f" · free reset on {', '.join(holders)} (claude-swap reset <n>)"
+                        if holders and not auto_reset else "")
+                log(f"{d['reason']}{when}{hint}")
+                notify("All accounts at the limit" + (when or " — retrying in 10 min") + hint)
+                state["wall_noted"] = True
+                save_state()
+        elif state.get("wall_noted"):
+            state["wall_noted"] = False
             save_state()
 
-        interval = 600 if (peak or 0) < 80 else (180 if peak < 95 else 60)
-        log(f"#{active} {desc} — next probe in {interval // 60} min")
-        time.sleep(interval)
+        if strategy == "fable":
+            # the old pre-warning, kept for the Fable strategy only
+            if peak >= 95 and not state.get("prewarned"):
+                notify(f"Account #{active} at {peak:.0f}% ({desc}) — will rotate at 99%")
+                log(f"pre-warning: #{active} {desc}")
+                state["prewarned"] = True
+                save_state()
+            elif peak < 90 and state.get("prewarned"):
+                state["prewarned"] = False
+                save_state()
+
+        sleep_for = cadence
+        if d["wake"]:
+            # +20 s: let the window actually roll over before looking
+            sleep_for = min(cadence, max(30, d["wake"] - time.time() + 20))
+        log(f"#{active} {desc} — {d['reason']} — next look {clock(time.time() + sleep_for)}")
+        time.sleep(sleep_for)
     except KeyboardInterrupt:
         log("watch stopped")
         break
@@ -2134,7 +2628,7 @@ cmd_interactive() {
   local count
   count=$(python3 -c "import json; print(len(json.load(open('$STORE'))['accounts']))")
 
-  read -r -p "Switch? (1-$count · a=auto · af=auto fable · wf/wg=watch fable/general · wp=stop · ws=status · Enter=exit) " choice
+  read -r -p "Switch? (1-$count · a=auto · af=auto fable · wg=watch · wr=watch+resets · wf=watch fable · wp=stop · ws=status · Enter=exit) " choice
 
   case "$choice" in
     "") exit 0 ;;
@@ -2142,6 +2636,7 @@ cmd_interactive() {
     af) cmd_auto fable ;;
     wf) cmd_watch_start fable ;;
     wg) cmd_watch_start general ;;
+    wr) cmd_watch_start general --auto-reset ;;
     wp) cmd_watch_stop ;;
     ws) cmd_watch_status ;;
     [0-9]*) _do_rotate "$choice" ;;
@@ -2177,11 +2672,11 @@ case "${1:-}" in
     ;;
   watch)
     case "${2:-status}" in
-      start) cmd_watch_start "${3:-fable}" ;;
-      run) cmd_watch_run "${3:-fable}" ;;
+      start) shift 2; cmd_watch_start "$@" ;;
+      run) shift 2; cmd_watch_run "$@" ;;
       stop) cmd_watch_stop ;;
       status) cmd_watch_status ;;
-      *) echo "Usage: claude-swap watch [start [fable|general]|stop|status]"; exit 1 ;;
+      *) echo "Usage: claude-swap watch [start [general|fable] [--auto-reset]|stop|status]"; exit 1 ;;
     esac
     ;;
   add)
@@ -2197,7 +2692,7 @@ case "${1:-}" in
     cmd_keys_sync
     ;;
   reset)
-    cmd_reset "${2:-}"
+    cmd_reset "${2:-}" "${3:-}"
     ;;
   disable)
     cmd_set_disabled "${2:-}" 1 disable

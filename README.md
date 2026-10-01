@@ -2,8 +2,8 @@
 
 Rotate between multiple Claude Max accounts in Claude Code — with a live
 dashboard of every account's 5h / 7d / Fable limits, a renewal calendar,
-swap strategies, and an optional watcher that rotates for you before you
-hit the wall.
+and a watcher that switches for you before you hit the wall, spending
+first the quota that would be lost first.
 
 ![claude-swap interactive dashboard](assets/claude-swap-check.png)
 
@@ -13,10 +13,10 @@ hit the wall.
 ```
 $ claude-swap check
 
-claude-swap v1.7.0
+claude-swap v1.8.0
 
 Active: 2 (Work / me@work.com)
-Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% · 7d 44% · Fable 65%
+Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
 
  #   Account       Plan    5h           reset   7d           Fable        Rst │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
 ──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
@@ -29,12 +29,11 @@ Watch:  RUNNING (fable, PID 63012) — watching #2 — last probe 22:05: 5h 8% �
   Plan ending: #1 Personal MAX20X cancelled, ends Fri 02 Oct 11:06 (in 3d)
   Free limit resets: #1 Personal ×1 · until Fri 02 Oct 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
 
-  Fable strategy — soonest renewal first (excludes rate-limited and Fable 100%)
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
-
-  General 7d strategy — soonest renewal first (excludes rate-limited)
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
+  Watcher order — what is lost first goes first · leaves at 98% of 5h or 7d, comes back once there is room
+  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·     renews Tue 28 17:00
+ *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·     renews Wed 29 08:00
+  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00    ·      ·      ·      ·      ·     blocked until Sat 25 22:00
+  Now: switch to #3 — #3 goes first (5h 0% · 7d 63%)
 ```
 
 </details>
@@ -167,7 +166,7 @@ claude-swap            # interactive: dashboard + switch prompt
 ### 5. Optional: hands-free switching
 
 ```bash
-claude-swap watch start fable
+claude-swap watch start                # or add --auto-reset (see below)
 ```
 
 See [watch mode](#watch-mode--automatic-switching) below.
@@ -186,8 +185,9 @@ claude-swap reset 3    # spend account 3's free limit reset (asks first)
 ```
 
 Interactive menu shortcuts: a number switches account, `a` = auto,
-`af` = auto fable, `wf`/`wg` = start watcher (fable/general), `wp` =
-stop watcher, `ws` = watcher status, Enter = exit.
+`af` = auto fable, `wg` = start watcher, `wr` = start watcher with
+`--auto-reset`, `wf` = start watcher (fable), `wp` = stop watcher,
+`ws` = watcher status, Enter = exit.
 
 ## Reading the dashboard
 
@@ -212,37 +212,68 @@ stop watcher, `ws` = watcher status, Enter = exit.
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
   it falls on a different day.
-- **Strategies** — the same rows reordered: consume first the account
-  whose weekly limit renews soonest (what you spend there comes back
-  first); % is only the tiebreaker. Rate-limited and disabled accounts
-  are excluded; the Fable strategy also excludes accounts at 100% Fable.
+- **Watcher order** — the same rows in the order the watcher (and
+  `auto`) consumes them, each with the reason: when its quota is lost
+  (`renews …` or `plan ends …`), `last day`, `holds a reset`, `little
+  room`, or `blocked until …` for accounts at their limit, which come
+  last. The `Now:` line says what the general strategy would do right
+  now. See [watch mode](#watch-mode--automatic-switching).
 
 ## Watch mode — automatic switching
 
 ```bash
-claude-swap watch start fable     # or: general
+claude-swap watch start                 # general strategy
+claude-swap watch start --auto-reset    # ...and spend free resets on its own
 claude-swap watch status
 claude-swap watch stop
 ```
 
-A small daemon (plain process + pidfile, log in
-`~/.claude/claude-swap-watch.log`) probes **every account** each cycle,
-which is free over the cookie, so a rotation can pick its target from
-figures it already has. The active account sets the pace on an adaptive
-schedule — every 10 min below 80%, every 3 min at 80–95%,
-every minute above 95%. Probes read claude.ai with the cookie and cost
-zero tokens; only an account without a working cookie falls back to a
-~5-token Haiku call.
+On macOS the watcher runs as a LaunchAgent
+(`~/Library/LaunchAgents/com.claude-swap.watch.plist`): it starts at
+login and launchd restarts it if it dies; `watch stop` unloads and
+removes it. On Linux it is a plain `nohup` process. Either way it logs
+to `~/.claude/claude-swap-watch.log`.
 
-- At **95%** it sends a macOS notification (pre-warning, once per crossing).
-- At **99%** (or on rate-limit) it probes the rest, picks the best target
-  with the chosen strategy (soonest weekly renewal first), rotates, and
-  notifies. If everything is exhausted it tells you and keeps retrying —
-  and names any account that still holds a free limit reset.
-- After rotating it watches the new active account automatically.
-- An unspent free limit reset gets a reminder 72 h and 24 h before it
-  lapses. The watcher never spends one itself: that is irreversible, and
-  what it is worth depends on timing.
+Each cycle it probes **every account** (free over the cookie) and asks
+the same decision engine `auto` and `check` use:
+
+- **Order** — consume first the quota that is lost first: each account's
+  weekly renewal, or the end of its plan when that comes sooner (a
+  cancelled plan loses whatever is left of its week). Quota that dies
+  within 24 h goes first, then accounts holding a free reset (reaching
+  the limit early is what makes a reset worth a whole week), then the rest.
+- **Leave** — when the active account reaches **98%** of its 5h *or* its
+  7d window, or gets rate-limited.
+- **Target** — the first account in that order with room (5h ≤ 80%,
+  7d ≤ 95%); with no room anywhere, the least loaded one.
+- **Come back** — once an account higher in the order has room again
+  (its 5h window rolled over, say) it switches back, so the quota that
+  expires first is not left unused. Never within 15 min of the last
+  switch, and an account you picked by hand is kept until it reaches its
+  limit. Each switch makes open sessions rebuild their prompt cache on
+  the new account, which is why it does not hop for crumbs.
+- **Wall** — with every account at its limit it notifies once, sleeps
+  until the first one frees up and switches there.
+- **Pace** — every 10 min while the active account is below 80%, 3 min
+  up to 95%, then every minute; it also wakes at the next known event (a
+  5h rollover, a weekly renewal, a plan end), so it reacts within a
+  minute. Zero tokens: only an account without a working cookie falls
+  back to a ~5-token Haiku call, and free-plan accounts are not probed.
+
+With `--auto-reset` it also spends **free limit resets** on its own: as
+soon as an account holding one reaches 98% of its 7d window — unless
+that week renews within 24 h anyway, in which case it waits (and spends
+it only if the reset would lapse first). It re-reads the usage
+afterwards, spends at most one per account every 6 h, and stops trying
+on an account whose week did not empty until the next `watch start`.
+Every spend is logged and notified. Without the flag it only reminds
+you, 72 h and 24 h before an unspent reset lapses.
+
+The thresholds are constants at the top of the script (`LEAVE`,
+`ROOM_5H`, `ROOM_7D`, `LAST_DAY`, `MIN_DWELL`…).
+
+`watch start fable` keeps the previous Fable strategy: leave at 99% of
+5h, 7d or Fable, pick the soonest Fable renewal, pre-warn at 95%.
 
 On Linux there are no notifications — everything still lands in the log.
 
@@ -253,13 +284,13 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap` | Interactive: dashboard + switch prompt |
 | `claude-swap <n>` | Switch to account N |
 | `claude-swap status` | Current account + watcher state |
-| `claude-swap check` | Full dashboard (limits, calendar, strategies) |
+| `claude-swap check` | Full dashboard (limits, calendar, watcher order) |
 | `claude-swap auto [fable\|general]` | Auto-switch to the best available account |
 | `claude-swap af` | Alias for `auto fable` |
-| `claude-swap watch start [fable\|general]` | Background auto-switcher (99% trigger, 95% pre-warning) |
+| `claude-swap watch start [general\|fable] [--auto-reset]` | Background auto-switcher (LaunchAgent on macOS) — see watch mode |
 | `claude-swap watch stop` | Stop the watcher |
 | `claude-swap watch status` | Watcher state + last probe + log tail |
-| `claude-swap reset <n>` | Spend account N's free limit reset (shows what it clears, asks for `yes`) |
+| `claude-swap reset <n> [--yes]` | Spend account N's free limit reset (shows what it clears, asks for `yes` unless `--yes`) |
 | `claude-swap add` | Add a new account |
 | `claude-swap remove <n>` | Remove an account |
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
@@ -317,7 +348,8 @@ first. Anthropic's help page: [What is a limit reset?](https://support.claude.co
   "Reset for free" button sends. It then re-reads the usage to confirm,
   so a lost reply is not reported as a failure.
 - Best use: an account at its limit with days left until its weekly
-  renewal, before the grant lapses.
+  renewal, before the grant lapses — which is exactly when
+  `watch start --auto-reset` spends one.
 
 ## Storage & security
 
@@ -326,7 +358,8 @@ Everything lives locally under `~/.claude/`:
 | File | Contents |
 |------|----------|
 | `claude-swap.json` | Accounts: labels, emails, setup tokens, sessionKeys, cached org/plan and plan end date (`600` perms) |
-| `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe, log |
+| `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe and decision, log |
+| `~/Library/LaunchAgents/com.claude-swap.watch.plist` | The watcher's LaunchAgent (macOS, while it runs) |
 | `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 
 Tokens are only ever sent to `api.anthropic.com`; sessionKeys only to
@@ -398,3 +431,15 @@ manually (plus `claude-swap-watch.*`) for a clean removal.
 ## License
 
 MIT
+
+## Development
+
+```bash
+make test      # decision-engine scenarios (python3 -m unittest)
+```
+
+The general strategy lives in one place: the `ENGINE_PY` block near the
+top of the script, a pure function that `check`, `auto` and the watcher
+all run. `tests/test_engine.py` loads it straight from the script and
+replays situations — leaving at 98%, coming back, plan ends, the wall,
+when a reset is spent — so a change to the rules shows up there first.
