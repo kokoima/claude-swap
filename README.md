@@ -13,26 +13,26 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.8.0
+claude-swap v1.9.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
 
  #   Account       Plan    5h           reset   7d           Fable        Rst │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
 ──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00    ·      ·      ·      ·      ·
+  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00 ✕11:06 ────────────────────────────
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
   3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·
   4  Old Account   FREE   — disabled —
 
-  calendar: 7d reset time · Fable when it falls on a different day   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
-  Plan ending: #1 Personal MAX20X cancelled, ends Fri 02 Oct 11:06 (in 3d)
-  Free limit resets: #1 Personal ×1 · until Fri 02 Oct 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
+  calendar: 7d reset time · Fable when it falls on a different day · ↓ downgrade · ✕ plan ends ─── no plan   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
+  Plan ending: #1 Personal MAX20X cancelled, ends Sun 26 Sep 11:06 (in 3d) · renews Sat 25 22:00 → 13h 6m until then
+  Free limit resets: #1 Personal ×1 · until Sun 26 Sep 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
 
   Watcher order — what is lost first goes first · leaves at 98% of 5h or 7d, comes back once there is room
   3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·     renews Tue 28 17:00
  *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·     renews Wed 29 08:00
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00    ·      ·      ·      ·      ·     blocked until Sat 25 22:00
+  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00 ✕11:06 ────────────────────────────  blocked until Sat 25 22:00
   Now: switch to #3 — #3 goes first (5h 0% · 7d 63%)
 ```
 
@@ -198,7 +198,13 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
   A **yellow** plan is about to stop: a `Plan ending: … cancelled, ends
   Fri 02 Oct 11:06 (in 3d)` line gives the cancellation date claude.ai's
   billing page shows, and `Plan downgrade: … MAX20X → PRO on …` a booked
-  step down. Both are read daily from `/subscription_details`.
+  step down. Each adds what the stop leaves of the week: the part still
+  unused that it cuts off (`12% of this week unused`), or the stretch
+  between the last renewal and the stop (`renews Sat 03 06:00 → 1h 56m
+  until then`; `~` when that renewal is projected a week at a time).
+  Both are read daily from `/subscription_details`, by `check` and by the
+  running watcher, so a cancellation or a resubscription shows up
+  without anyone running `check`.
 - **5h / 7d / Fable** — color bars: green <50%, yellow 50–80%, red ≥80%.
   `-` means no data: an expired sessionKey, or a plan with no such
   window.
@@ -211,7 +217,11 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
   marked `— plan ends`. See [free limit resets](#free-limit-resets).
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
-  it falls on a different day.
+  it falls on a different day. A cancelled plan shows `✕HH:MM` in red on
+  the day it ends and a line on every day after it, and drops the
+  renewals that fall after the end, since they never come; a booked
+  downgrade shows `↓HH:MM` in cyan and the row goes on. One mark per
+  day: the end beats a downgrade, which beats a renewal.
 - **Watcher order** — the same rows in the order the watcher (and
   `auto`) consumes them, each with the reason: when its quota is lost
   (`renews …` or `plan ends …`), `last day`, `holds a reset`, `little

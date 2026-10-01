@@ -235,10 +235,155 @@ class Resets(unittest.TestCase):
         self.assertNotEqual(d["action"], "reset")
 
 
+class Unblock(unittest.TestCase):
+    def test_lifts_at_the_renewal(self):
+        r = acct(1, u7=100, r7=NOW + 30 * H)
+        self.assertEqual(E["unblock_at"](r), NOW + 30 * H)
+
+    def test_never_lifts_when_the_plan_ends_first(self):
+        # #3 on Thu night: week spent, renewal Tue, plan gone Fri 11:06
+        r = acct(3, u5=8, u7=98, r7=NOW + 110 * H,
+                 plan_end=NOW + 15 * H, cancel_at=NOW + 15 * H)
+        self.assertIsNone(E["unblock_at"](r))
+
+    def test_a_downgrade_does_not_stop_it(self):
+        r = acct(3, u7=98, r7=NOW + 110 * H,
+                 plan_end=NOW + 15 * H, down_at=NOW + 15 * H)
+        self.assertEqual(E["unblock_at"](r), NOW + 110 * H)
+
+
 class Wake(unittest.TestCase):
     def test_wakes_at_the_next_known_event(self):
         d = decide(today(), 3, LONG_AGO)
         self.assertEqual(d["wake"], NOW + 1.8 * H)  # #2's 5h window resets
+
+
+# The check calendar: eight days, each one a slot from midnight to midnight.
+DAYS = [(NOW + k * 24 * H, NOW + (k + 1) * 24 * H) for k in range(8)]
+GONE = ("gone", None)
+
+
+def marks(**r):
+    return E["timeline"](r, DAYS)
+
+
+class Timeline(unittest.TestCase):
+    def test_renewal_on_its_day(self):
+        m = marks(r7=NOW + 50 * H)
+        self.assertEqual(m[2], ("renew", NOW + 50 * H))
+        self.assertEqual(m[:2] + m[3:], [None] * 7)
+
+    def test_plan_end_on_its_day_and_no_plan_after(self):
+        m = marks(r7=NOW + 139 * H, cancel_at=NOW + 37 * H)
+        self.assertEqual(m[0], None)
+        self.assertEqual(m[1], ("end", NOW + 37 * H))
+        # #3: the Tue renewal never comes, the plan is gone by then
+        self.assertEqual(m[2:], [GONE] * 6)
+
+    def test_end_wins_over_a_renewal_the_same_day(self):
+        # #8 renews Sat 06:00 and its plan ends 07:56
+        m = marks(r7=NOW + 54 * H, cancel_at=NOW + 56 * H)
+        self.assertEqual(m[2], ("end", NOW + 56 * H))
+
+    def test_plan_already_ended(self):
+        self.assertEqual(marks(cancel_at=NOW - 5 * H), [GONE] * 8)
+
+    def test_downgrade_on_its_day_and_the_row_goes_on(self):
+        m = marks(r7=NOW + 150 * H, down_at=NOW + 30 * H)
+        self.assertEqual(m[1], ("down", NOW + 30 * H))
+        self.assertEqual(m[6], ("renew", NOW + 150 * H))
+        self.assertNotIn(GONE, m)
+
+    def test_fable_reset_on_another_day(self):
+        self.assertEqual(marks(r7=NOW + 50 * H, rf=NOW + 80 * H)[3],
+                         ("fable", NOW + 80 * H))
+
+    def test_fable_reset_the_same_day_gives_way_to_the_renewal(self):
+        self.assertEqual(marks(r7=NOW + 50 * H, rf=NOW + 51 * H)[2],
+                         ("renew", NOW + 50 * H))
+
+
+class Ending(unittest.TestCase):
+    def ending(self, u7, r7, end):
+        return E["ending"]({"u7": u7, "r7": r7}, end)
+
+    def test_end_before_the_renewal_cuts_the_unused_week(self):
+        # #3: 88% used, plan ends before its Tue renewal
+        self.assertEqual(self.ending(88, NOW + 139 * H, NOW + 37 * H),
+                         {"left": 12, "renews": None, "tail": None,
+                          "projected": False})
+
+    def test_renewal_just_before_the_end_leaves_a_short_stretch(self):
+        # #8: renews Sat 06:00, plan ends 07:56
+        e = self.ending(100, NOW + 56 * H, NOW + 58 * H)
+        self.assertEqual((e["left"], e["renews"], e["tail"], e["projected"]),
+                         (None, NOW + 56 * H, 2 * H, False))
+
+    def test_later_renewals_are_projected_a_week_apart(self):
+        # #5: renews Sun, plan ends 11 days later: last renewal one week on
+        e = self.ending(98, NOW + 62 * H, NOW + 313 * H)
+        self.assertEqual((e["renews"], e["tail"], e["projected"]),
+                         (NOW + 230 * H, 83 * H, True))
+
+    def test_without_data(self):
+        self.assertEqual(self.ending(None, None, NOW + 37 * H),
+                         {"left": None, "renews": None, "tail": None,
+                          "projected": False})
+
+
+def sub_acc(**kw):
+    acc = {"session_key": "sk", "org_id": "org",
+           "plan": "default_claude_max_20x", "sub_checked": NOW - 25 * H}
+    acc.update(kw)
+    return acc
+
+
+class Subscription(unittest.TestCase):
+    def due(self, accounts, tried=None):
+        return E["subs_due"](accounts, NOW, tried or {})
+
+    def test_read_once_a_day(self):
+        self.assertEqual(self.due([sub_acc()]), [1])
+        self.assertEqual(self.due([sub_acc(sub_checked=NOW - 2 * H)]), [])
+
+    def test_never_read_is_due(self):
+        acc = sub_acc()
+        del acc["sub_checked"]
+        self.assertEqual(self.due([acc]), [1])
+
+    def test_skips_free_disabled_and_cookieless_accounts(self):
+        self.assertEqual(self.due([sub_acc(plan="default_claude_ai"),
+                                   sub_acc(disabled=True),
+                                   sub_acc(session_key=None),
+                                   sub_acc(org_id=None),
+                                   sub_acc()]), [5])
+
+    def test_an_ended_plan_is_still_read_to_catch_a_resubscription(self):
+        acc = sub_acc(plan_ends="2026-09-01T00:00:00Z")
+        self.assertEqual(self.due([acc]), [1])
+
+    def test_waits_an_hour_after_a_failed_read(self):
+        self.assertEqual(self.due([sub_acc()], {"1": NOW - 0.5 * H}), [])
+        self.assertEqual(self.due([sub_acc()], {"1": NOW - 2 * H}), [1])
+
+    def test_parses_a_cancellation(self):
+        self.assertEqual(
+            E["parse_subscription"]({"plan_ending_at": "2026-10-02T09:05:45Z",
+                                     "scheduled_downgrade": None}),
+            {"plan_ends": "2026-10-02T09:05:45Z", "plan_next": None})
+
+    def test_parses_a_downgrade(self):
+        s = {"plan_ending_at": None,
+             "scheduled_downgrade": {"plan_type": "claude_pro",
+                                     "date": "2026-10-10T00:00:00Z"}}
+        self.assertEqual(E["parse_subscription"](s),
+                         {"plan_ends": None,
+                          "plan_next": {"plan": "claude_pro",
+                                        "date": "2026-10-10T00:00:00Z"}})
+
+    def test_a_renewed_subscription_clears_the_end(self):
+        self.assertEqual(E["parse_subscription"]({"plan_ending_at": None}),
+                         {"plan_ends": None, "plan_next": None})
 
 
 if __name__ == "__main__":

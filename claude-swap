@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -34,7 +34,8 @@ IS_MACOS=false
 # the clock passed in — so tests/test_engine.py can replay any situation.
 read -r -d '' ENGINE_PY <<'PYEOF' || true
 # A row: n, label, u5/u7 (% or None), r5/r7 (window resets, epoch or None),
-# plan_end (cancellation or downgrade, epoch or None), free, disabled, error,
+# plan_end (cancellation or downgrade, epoch or None), cancel_at (when a
+# cancelled plan stops, epoch or None), free, disabled, error,
 # rate_limited, resets (spendable count or None), resets_ends (when they
 # lapse, epoch or None), reset_cooldown (epoch or None).
 #
@@ -104,13 +105,17 @@ def rank(rows, now):
 
 
 def unblock_at(r):
-    """When a blocked account is usable again; None if unknown."""
+    """When a blocked account is usable again; None if unknown or never,
+    which is the case when its cancelled plan ends first."""
     times = []
     if (r.get("u5") or 0) >= LEAVE:
         times.append(r.get("r5"))
     if (r.get("u7") or 0) >= LEAVE:
         times.append(r.get("r7"))
     if not times or None in times:
+        return None
+    cancel = r.get("cancel_at")
+    if cancel and max(times) >= cancel:
         return None
     return max(times)
 
@@ -211,6 +216,96 @@ def decide(rows, active, now, state, auto_reset=False):
         return out("switch", best["n"], ahead)
 
     return out("stay", active, f"#{active} goes first")
+
+
+# --- Plan timeline: what check draws, and when the watch re-reads it ---
+# cancel_at is when a cancelled plan stops (the account turns free) and
+# down_at when a booked downgrade lands (the account goes on, smaller).
+
+WEEK = 7 * 86400
+SUB_TTL = 86400     # a subscription is re-read once a day
+SUB_RETRY = 3600    # ...or an hour after a read that failed
+
+
+def timeline(r, days):
+    """One calendar mark per day, days being (start, end) epochs.
+
+    ("end", t) on the day the plan stops and ("gone", None) on every day
+    after it; ("down", t) on a downgrade; ("renew", t) on the weekly
+    renewal and ("fable", t) on a Fable one on another day, both only if
+    they come before the end, since after it they never happen. One mark
+    per day: end beats downgrade beats renewal beats Fable. None = nothing.
+    """
+    cancel = r.get("cancel_at")
+    events = [("end", cancel), ("down", r.get("down_at"))]
+    events += [(kind, t) for kind, t in (("renew", r.get("r7")),
+                                         ("fable", r.get("rf")))
+               if t and not (cancel and t >= cancel)]
+    marks = []
+    for start, end in days:
+        if cancel and start >= cancel:
+            marks.append(("gone", None))
+            continue
+        marks.append(next(((kind, t) for kind, t in events
+                           if t and start <= t < end), None))
+    return marks
+
+
+def ending(r, end):
+    """What a plan stopping at `end` leaves of the weekly quota.
+
+    left: % of the current week still unused, which the end cuts off when
+    it comes before the renewal. Otherwise renews is the last renewal before
+    the end and tail the stretch from it to the end; projected says it was
+    counted a week at a time from the next one, so it is an estimate.
+    """
+    out = {"left": None, "renews": None, "tail": None, "projected": False}
+    u7, r7 = r.get("u7"), r.get("r7")
+    if r7 is None or r7 >= end:
+        if u7 is not None:
+            out["left"] = max(0, round(100 - u7))
+        return out
+    weeks = int((end - r7) // WEEK)
+    if r7 + weeks * WEEK >= end:
+        weeks -= 1
+    out.update(renews=r7 + weeks * WEEK, tail=end - (r7 + weeks * WEEK),
+               projected=weeks > 0)
+    return out
+
+
+def parse_subscription(s):
+    """plan_ends / plan_next as the store keeps them, from subscription_details.
+
+    plan_ending_at is claude.ai's "Your subscription ends on …"; a smaller
+    plan booked for later comes as scheduled_downgrade instead.
+    """
+    s = s or {}
+    down = s.get("scheduled_downgrade") or {}
+    return {"plan_ends": s.get("plan_ending_at"),
+            "plan_next": ({"plan": down.get("plan_type"), "date": down.get("date")}
+                          if down.get("plan_type") else None)}
+
+
+def subs_due(accounts, now, tried):
+    """1-based numbers of the accounts whose subscription is worth re-reading.
+
+    Paid plans with a cookie, once a day. A plan past its cached end is read
+    too, which is how a resubscription shows up. tried maps "n" to the
+    last failed read, retried an hour later.
+    """
+    due = []
+    for n, acc in enumerate(accounts, 1):
+        tier = (acc.get("plan") or "").lower()
+        if (acc.get("disabled") or not acc.get("session_key")
+                or not acc.get("org_id")
+                or "free" in tier or tier in ("", "default_claude_ai")):
+            continue
+        if now - (acc.get("sub_checked") or 0) < SUB_TTL:
+            continue
+        if now - (tried.get(str(n)) or 0) < SUB_RETRY:
+            continue
+        due.append(n)
+    return due
 PYEOF
 export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
@@ -576,12 +671,7 @@ def fetch_web_usage(acc):
             return
         except Exception:
             return
-        down = s.get("scheduled_downgrade") or {}
-        acc.update({"plan_ends": s.get("plan_ending_at"),
-                    "plan_next": ({"plan": down.get("plan_type"),
-                                   "date": down.get("date")}
-                                  if down.get("plan_type") else None),
-                    "sub_checked": int(time.time())})
+        acc.update(engine.parse_subscription(s), sub_checked=int(time.time()))
         store_dirty[0] = True
 
     def plan_age():
@@ -908,15 +998,29 @@ def resets_cell(res):
 
 today = datetime.now().date()
 cal_days = [today + timedelta(days=k) for k in range(NCAL)]
+# each calendar day as epochs, local midnight to midnight (engine.timeline)
+cal_bounds = [tuple(datetime.combine(d + timedelta(days=k), datetime.min.time())
+                    .timestamp() for k in (0, 1)) for d in cal_days]
+
+def ep(dt):
+    return dt.timestamp() if dt else None
 
 def trunc(s, w):
     return s if len(s) <= w else s[:w - 1] + "…"
 
-def day_slot(dt):
-    if dt is None:
-        return None
-    k = (dt.date() - today).days
-    return k if 0 <= k < NCAL else None
+# yellow = 7d renewal · magenta = Fable renewal on another day ·
+# cyan ↓ = downgrade · red ✕ = plan ends, and a line on the days without one
+CAL_MARKS = {"renew": (YELLOW, ""), "fable": (MAG, ""),
+             "down": (CYAN, "↓"), "end": (RED, "✕")}
+
+def cal_cell(mark):
+    if mark is None:
+        return paint(GREY, "·")
+    kind, t = mark
+    if kind == "gone":
+        return paint(GREY, "─" * CW)
+    col, sign = CAL_MARKS[kind]
+    return paint(col, sign + datetime.fromtimestamp(t).strftime("%H:%M"))
 
 def left_part(*cells):
     return "  ".join(cells) + " "
@@ -946,16 +1050,14 @@ def render_row(row):
     else:
         name_cell = pad(name, W_LB)
 
-    # calendar cell = weekly reset time on the day it falls:
-    # yellow = 7d reset; magenta = Fable reset only when on a different day
-    cells = {}
-    s7 = day_slot(row["r7"])
-    sf = day_slot(row["rf"])
-    if s7 is not None:
-        cells[s7] = paint(YELLOW, row["r7"].strftime("%H:%M"))
-    if sf is not None and sf != s7:
-        cells[sf] = paint(MAG, row["rf"].strftime("%H:%M"))
-    cal = "".join(center(cells.get(k, paint(GREY, "·")), CW) for k in range(NCAL))
+    # calendar: what happens to the week and the plan on each day
+    acc = accounts[row["n"] - 1]
+    marks = engine.timeline({
+        "r7": ep(row["r7"]), "rf": ep(row["rf"]),
+        "cancel_at": ep(parse_iso(acc.get("plan_ends"))),
+        "down_at": ep(parse_iso((acc.get("plan_next") or {}).get("date")))},
+        cal_bounds)
+    cal = "".join(center(cal_cell(m), CW) for m in marks)
 
     line = left_part(
         num, name_cell, plan_cell(row["plan"], row["plan_end"] is not None),
@@ -972,7 +1074,9 @@ for row in results:
 
 print()
 print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
-      + paint(MAG, "Fable") + " when it falls on a different day"
+      + paint(MAG, "Fable") + " when it falls on a different day · "
+      + paint(CYAN, "↓") + " downgrade · " + paint(RED, "✕") + " plan ends"
+      + paint(GREY, " ───") + " no plan"
       + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
                     "   │   Rst: free limit resets left (? = no valid cookie)"))
 
@@ -995,6 +1099,26 @@ for acc, old, new in plan_changes:
           + f"#{n} {acc.get('label', '?')} " + paint(oc, o) + " → " + paint(wc, w))
 
 # ---------- subscriptions that stop: cancelled, or a smaller plan booked ----------
+def span(sec):
+    m = int(sec // 60)
+    d, h, mm = m // 1440, m % 1440 // 60, m % 60
+    return f"{d}d {h}h" if d else (f"{h}h {mm}m" if h else f"{mm}m")
+
+def ending_note(r):
+    """What the stop leaves of the week: the unused part it cuts off, or
+    the stretch between the last renewal and the stop."""
+    e = engine.ending({"u7": r["u7"], "r7": ep(r["r7"])}, ep(r["plan_end"]))
+    if e["left"] is not None:
+        txt = f"{e['left']}% of this week unused"
+    elif e["renews"] is not None:
+        t = datetime.fromtimestamp(e["renews"]).strftime("%a %d %H:%M")
+        tilde = "~" if e["projected"] else ""
+        txt = (f"{'last renewal' if e['projected'] else 'renews'} {tilde}{t}"
+               f" → {tilde}{span(e['tail'])} until then")
+    else:
+        return ""
+    return paint(GREY, " · " + txt)
+
 for r in results:
     if r["disabled"] or not r["plan_end"]:
         continue
@@ -1004,10 +1128,11 @@ for r in results:
     if nxt and parse_iso(nxt.get("date")) == r["plan_end"]:
         to, tc = plan_name(nxt.get("plan"))
         print("  " + paint(YELLOW, "Plan downgrade: ") + head + " → "
-              + paint(tc, to) + " " + deadline(r["plan_end"], "on"))
+              + paint(tc, to) + " " + deadline(r["plan_end"], "on")
+              + ending_note(r))
     else:
         print("  " + paint(YELLOW, "Plan ending: ") + head
-              + " cancelled, " + deadline(r["plan_end"], "ends"))
+              + " cancelled, " + deadline(r["plan_end"], "ends") + ending_note(r))
 
 # ---------- free limit resets: who holds one and when it lapses ----------
 # The weekly renewal never moves, so a reset is worth most on an account at
@@ -1034,9 +1159,6 @@ if held:
 # The decision engine the watch and `auto` use: consume first the quota that
 # is lost first. Blocked accounts follow, by when they free up.
 
-def ep(dt):
-    return dt.timestamp() if dt else None
-
 def when(ts):
     return datetime.fromtimestamp(ts).strftime("%a %d %H:%M")
 
@@ -1049,6 +1171,7 @@ for r in results:
     eng_rows.append({
         "n": r["n"], "label": r["label"], "u5": r["u5"], "u7": r["u7"],
         "r5": ep(r["r5"]), "r7": ep(r["r7"]), "plan_end": ep(r["plan_end"]),
+        "cancel_at": ep(cancel),
         # a cancelled plan past its end date is free, whatever is cached
         "free": is_free(r["plan"]) or bool(cancel and cancel <= datetime.now()),
         "disabled": r["disabled"], "error": None if limited else r["error"],
@@ -1065,8 +1188,12 @@ by_n = {r["n"]: r for r in results}
 def note(e):
     """Why the account sits there: when its quota is lost, or frees up."""
     if engine.blocked(e):
-        t = engine.unblock_at(e)
-        return paint(RED, "blocked" + (f" until {when(t)}" if t else ""))
+        t, cancel = engine.unblock_at(e), e.get("cancel_at")
+        if t:
+            return paint(RED, f"blocked until {when(t)}")
+        if cancel and cancel > now_ts:
+            return paint(RED, "blocked") + paint(GREY, f" · plan ends {when(cancel)}")
+        return paint(RED, "blocked")
     d = engine.deadline(e, now_ts)
     if d == float("inf"):
         txt = "no week running"
@@ -1208,6 +1335,7 @@ for i, acc in enumerate(accounts):
              # what the decision engine reads (general strategy)
              "u5": None, "u7": None, "r5": None, "r7": None,
              "plan_end": min(future) if future else None, "free": False,
+             "cancel_at": cancel,
              "disabled": False, "error": None, "resets": None,
              "resets_ends": None, "reset_cooldown": None}
 
@@ -2287,7 +2415,8 @@ def probe(acc):
     return out
 
 def plan_dates(acc):
-    """(when the current plan stops, epoch or None; whether it has stopped).
+    """(when the current plan stops, epoch or None; whether it has stopped;
+    the cancellation, epoch or None).
 
     Both come from what `check` caches: a cancellation ends the paid plan,
     a booked downgrade only shrinks it, so only the former leaves it free.
@@ -2296,15 +2425,16 @@ def plan_dates(acc):
     cancel = iso_epoch(acc.get("plan_ends"))
     down = iso_epoch((acc.get("plan_next") or {}).get("date"))
     future = [t for t in (cancel, down) if t and t > now]
-    return (min(future) if future else None), bool(cancel and cancel <= now)
+    return ((min(future) if future else None), bool(cancel and cancel <= now),
+            cancel)
 
 def probe_all(store):
     """Probe every usable account and publish the snapshot for the statusline."""
     rows = []
     for i, acc in enumerate(store.get("accounts", [])):
-        plan_end, ended = plan_dates(acc)
+        plan_end, ended, cancel = plan_dates(acc)
         row = {"n": i + 1, "label": acc.get("label") or acc.get("email") or "?",
-               "plan": acc.get("plan"), "plan_end": plan_end,
+               "plan": acc.get("plan"), "plan_end": plan_end, "cancel_at": cancel,
                "disabled": bool(acc.get("disabled")),
                "free": is_free(acc.get("plan")) or ended,
                "u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
@@ -2411,6 +2541,74 @@ def clock(ts):
     return datetime.fromtimestamp(ts).strftime("%H:%M" if ts - time.time() < 20 * 3600
                                                else "%a %H:%M")
 
+# Cancellations and downgrades are re-read here once a day per paid account,
+# so the order (and check's calendar) follow a cancel or a resubscription
+# without waiting for someone to run `check`.
+sub_tried = {}  # "n" -> when a read last failed (retried an hour later)
+
+def when_iso(v):
+    t = iso_epoch(v)
+    return datetime.fromtimestamp(t).strftime("%a %d %b %H:%M") if t else "?"
+
+def save_subscription(n, org, sub):
+    """Write one account's subscription into the store. The store is re-read
+    just before, so a rotation or a check that wrote meanwhile is kept."""
+    try:
+        with open(store_path) as f:
+            fresh = json.load(f)
+        acc = fresh["accounts"][n - 1]
+        if acc.get("org_id") != org:
+            return False  # the accounts moved under us: next cycle
+        acc.update(sub, sub_checked=int(time.time()))
+        tmp = store_path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(fresh, f, indent=2)
+        os.replace(tmp, store_path)
+        return True
+    except Exception:
+        return False
+
+def refresh_subscriptions(store):
+    now = time.time()
+    for n in engine.subs_due(store.get("accounts", []), now, sub_tried):
+        acc = store["accounts"][n - 1]
+        req = urllib.request.Request(
+            f"https://claude.ai/api/organizations/{acc['org_id']}/subscription_details",
+            headers={"Cookie": f"sessionKey={acc['session_key']}",
+                     "User-Agent": BROWSER_UA, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                sub = engine.parse_subscription(json.load(r))
+        except urllib.error.HTTPError as e:
+            # a plan past its end answers 403 for good: back off a day, not
+            # an hour (on a live plan a 403 is throttling, so the hour holds)
+            ended = (iso_epoch(acc.get("plan_ends")) or now + 1) <= now
+            sub_tried[str(n)] = (now + engine.SUB_TTL - engine.SUB_RETRY
+                                 if e.code in (403, 404) and ended else now)
+            continue
+        except Exception:
+            sub_tried[str(n)] = now
+            continue
+        finally:
+            time.sleep(1.2)  # claude.ai throttles bursts
+        if not save_subscription(n, acc.get("org_id"), sub):
+            sub_tried[str(n)] = now
+            continue
+        changes = []
+        if sub["plan_ends"] != acc.get("plan_ends"):
+            changes.append(f"plan ends {when_iso(sub['plan_ends'])}"
+                           if sub["plan_ends"] else "no longer cancelled")
+        if sub["plan_next"] != acc.get("plan_next"):
+            nxt = sub["plan_next"]
+            changes.append(f"downgrade to {nxt['plan']} on {when_iso(nxt['date'])}"
+                           if nxt else "downgrade withdrawn")
+        acc.update(sub, sub_checked=int(time.time()))
+        if changes:
+            who = f"#{n} {acc.get('label') or acc.get('email') or '?'}"
+            log(f"subscription: {who} — {', '.join(changes)}")
+            notify(f"{who}: {', '.join(changes)}")
+
 def run_logged(args):
     r = subprocess.run(args, capture_output=True, text=True)
     for line in ((r.stdout or "") + (r.stderr or "")).strip().splitlines():
@@ -2463,6 +2661,7 @@ while True:
             state.update({"set_by_watch": active, "manual": True})
             log(f"#{active} picked by hand — kept until it reaches its limit")
 
+        refresh_subscriptions(store)
         rows = probe_all(store)
         remind_expiring(rows)
         p = next((r for r in rows if r["n"] == active), None)
