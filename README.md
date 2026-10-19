@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.9.2
+claude-swap v1.9.3
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%

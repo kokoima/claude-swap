@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.9.2"
+VERSION="1.9.3"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -584,7 +584,8 @@ except Exception as e:
 print()
 
 # Account list
-print(f"  #  {'Label':<20} {'Email':<30} Expires")
+nw = len(str(len(accounts)))
+print(f"  {'#':>{nw + 1}}  {'Label':<20} {'Email':<30} Expires")
 for i, acc in enumerate(accounts):
     n = i + 1
     marker = "*" if n == active else " "
@@ -595,7 +596,7 @@ for i, acc in enumerate(accounts):
         exp_dt = datetime.fromtimestamp(exp_ms / 1000).strftime("%Y-%m-%d")
     else:
         exp_dt = "EXPIRED"
-    print(f"  {marker}{n}  {label:<20} {email:<30} {exp_dt}")
+    print(f"  {marker}{n:>{nw}}  {label:<20} {email:<30} {exp_dt}")
 PYEOF
 }
 
