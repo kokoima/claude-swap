@@ -6,23 +6,28 @@ Run with:  python3 -m unittest discover tests
 """
 import os
 import re
+import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "claude-swap")
 
 
-def load_engine():
+def load_engine(leave="98"):
+    """The engine with LEAVE pinned, so a local override does not leak in."""
     with open(SCRIPT) as f:
         src = f.read()
     m = re.search(r"read -r -d '' ENGINE_PY <<'PYEOF'[^\n]*\n(.*?)\nPYEOF\n", src, re.S)
     if not m:
         raise AssertionError("ENGINE_PY block not found in claude-swap")
     ns = {}
-    exec(m.group(1), ns)
+    with mock.patch.dict(os.environ, {"CLAUDE_SWAP_LEAVE": leave}):
+        exec(m.group(1), ns)
     return ns
 
 
 E = load_engine()
+E100 = load_engine("100")
 H = 3600
 NOW = 1_800_000_000  # any fixed instant; every time below is relative to it
 
@@ -233,6 +238,68 @@ class Resets(unittest.TestCase):
         state = {**LONG_AGO, "reset_failed": [2]}
         d = decide(self.holder(), 2, state, auto_reset=True)
         self.assertNotEqual(d["action"], "reset")
+
+
+class LeaveSetting(unittest.TestCase):
+    """LEAVE comes from CLAUDE_SWAP_LEAVE, else ~/.claude/claude-swap-leave."""
+
+    def setting(self, env=None, file=None):
+        with tempfile.TemporaryDirectory() as home:
+            if file is not None:
+                os.mkdir(os.path.join(home, ".claude"))
+                with open(os.path.join(home, ".claude", "claude-swap-leave"), "w") as f:
+                    f.write(file)
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                os.environ.pop("CLAUDE_SWAP_LEAVE", None)
+                if env is not None:
+                    os.environ["CLAUDE_SWAP_LEAVE"] = env
+                return E["_leave_setting"]()
+
+    def test_defaults_to_98(self):
+        self.assertEqual(self.setting(), 98)
+
+    def test_read_from_the_file(self):
+        self.assertEqual(self.setting(file="100\n"), 100)
+
+    def test_the_variable_wins_over_the_file(self):
+        self.assertEqual(self.setting(env="99", file="100"), 99)
+
+    def test_an_empty_variable_falls_back_to_the_file(self):
+        self.assertEqual(self.setting(env="", file="100"), 100)
+
+    def test_keeps_decimals(self):
+        self.assertEqual(self.setting(file="99.5"), 99.5)
+
+    def test_nonsense_falls_back_to_the_default(self):
+        for v in ("abc", "0", "-5", "101", "nan", "inf"):
+            with self.subTest(v=v):
+                self.assertEqual(self.setting(file=v), 98)
+
+
+class SqueezeAt100(unittest.TestCase):
+    """With LEAVE at 100 an account is used until its hard limit."""
+
+    def decide(self, rows, active, auto_reset=False):
+        return E100["decide"](rows, active, NOW, dict(LONG_AGO), auto_reset)
+
+    def test_stays_at_99(self):
+        self.assertEqual(self.decide(today({3: {"u5": 99}}), 3)["action"], "stay")
+        self.assertEqual(self.decide(today({3: {"u7": 99}}), 3)["action"], "stay")
+
+    def test_leaves_at_100(self):
+        d = self.decide(today({3: {"u5": 100}}), 3)
+        self.assertEqual((d["action"], d["target"]), ("switch", 5))
+
+    def test_a_rate_limit_still_leaves_below_100(self):
+        d = self.decide(today({3: {"u5": 99, "rate_limited": True}}), 3)
+        self.assertEqual((d["action"], d["target"]), ("switch", 5))
+
+    def test_a_reset_waits_for_the_week_to_be_spent(self):
+        fields = {"resets": 1, "resets_ends": NOW + 500 * H, "r7": NOW + 100 * H}
+        d = self.decide(today({2: {**fields, "u7": 99}}), 2, auto_reset=True)
+        self.assertNotEqual(d["action"], "reset")
+        d = self.decide(today({2: {**fields, "u7": 100}}), 2, auto_reset=True)
+        self.assertEqual((d["action"], d["target"]), ("reset", 2))
 
 
 class Unblock(unittest.TestCase):

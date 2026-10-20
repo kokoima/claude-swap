@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.9.3
+claude-swap v1.10.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -254,7 +254,7 @@ the same decision engine `auto` and `check` use:
   within 24 h goes first, then accounts holding a free reset (reaching
   the limit early is what makes a reset worth a whole week), then the rest.
 - **Leave** — when the active account reaches **98%** of its 5h *or* its
-  7d window, or gets rate-limited.
+  7d window, or gets rate-limited. The level can be changed (see below).
 - **Target** — the first account in that order with room (5h ≤ 80%,
   7d ≤ 95%); with no room anywhere, the least loaded one.
 - **Come back** — once an account higher in the order has room again
@@ -272,16 +272,29 @@ the same decision engine `auto` and `check` use:
   back to a ~5-token Haiku call, and free-plan accounts are not probed.
 
 With `--auto-reset` it also spends **free limit resets** on its own: as
-soon as an account holding one reaches 98% of its 7d window — unless
-that week renews within 24 h anyway, in which case it waits (and spends
-it only if the reset would lapse first). It re-reads the usage
-afterwards, spends at most one per account every 6 h, and stops trying
-on an account whose week did not empty until the next `watch start`.
-Every spend is logged and notified. Without the flag it only reminds
-you, 72 h and 24 h before an unspent reset lapses.
+soon as an account holding one reaches the leave level (98%) of its 7d
+window — unless that week renews within 24 h anyway, in which case it
+waits (and spends it only if the reset would lapse first). It re-reads
+the usage afterwards, spends at most one per account every 6 h, and
+stops trying on an account whose week did not empty until the next
+`watch start`. Every spend is logged and notified. Without the flag it
+only reminds you, 72 h and 24 h before an unspent reset lapses.
 
-The thresholds are constants at the top of the script (`LEAVE`,
-`ROOM_5H`, `ROOM_7D`, `LAST_DAY`, `MIN_DWELL`…).
+The leave level is a setting: write it to `~/.claude/claude-swap-leave`
+(or set `CLAUDE_SWAP_LEAVE`, which wins over the file) and restart the
+watch, which reads it once at start. `check` shows the level in force on
+its *Watcher order* line. At **100** every account is used to its hard
+limit, which squeezes the last 2% out of each at the cost of the odd
+request rejected with a 429 before the switch. Anything that is not a
+number above 0 and up to 100 is ignored.
+
+```bash
+echo 100 > ~/.claude/claude-swap-leave
+claude-swap watch stop && claude-swap watch start --auto-reset
+```
+
+The other thresholds are constants at the top of the script (`ROOM_5H`,
+`ROOM_7D`, `LAST_DAY`, `MIN_DWELL`…).
 
 `watch start fable` keeps the previous Fable strategy: leave at 99% of
 5h, 7d or Fable, pick the soonest Fable renewal, pre-warn at 95%.
@@ -459,5 +472,6 @@ make test      # decision-engine scenarios (python3 -m unittest)
 The general strategy lives in one place: the `ENGINE_PY` block near the
 top of the script, a pure function that `check`, `auto` and the watcher
 all run. `tests/test_engine.py` loads it straight from the script and
-replays situations — leaving at 98%, coming back, plan ends, the wall,
-when a reset is spent — so a change to the rules shows up there first.
+replays situations — leaving at 98% (or at 100%), coming back, plan
+ends, the wall, when a reset is spent — so a change to the rules shows
+up there first.

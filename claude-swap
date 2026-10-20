@@ -18,7 +18,7 @@
 
 set -e
 
-VERSION="1.9.3"
+VERSION="1.10.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_JSON="$HOME/.claude.json"
@@ -45,7 +45,31 @@ read -r -d '' ENGINE_PY <<'PYEOF' || true
 # holding a free reset (reaching the limit early is what makes the reset
 # worth a whole week), then the rest.
 
-LEAVE = 98                  # leave an account once its 5h or 7d reaches this %
+def _leave_setting(default=98):
+    """LEAVE override: CLAUDE_SWAP_LEAVE, else ~/.claude/claude-swap-leave.
+
+    100 squeezes the last 2% of every account: it is left only at its hard
+    limit or on a 429, at the price of the odd rejected request. Anything
+    that is not a number in (0, 100] falls back to the default. Read once
+    per process, so a running watch needs a restart to pick a change up."""
+    import os
+    v = os.environ.get("CLAUDE_SWAP_LEAVE")
+    if not v:
+        try:
+            with open(os.path.expanduser("~/.claude/claude-swap-leave")) as f:
+                v = f.read().strip()
+        except OSError:
+            v = None
+    try:
+        x = float(v) if v else default
+    except ValueError:
+        x = default
+    if not 0 < x <= 100:  # also rejects nan and inf
+        x = default
+    return int(x) if x == int(x) else x
+
+
+LEAVE = _leave_setting()    # leave an account once its 5h or 7d reaches this %
 ROOM_5H = 80                # worth switching to: 5h at or below this...
 ROOM_7D = 95                # ...and 7d at or below this
 LAST_DAY = 24 * 3600        # quota expiring within this goes first
@@ -393,6 +417,10 @@ cmd_help() {
   echo "  --auto-reset it spends a free reset as soon as an account's week is"
   echo "  spent (unless the week renews within a day). On macOS the watch runs"
   echo "  as a LaunchAgent, so it survives reboots."
+  echo ""
+  echo "  To leave at another level, write it to ~/.claude/claude-swap-leave"
+  echo "  (or set CLAUDE_SWAP_LEAVE) and restart the watch. 100 uses every"
+  echo "  account to its limit, at the cost of the odd rejected request."
 }
 
 cmd_init() {
