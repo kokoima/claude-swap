@@ -2820,6 +2820,9 @@ def login(n):
             account = None
         if not oauth.is_full(o) or not account:
             print(f"  No login came back (exit {r.returncode}): nothing changed.")
+            print("  The browser tab it ended on says why (error_description=...):"
+                  " account_on_hold means claude.ai has the account restricted"
+                  " (claude.ai/restricted); access_denied alone, that it was cancelled.")
             return False
         got = (account.get("emailAddress") or "").strip().lower()
         store = oauth.load_store(store_path)  # it may have taken minutes
