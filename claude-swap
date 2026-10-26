@@ -2828,12 +2828,14 @@ def login(n):
                   " (claude.ai/restricted); access_denied alone, that it was cancelled.")
             return False
         got = (account.get("emailAddress") or "").strip().lower()
-        store = oauth.load_store(store_path)  # it may have taken minutes
-        k = n if got == email.lower() else oauth.by_identity(store["accounts"], None, got)
+        # it may have taken minutes, and the accounts may have been renumbered
+        # meanwhile (a remove): find it again by email, never by number
+        store = oauth.load_store(store_path)
+        k = oauth.by_identity(store["accounts"], None, got)
         if k is None:
             print(f"  That login is {got}, which is not in claude-swap: discarded.")
             return False
-        if k != n:
+        if got != email.lower():
             print(f"  That login is {got}: kept for #{k} instead.")
         acc = store["accounts"][k - 1]
         if not secrets.write(oauth.VAULT, oauth.dump(o), oauth.slot(acc)):
@@ -3989,6 +3991,12 @@ with open('$STORE') as f:
     d = json.load(f)
 target = $target
 gone = d['accounts'].pop(target - 1)
+live = d.get('live') or {}
+for k in ('n', 'from'):  # account numbers after the removed one move down
+    if live.get(k) == target:
+        live[k] = None
+    elif (live.get(k) or 0) > target:
+        live[k] -= 1
 if gone.get('oauth') and gone.get('email'):  # its saved full login goes too
     oauth = types.ModuleType('oauth')
     exec(os.environ['CLAUDE_SWAP_OAUTH'], oauth.__dict__)
