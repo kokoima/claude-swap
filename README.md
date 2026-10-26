@@ -13,26 +13,26 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.10.0
+claude-swap v1.11.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
 
- #   Account       Plan    5h           reset   7d           Fable        Rst │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
-──────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00 ✕11:06 ────────────────────────────
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·
+ #   Account       Plan    5h           reset   7d           Fable        Rst  Chr │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
+───────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
+  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1   3d │   ·      ·    22:00 ✕11:06 ────────────────────────────
+ *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0    ✓ │   ·      ·      ·      ·      ·      ·    08:00    ·
+  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    -    - │   ·      ·      ·      ·      ·    17:00    ·      ·
   4  Old Account   FREE   — disabled —
 
-  calendar: 7d reset time · Fable when it falls on a different day · ↓ downgrade · ✕ plan ends ─── no plan (─22:00─ renews if resubscribed)   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)
+  calendar: 7d reset time · Fable when it falls on a different day · ↓ downgrade · ✕ plan ends ─── no plan (─22:00─ renews if resubscribed)   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)
   Plan ending: #1 Personal MAX20X cancelled, ends Sun 26 Sep 11:06 (in 3d) · renews Sat 25 22:00 → 13h 6m until then
   Free limit resets: #1 Personal ×1 · until Sun 26 Sep 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
 
   Watcher order — what is lost first goes first · leaves at 98% of 5h or 7d, comes back once there is room
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    - │   ·      ·      ·      ·      ·    17:00    ·      ·     renews Tue 28 17:00
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0 │   ·      ·      ·      ·      ·      ·    08:00    ·     renews Wed 29 08:00
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1 │   ·      ·    22:00 ✕11:06 ────────────────────────────  blocked until Sat 25 22:00
+  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    -    - │   ·      ·      ·      ·      ·    17:00    ·      ·     renews Tue 28 17:00
+ *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0    ✓ │   ·      ·      ·      ·      ·      ·    08:00    ·     renews Wed 29 08:00
+  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1   3d │   ·      ·    22:00 ✕11:06 ────────────────────────────  blocked until Sat 25 22:00
   Now: switch to #3 — #3 goes first (5h 0% · 7d 63%)
 ```
 
@@ -182,6 +182,7 @@ claude-swap auto       # switch to the best account (general strategy)
 claude-swap af         # switch to the best account for Fable
 claude-swap check      # dashboard without switching
 claude-swap reset 3    # spend account 3's free limit reset (asks first)
+claude-swap auth all   # full logins for Claude in Chrome (once per account, ~monthly)
 ```
 
 Interactive menu shortcuts: a number switches account, `a` = auto,
@@ -318,7 +319,9 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap add` | Add a new account |
 | `claude-swap remove <n>` | Remove an account |
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
-| `claude-swap keys-sync` | Auto-import sessionKeys from Chrome profiles (by email) |
+| `claude-swap keys-sync` | Auto-import sessionKeys from Chrome profiles (by email); also notes each account's Chrome profile |
+| `claude-swap auth [n\|all]` | Full login for account N (or every paid account lacking one), authorized in its Chrome profile — what Claude in Chrome needs. No argument: who has one and until when |
+| `claude-swap chrome [n\|all]` | Open the Chrome profile of account N (default: the active one); `chrome <n> "Profile 3"` sets it |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
@@ -328,15 +331,57 @@ Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
 
 Claude Code stores credentials in two places:
 
-1. **macOS Keychain** (`Claude Code-credentials`) — has priority
+1. **macOS Keychain** (`Claude Code-credentials`) — read first
 2. **`~/.claude/.credentials.json`** — fallback
+
+(With `CLAUDE_CONFIG_DIR` set, both move the way Claude Code moves them,
+and claude-swap follows.)
 
 When you run `claude-swap <n>`, it:
 
-1. Deletes the Keychain entry (macOS only) so it doesn't override the file
-2. Writes the selected setup token to `~/.claude/.credentials.json`
-3. Clears `oauthAccount` from `~/.claude.json` (Claude Code repopulates it)
+1. Saves the full login in use, if any, to its account (see below)
+2. Writes account N's credential into the Keychain entry — its full login
+   when it has one, else its setup token — and the setup token to
+   `.credentials.json` underneath. The entry is overwritten, never
+   deleted: running sessions keep serving a deleted entry from their
+   cache, and would stay on the old account
+3. Sets `oauthAccount` in `~/.claude.json` to account N (or clears it for
+   a setup token), under the lock Claude Code itself takes on that file
 4. Updates the active account in `~/.claude/claude-swap.json`
+
+Running sessions pick the new credential up within 30 seconds.
+
+### Claude in Chrome
+
+Claude in Chrome talks to the browser through Anthropic's bridge, and the
+bridge refuses setup tokens (`403 missing scope`): it wants the full login
+that `/login` leaves behind. That is why, without help, Chrome only works
+right after a `/login`, and stops at the next switch.
+
+So each account can also hold its full login. `claude-swap auth <n>` runs
+`claude auth login` in a throwaway config, opens the authorization page in
+that account's Chrome profile, checks the login is that account's, and
+saves it in the Keychain (service `claude-swap`). Every switch then
+installs it. What it takes:
+
+- **One Chrome profile per account**, open, with the Claude extension
+  signed in to that same account. The bridge has one room per account, so
+  each account only ever sees its own browser. `keys-sync` notes which
+  profile is whose; `claude-swap chrome all` opens them all.
+- **Redo `auth` every ~4 weeks.** A login's refresh token works once and
+  refreshing does not extend it: it dies about four weeks after the
+  authorization. `check` (the `Chr` column) and the watcher warn 5 days
+  and 1 day ahead.
+- Claude Code refreshes the login in use every ~8 hours and writes the
+  new pair back; claude-swap saves it to its account before every switch,
+  and the watcher every minute. If a session writes the account just left
+  back over the new one, the watcher undoes it; a `/login` by hand is
+  taken as your pick of active account.
+- A session already connected to Chrome keeps its browser after a switch
+  until `/mcp` → Reconnect; new sessions use the new account's.
+
+Accounts without a full login keep working exactly as before, on their
+setup token — only Claude in Chrome needs `auth`.
 
 Data sources for the dashboard:
 
@@ -384,10 +429,12 @@ Everything lives locally under `~/.claude/`:
 | `claude-swap.json` | Accounts: labels, emails, setup tokens, sessionKeys, cached org/plan and plan end date (`600` perms) |
 | `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe and decision, log |
 | `~/Library/LaunchAgents/com.claude-swap.watch.plist` | The watcher's LaunchAgent (macOS, while it runs) |
+| Keychain, service `claude-swap` | Each account's full login for Claude in Chrome (refresh token included), one entry per email. The store only keeps fingerprints and expiry dates of it |
 | `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 
-Tokens are only ever sent to `api.anthropic.com`; sessionKeys only to
-`claude.ai`. Nothing goes to any third party.
+Tokens are only ever sent to `api.anthropic.com` (and refresh tokens to
+`platform.claude.com`, Claude Code's own token endpoint); sessionKeys
+only to `claude.ai`. Nothing goes to any third party.
 
 ## Troubleshooting
 
@@ -419,6 +466,21 @@ the paid plan by itself — or `claude-swap disable <n>` to hide it.
 can't call the API and claude.ai could not tell why (no working
 sessionKey): revoked, or no active subscription. Regenerate it with
 `claude setup-token`, or refresh the cookie with `keys-sync`.
+
+**Claude in Chrome does not connect** — `claude-swap status` must say
+`full login, Claude in Chrome ready` for the active account; if not,
+`claude-swap auth <n>`. Then the account's Chrome profile must be open
+with the Claude extension signed in to that same account
+(`claude-swap chrome` opens it). A session that was already connected
+before the switch needs `/mcp` → Reconnect.
+
+**`Chr` shows `✕`** — that account's login was refused or expired:
+`claude-swap auth <n>`. Until then it runs on its setup token.
+
+**`auth` opened the wrong profile, or the page shows another account** —
+don't authorize it (`auth` would notice and discard it anyway). Set the
+right profile with `claude-swap chrome <n> "Profile 3"`, or log claude.ai
+in on that profile and run `keys-sync`.
 
 **`Watch: stale pidfile`** — the watcher died (e.g. reboot). Run
 `claude-swap watch stop` to clean up, then `watch start` again.

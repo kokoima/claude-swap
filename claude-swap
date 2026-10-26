@@ -11,6 +11,8 @@
 #   claude-swap check        Status + API rate limit check
 #   claude-swap auto         Auto-rotate to best available account
 #   claude-swap reset <n>    Spend account N's free limit reset
+#   claude-swap auth [n|all] Full login per account (needed by Claude in Chrome)
+#   claude-swap chrome [n]   Open the account's Chrome profile
 #   claude-swap add          Add a new account
 #   claude-swap remove <n>   Remove an account
 #   claude-swap init         First-time setup
@@ -18,10 +20,15 @@
 
 set -e
 
-VERSION="1.10.0"
+VERSION="1.11.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
-CLAUDE_CREDS="$HOME/.claude/.credentials.json"
-CLAUDE_JSON="$HOME/.claude.json"
+# Claude Code's files, where it looks for them (CLAUDE_CONFIG_DIR moves both)
+CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  CLAUDE_JSON="$CLAUDE_CONFIG_DIR/.claude.json"
+else
+  CLAUDE_JSON="$HOME/.claude.json"
+fi
 WATCH_PID="$HOME/.claude/claude-swap-watch.pid"
 WATCH_LOG="$HOME/.claude/claude-swap-watch.log"
 WATCH_STATE="$HOME/.claude/claude-swap-watch.state"
@@ -348,6 +355,685 @@ def needs_billed_probe(free, web_ok, has_windows):
 PYEOF
 export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
+# --- Full logins (Claude in Chrome) ---
+# Saving, refreshing and installing each account's full OAuth login, shared
+# by the swap, check, auth and the watch: each Python block runs
+# exec(os.environ["CLAUDE_SWAP_OAUTH"]). The outside world comes in through
+# small objects, so tests/test_oauth.py can replay any situation.
+read -r -d '' OAUTH_PY <<'PYEOF' || true
+# A setup-token is enough to chat, but Claude in Chrome's bridge turns it
+# away (403 "missing scope"): it needs the full login that /login or
+# `claude auth login` leaves in Claude Code's credential store. So an account
+# can also keep that login in a vault (the macOS keychain, service
+# "claude-swap"), and a swap installs it as Claude Code's credential, falling
+# back to the setup-token for an account that has none.
+#
+# How these logins behave (measured on 26 Oct 2026):
+# - A refresh token works once. Refreshing hands out a new pair and revokes
+#   the previous access token on the spot, so a login never lives in two
+#   places at once.
+# - Refreshing does not extend the refresh token, which dies ~4 weeks after
+#   the browser authorization: then `claude-swap auth <n>` has to be redone.
+# - Claude Code refreshes the login in use every ~8 h and writes the new pair
+#   back, so its copy is the live one: it is saved to its account's slot
+#   before anything overwrites it.
+# - Deleting Claude Code's keychain item does not reach running sessions,
+#   which keep serving their cached copy: it is always overwritten instead.
+
+import glob, hashlib, json, os, re, subprocess, time, unicodedata
+import urllib.request, urllib.error
+
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code's own
+# Cloudflare turns urllib's default User-Agent away (error 1010)
+UA = "claude-swap (+https://github.com/kokoima/claude-swap)"
+VAULT = os.environ.get("CLAUDE_SWAP_VAULT") or "claude-swap"
+# What claude-swap has always written next to a setup-token: Claude Code
+# wants these scopes to start, although the token only carries inference.
+SETUP_SCOPES = ["user:file_upload", "user:inference", "user:mcp_servers",
+                "user:profile", "user:sessions:claude_code"]
+REFRESH_MARGIN = 600       # an access token with less left is refreshed first
+RACE_WINDOW = 900          # see after_sync()
+EXPIRY_WARN_H = (120, 24)  # remind this many hours before a login dies
+EXT_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"  # the Claude in Chrome extension
+CHROME_BASE = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+
+
+# ---------- where Claude Code keeps things (CLAUDE_CONFIG_DIR as it does) ----------
+
+def config_hash(d):
+    return hashlib.sha256(unicodedata.normalize("NFC", d).encode()).hexdigest()[:8]
+
+def cc_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+def cc_service():
+    """Claude Code's keychain item, suffixed when CLAUDE_CONFIG_DIR is set."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return "Claude Code-credentials" + (f"-{config_hash(d)}" if d else "")
+
+def cc_json():
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return os.path.join(d, ".claude.json") if d else os.path.expanduser("~/.claude.json")
+
+def cc_creds():
+    return os.path.join(cc_dir(), ".credentials.json")
+
+
+# ---------- logins ----------
+
+def parse(text):
+    """The claudeAiOauth object of a stored credential (JSON, or the hex
+    `security` prints for it), or None."""
+    if not text:
+        return None
+    try:
+        d = json.loads(text)
+    except ValueError:
+        try:
+            d = json.loads(bytes.fromhex(text.strip()).decode())
+        except Exception:
+            return None
+    o = d.get("claudeAiOauth") if isinstance(d, dict) else None
+    return o if isinstance(o, dict) and o.get("accessToken") else None
+
+def dump(o):
+    return json.dumps({"claudeAiOauth": o})
+
+def is_full(o):
+    """A full login carries a refresh token; a setup-token never does."""
+    return bool(o and o.get("refreshToken"))
+
+def fp(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()[:12] if tok else None
+
+def slot(acc):
+    """An account's vault entry, by email so that removing one shifts none."""
+    return "oauth:" + (acc.get("email") or "").strip().lower()
+
+def setup_login(acc):
+    return {"accessToken": acc["token"], "refreshToken": "",
+            "expiresAt": acc.get("expires", 0), "scopes": SETUP_SCOPES,
+            "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}
+
+def note_login(acc, o, now, account=None):
+    """Record in the store what a saved login is, never its tokens."""
+    m = {k: v for k, v in (acc.get("oauth") or {}).items()
+         if k not in ("dead", "dead_reason")}
+    m.update({"fp": fp(o.get("refreshToken")), "fp_at": fp(o.get("accessToken")),
+              "expires": o.get("expiresAt"),
+              "rt_expires": o.get("refreshTokenExpiresAt"), "saved": int(now)})
+    if account:
+        m["account"] = account
+        m["uuid"] = account.get("accountUuid")
+    acc["oauth"] = m
+
+def usable(acc, now):
+    """Whether the account holds a login that can still be installed."""
+    m = acc.get("oauth") or {}
+    if not m.get("fp") or m.get("dead"):
+        return False
+    rt = m.get("rt_expires")
+    return not rt or rt / 1000 > now
+
+def login_state(acc, now):
+    """('ok' | 'expiring' | 'dead' | 'none', seconds left or None)."""
+    m = acc.get("oauth") or {}
+    if not m.get("fp"):
+        return "none", None
+    rt = m.get("rt_expires")
+    left = rt / 1000 - now if rt else None
+    if m.get("dead") or (left is not None and left <= 0):
+        return "dead", left
+    if left is not None and left < EXPIRY_WARN_H[0] * 3600:
+        return "expiring", left
+    return "ok", left
+
+def owner(o, accounts):
+    """The account a login belongs to, from the fingerprints the store keeps."""
+    rt, at = fp(o.get("refreshToken")), fp(o.get("accessToken"))
+    for i, a in enumerate(accounts, 1):
+        m = a.get("oauth") or {}
+        if (rt and m.get("fp") == rt) or (at and m.get("fp_at") == at):
+            return i
+    return None
+
+def by_identity(accounts, uuid=None, email=None):
+    if uuid:
+        for i, a in enumerate(accounts, 1):
+            if (a.get("oauth") or {}).get("uuid") == uuid:
+                return i
+    if email:
+        for i, a in enumerate(accounts, 1):
+            if (a.get("email") or "").strip().lower() == email.strip().lower():
+                return i
+    return None
+
+
+# ---------- the outside world ----------
+
+class Http:
+    """JSON over HTTPS -> (status, body or None); status 0 = no answer."""
+    def call(self, url, body=None, headers=None, timeout=20):
+        h = {"User-Agent": UA, "Accept": "application/json", **(headers or {})}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        try:
+            req = urllib.request.Request(url, data=data, headers=h)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, None
+        except Exception:
+            return 0, None
+
+class Keychain:
+    """macOS generic passwords, written the way Claude Code writes its own:
+    the secret travels on stdin (`security -i`), never on a command line."""
+    def __init__(self, user=None):
+        self.user = user or os.environ.get("USER") or ""
+
+    def read(self, service, account=None):
+        try:
+            r = subprocess.run(["security", "find-generic-password", "-a",
+                                account or self.user, "-s", service, "-w"],
+                               capture_output=True, text=True, timeout=10)
+        except Exception:
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def write(self, service, text, account=None):
+        acct = account or self.user
+        if any(c in s for s in (acct, service) for c in '"\n'):
+            return False
+        cmd = (f'add-generic-password -U -a "{acct}" -s "{service}" '
+               f'-X "{text.encode().hex()}"\n')
+        try:
+            subprocess.run(["security", "-i"], input=cmd, capture_output=True,
+                           text=True, timeout=10)
+        except Exception:
+            return False
+        # `security -i` exits 0 even when the command inside it failed
+        got = self.read(service, acct)
+        return got == text or (got is not None and parse(got) == parse(text))
+
+    def delete(self, service, account=None):
+        try:
+            subprocess.run(["security", "delete-generic-password", "-a",
+                            account or self.user, "-s", service],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+def write_private(path, text):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+class FileVault:
+    """The vault where there is no keychain: one file only its owner reads."""
+    def __init__(self, path=None):
+        self.path = path or os.path.expanduser("~/.claude/claude-swap-vault.json")
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def read(self, service, account=None):
+        return self._load().get(service, {}).get(account or "")
+
+    def write(self, service, text, account=None):
+        d = self._load()
+        d.setdefault(service, {})[account or ""] = text
+        return write_private(self.path, json.dumps(d))
+
+    def delete(self, service, account=None):
+        d = self._load()
+        if d.get(service, {}).pop(account or "", None) is not None:
+            write_private(self.path, json.dumps(d))
+
+class Live:
+    """Claude Code's own credential: its keychain item on macOS, which it reads
+    before .credentials.json; the .credentials.json file elsewhere."""
+    def __init__(self, secrets, macos):
+        self.secrets, self.macos = secrets, macos
+
+    def read(self):
+        if self.macos:
+            return parse(self.secrets.read(cc_service()))
+        try:
+            with open(cc_creds()) as f:
+                return parse(f.read())
+        except OSError:
+            return None
+
+    def write(self, o):
+        if self.macos:
+            return self.secrets.write(cc_service(), dump(o))
+        return write_private(cc_creds(), json.dumps({"claudeAiOauth": o}, indent=2))
+
+    def backup(self, o):
+        """On macOS, .credentials.json keeps the setup-token underneath, as before."""
+        if self.macos:
+            write_private(cc_creds(), json.dumps({"claudeAiOauth": o}, indent=2))
+
+def default_io(macos=None):
+    macos = (os.uname().sysname == "Darwin") if macos is None else macos
+    secrets = Keychain() if macos else FileVault()
+    return secrets, Live(secrets, macos), Http()
+
+def disk_account(path=None):
+    try:
+        with open(path or cc_json()) as f:
+            return json.load(f).get("oauthAccount")
+    except Exception:
+        return None
+
+def set_account(account, path=None):
+    """Write Claude Code's oauthAccount, or drop it with None, under the lock
+    Claude Code takes on that file (a `<file>.lock` directory)."""
+    path = os.path.realpath(path or cc_json())
+    if not os.path.exists(path):
+        return False
+    lock, held = path + ".lock", False
+    for _ in range(40):
+        try:
+            os.mkdir(lock)
+            held = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > 10:  # stale, by its rules
+                    os.rmdir(lock)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.1)
+        except OSError:
+            break
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        if d.get("oauthAccount") == account:
+            return True
+        if account is None:
+            d.pop("oauthAccount", None)
+        else:
+            d["oauthAccount"] = account
+        tmp = f"{path}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                     os.stat(path).st_mode & 0o777)
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+    finally:
+        if held:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+
+def load_store(path):
+    with open(path) as f:
+        return json.load(f)
+
+def save_store(path, store):
+    write_private(path, json.dumps(store, indent=2))
+
+def commit(path, store, top=("active", "live")):
+    """Save the logins of `store` (and its `top` keys) onto the store as it is
+    on disk now, so that what another process wrote meanwhile is kept."""
+    try:
+        fresh = load_store(path)
+    except Exception:
+        return save_store(path, store)
+    mine = {(a.get("email") or "").strip().lower(): a
+            for a in store.get("accounts", []) if a.get("email")}
+    for a in fresh.get("accounts", []):
+        b = mine.get((a.get("email") or "").strip().lower())
+        if b is None:
+            continue
+        if b.get("oauth") is None:
+            a.pop("oauth", None)
+        else:
+            a["oauth"] = b["oauth"]
+    for k in top:
+        if k in store:
+            fresh[k] = store[k]
+    save_store(path, fresh)
+
+
+# ---------- the server ----------
+
+class Dead(Exception):
+    """The refresh token was refused for good: the login is gone."""
+
+def refresh(o, http, now):
+    """A fresh pair for login o; None if there was no clear answer."""
+    st, d = http.call(TOKEN_URL, {
+        "grant_type": "refresh_token", "refresh_token": o["refreshToken"],
+        "client_id": CLIENT_ID, "scope": " ".join(o.get("scopes") or [])})
+    if st == 200 and isinstance(d, dict) and d.get("access_token"):
+        n = dict(o)
+        n["accessToken"] = d["access_token"]
+        n["refreshToken"] = d.get("refresh_token") or o["refreshToken"]
+        n["expiresAt"] = int((now + float(d.get("expires_in") or 28800)) * 1000)
+        if d.get("refresh_token_expires_in"):
+            n["refreshTokenExpiresAt"] = int(
+                (now + float(d["refresh_token_expires_in"])) * 1000)
+        if d.get("scope"):
+            n["scopes"] = d["scope"].split()
+        return n
+    if isinstance(d, dict) and d.get("error") == "invalid_grant":
+        raise Dead(d.get("error_description") or "invalid_grant")
+    return None
+
+def profile(at, http):
+    st, d = http.call(PROFILE_URL, headers={
+        "Authorization": f"Bearer {at}", "anthropic-beta": "oauth-2025-04-20"},
+        timeout=15)
+    ok = st == 200 and isinstance(d, dict) and isinstance(d.get("account"), dict)
+    return d if ok else None
+
+def account_of(p):
+    """Claude Code's oauthAccount for a profile reply; it fills in the rest."""
+    a, o = p.get("account") or {}, p.get("organization") or {}
+    out = {"accountUuid": a.get("uuid"), "emailAddress": a.get("email"),
+           "organizationUuid": o.get("uuid")}
+    if a.get("display_name"):
+        out["displayName"] = a["display_name"]
+    if o.get("name"):
+        out["organizationName"] = o["name"]
+    return out
+
+
+# ---------- keeping Claude Code and the vault in line ----------
+
+def sync(store, secrets, live, http, now):
+    """Save the live login into its account's slot.
+
+    -> (n, what, sure): n is the account it belongs to; what is 'setup'
+    (a setup-token or nothing: nothing to keep), 'same', 'saved',
+    'unknown' or 'vault-failed'; sure says n came from the login itself
+    (fingerprint or the server) rather than from Claude Code's config.
+    """
+    o = live.read()
+    if not is_full(o):
+        return None, "setup", False
+    accounts = store.get("accounts", [])
+    n, sure, account = owner(o, accounts), True, None
+    if n is None:
+        # Not what claude-swap installed: Claude Code refreshed it, or someone
+        # logged in by hand. The server says whose it is.
+        disk = disk_account()
+        p = profile(o["accessToken"], http)
+        if p:
+            account = account_of(p)
+            if disk and disk.get("accountUuid") == account["accountUuid"]:
+                account = disk  # Claude Code's record is the fuller one
+            n = by_identity(accounts, account["accountUuid"], account["emailAddress"])
+        elif disk:
+            # Expired access token, so no answer: Claude Code's config may
+            # name it, but only the account installed last is taken on that
+            # word. A wrong guess would overwrite another account's login.
+            k = by_identity(accounts, disk.get("accountUuid"), disk.get("emailAddress"))
+            if k and k == (store.get("live") or {}).get("n"):
+                n, sure, account = k, False, disk
+        if n is None:
+            return None, "unknown", False
+    acc = accounts[n - 1]
+    m = acc.get("oauth") or {}
+    if (m.get("fp") == fp(o["refreshToken"]) and m.get("fp_at") == fp(o["accessToken"])
+            and not m.get("dead")):
+        return n, "same", sure
+    if not secrets.write(VAULT, dump(o), slot(acc)):
+        return n, "vault-failed", sure
+    note_login(acc, o, now, account or m.get("account"))
+    return n, "saved", sure
+
+def install(store, n, secrets, live, http, now):
+    """Make account n Claude Code's credential: its full login if it holds a
+    usable one (refreshed first when about to expire), else its setup-token.
+
+    -> (mode, note): mode 'oauth', 'setup' or 'failed' (Claude Code's
+    credential could not be written; nothing changed).
+    """
+    acc = store["accounts"][n - 1]
+    o, note = None, None
+    if usable(acc, now):
+        o = parse(secrets.read(VAULT, slot(acc)))
+        if o is None:
+            note = "its saved login could not be read"
+    if o and (o.get("expiresAt") or 0) / 1000 - now < REFRESH_MARGIN:
+        try:
+            r = refresh(o, http, now)
+        except Dead as e:
+            acc["oauth"].update(dead=int(now), dead_reason=str(e))
+            o, note = None, f"its login was refused ({e}): claude-swap auth {n}"
+        else:
+            if r:
+                # the old refresh token is spent: keep the new pair first
+                if secrets.write(VAULT, dump(r), slot(acc)):
+                    note_login(acc, r, now)
+                o = r
+            # no answer: install it as it is, Claude Code refreshes it later
+    if o:
+        if live.write(o):
+            live.backup(setup_login(acc))
+            set_account((acc.get("oauth") or {}).get("account"))
+            return "oauth", note
+        return "failed", "could not write Claude Code's credential"
+    s = setup_login(acc)
+    if not live.write(s):
+        return "failed", "could not write Claude Code's credential"
+    live.backup(s)
+    set_account(None)
+    return "setup", note
+
+def mark_live(store, n, mode, now, prev):
+    store["live"] = {"n": n, "mode": mode, "at": int(now), "from": prev}
+
+def after_sync(n_live, store, now):
+    """What to do when the live login is another account's than the active one.
+
+    'reinstall': it is the account just left, written back by a session
+    that refreshed it right after the swap. 'adopt': someone logged in by
+    hand (/login), which is their pick. None: nothing to do.
+    """
+    active = store.get("active")
+    if not n_live or n_live == active:
+        return None
+    last = store.get("live") or {}
+    if n_live == last.get("from") and now - (last.get("at") or 0) < RACE_WINDOW:
+        return "reinstall"
+    return "adopt"
+
+def tick(store_path, secrets, live, http, now=None):
+    """One pass keeping the vault and Claude Code in line -> [(kind, msg)],
+    kind 'log' or 'notify'."""
+    now = now or time.time()
+    store = load_store(store_path)
+    before = json.dumps(store, sort_keys=True)
+    accounts, active = store.get("accounts", []), store.get("active", 0)
+    if not 1 <= active <= len(accounts):
+        return []
+    ev = []
+    n_live, what, sure = sync(store, secrets, live, http, now)
+    if what == "saved":
+        ev.append(("log", f"saved #{n_live}'s refreshed login"))
+    elif what == "vault-failed":
+        ev.append(("log", f"could not save #{n_live}'s login to the vault"))
+    elif what == "unknown":
+        ev.append(("log", "Claude Code holds a login of no account here, or one "
+                          "the server would not name: left alone"))
+    act = after_sync(n_live, store, now) if sure else None
+    if act == "reinstall":
+        mode, note = install(store, active, secrets, live, http, now)
+        if mode != "failed":
+            mark_live(store, active, mode, now, n_live)
+        ev.append(("log", f"#{n_live}'s login was written back over #{active} "
+                          f"right after the swap: #{active} installed again"
+                          + (f" ({note})" if note else "")))
+    elif act == "adopt":
+        store["active"] = n_live
+        mark_live(store, n_live, "oauth", now, active)
+        ev.append(("notify", f"#{n_live} logged in by hand: now the active account"))
+    elif what == "setup" and usable(accounts[active - 1], now):
+        mode, note = install(store, active, secrets, live, http, now)
+        if mode == "oauth":
+            mark_live(store, active, mode, now, (store.get("live") or {}).get("from"))
+            ev.append(("log", f"#{active}'s full login installed: Claude in Chrome ready"))
+        elif note:
+            ev.append(("log", f"#{active}: {note}"))
+    if json.dumps(store, sort_keys=True) != before:
+        commit(store_path, store)
+    return ev
+
+def due_reminders(accounts, now, warned):
+    """(key, message) for logins about to die or refused, once per login."""
+    out = []
+    for i, a in enumerate(accounts, 1):
+        m = a.get("oauth") or {}
+        if a.get("disabled") or not m.get("fp"):
+            continue
+        st, left = login_state(a, now)
+        rt = int(m.get("rt_expires") or 0)
+        if st == "dead":
+            key, msg = f"{i}:{rt}:dead", f"#{i} lost its Claude in Chrome login"
+        elif st == "expiring":  # under the first threshold, so one matches
+            h = min(h for h in EXPIRY_WARN_H if left <= h * 3600)
+            days = left / 86400
+            key = f"{i}:{rt}:{h}"
+            msg = (f"#{i}'s Claude in Chrome login expires in "
+                   + (f"{days:.0f} days" if days >= 1.5 else f"{left / 3600:.0f} h"))
+        else:
+            continue
+        if key not in warned:
+            out.append((key, msg + f" — claude-swap auth {i}"))
+    return out
+
+
+# ---------- Chrome profiles ----------
+
+def has_extension(prof, base=CHROME_BASE):
+    return os.path.isdir(os.path.join(base, prof, "Extensions", EXT_ID))
+
+def profile_names(base=CHROME_BASE):
+    try:
+        with open(os.path.join(base, "Local State")) as f:
+            info = json.load(f)["profile"]["info_cache"]
+        return {k: v.get("name") or k for k, v in info.items()}
+    except Exception:
+        return {}
+
+_EXT_PUT = re.compile(rb'accountUuid(.{1,12}?)"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]'
+                      rb'{4}-[0-9a-f]{4}-[0-9a-f]{12})"', re.S)
+_EXT_DEL = re.compile(rb'\x00\x0baccountUuid')  # a LevelDB deletion record
+
+def extension_account(prof, base=CHROME_BASE):
+    """The account uuid the Claude extension of a Chrome profile is signed in
+    to, from its storage (LevelDB): the last write of accountUuid wins,
+    tables before logs and both oldest first. None: signed out or absent."""
+    d = os.path.join(base, prof, "Local Extension Settings", EXT_ID)
+
+    def num(f):
+        try:
+            return int(os.path.basename(f).split(".")[0])
+        except ValueError:
+            return -1
+    last = None
+    files = (sorted(glob.glob(os.path.join(d, "*.ldb")), key=num)
+             + sorted(glob.glob(os.path.join(d, "*.log")), key=num))
+    for f in files:
+        try:
+            with open(f, "rb") as fh:
+                b = fh.read()
+        except OSError:
+            continue
+        ev = ([(m.start(), m.group(2).decode()) for m in _EXT_PUT.finditer(b)]
+              + [(m.start(), None) for m in _EXT_DEL.finditer(b)])
+        for _, v in sorted(ev, key=lambda e: e[0]):
+            last = v
+    return last
+
+def account_uuid(acc):
+    return acc.get("uuid") or (acc.get("oauth") or {}).get("uuid")
+
+def chrome_profile_for(uuid, cookie_profiles=(), current=None, base=CHROME_BASE):
+    """The Chrome profile Claude in Chrome drives for an account: one whose
+    extension is signed in to it (the current pick first, then one also
+    logged in to it on claude.ai). With none, the current pick unless its
+    extension is someone else's, else the old guess from claude.ai cookies."""
+    cookie_profiles = list(cookie_profiles)
+    if uuid:
+        ext = [p for p in sorted(profile_names(base)) if extension_account(p, base) == uuid]
+        for c in [current] + cookie_profiles + ext:
+            if c in ext:
+                return c
+    if current and extension_account(current, base) in (None, uuid):
+        return current
+    with_ext = [p for p in cookie_profiles if has_extension(p, base)]
+    return (with_ext or cookie_profiles or [None])[0]
+
+def login_profile_for(uuid, cookie_profiles, base=CHROME_BASE):
+    """Where `auth` opens the authorization page: a profile logged in to the
+    account on claude.ai, its Claude in Chrome one if that is among them."""
+    for p in cookie_profiles:
+        if uuid and extension_account(p, base) == uuid:
+            return p
+    return cookie_profiles[0] if cookie_profiles else None
+
+def chrome_ready(acc, base=CHROME_BASE):
+    """Whether the account's Chrome profile has the extension signed in to it."""
+    prof, uuid = acc.get("chrome_profile"), account_uuid(acc)
+    return bool(prof and uuid and extension_account(prof, base) == uuid)
+
+def open_profile(prof, url=None):
+    subprocess.run(["open", "-na", "Google Chrome", "--args",
+                    f"--profile-directory={prof}"] + ([url] if url else []),
+                   capture_output=True)
+
+NATIVE_HOSTS = ["Google/Chrome", "BraveSoftware/Brave-Browser", "Arc/User Data",
+                "Microsoft Edge", "Chromium", "Vivaldi", "com.operasoftware.Opera"]
+
+def restore_native_hosts(tmpdir):
+    """`claude` run on a throwaway CLAUDE_CONFIG_DIR may point the browsers'
+    native-messaging manifests into it: point them back."""
+    good = os.path.join(cc_dir(), "chrome", "chrome-native-host")
+    for b in NATIVE_HOSTS:
+        p = os.path.expanduser(f"~/Library/Application Support/{b}/NativeMessagingHosts/"
+                               "com.anthropic.claude_code_browser_extension.json")
+        try:
+            with open(p) as f:
+                m = json.load(f)
+            if str(m.get("path", "")).startswith(tmpdir):
+                m["path"] = good
+                with open(p, "w") as f:
+                    json.dump(m, f, indent=2)
+        except Exception:
+            continue
+PYEOF
+export CLAUDE_SWAP_OAUTH="$OAUTH_PY"
+
 # --- Checks ---
 
 check_python() {
@@ -395,6 +1081,8 @@ cmd_help() {
   echo "  claude-swap remove <n>   Remove an account"
   echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/Fable for that account)"
   echo "  claude-swap keys-sync    Auto-import sessionKeys from Chrome profiles (by email)"
+  echo "  claude-swap auth [n|all] Full login per account, which Claude in Chrome needs"
+  echo "  claude-swap chrome [n|all]  Open the Chrome profile of account N (default: active)"
   echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
   echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap init         First-time setup"
@@ -421,6 +1109,13 @@ cmd_help() {
   echo "  To leave at another level, write it to ~/.claude/claude-swap-leave"
   echo "  (or set CLAUDE_SWAP_LEAVE) and restart the watch. 100 uses every"
   echo "  account to its limit, at the cost of the odd rejected request."
+  echo ""
+  echo "  Claude in Chrome refuses setup-tokens: it needs each account's full"
+  echo "  login. 'auth' takes it once per account, in that account's Chrome"
+  echo "  profile, and every swap then installs it (the setup-token stays as"
+  echo "  the fallback). It lasts about four weeks; check's Chr column and the"
+  echo "  watch tell when to redo it. Keep each account's Chrome profile open"
+  echo "  with the Claude extension signed in to that same account."
 }
 
 cmd_init() {
@@ -503,14 +1198,25 @@ with open('$STORE', 'w') as f:
 cmd_status() {
   check_store
   python3 - "$STORE" "$CLAUDE_CREDS" "$CLAUDE_JSON" "$IS_MACOS" "$VERSION" <<'PYEOF'
-import json, hashlib, time, os, sys, subprocess, binascii
+import json, hashlib, time, os, sys, types
 from datetime import datetime
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 
 store_path = sys.argv[1]
 creds_path = sys.argv[2]
 claude_json_path = sys.argv[3]
 is_macos = sys.argv[4] == "true"
 version = sys.argv[5]
+
+# Keep the logins in line first (saves a login Claude Code refreshed), so
+# what follows describes the current state.
+events = []
+try:
+    events = oauth.tick(store_path, *oauth.default_io(is_macos))
+except Exception as e:
+    events = [("log", f"login sync failed: {type(e).__name__}")]
 
 with open(store_path) as f:
     store = json.load(f)
@@ -571,30 +1277,21 @@ else:
     print("Watch:  not running")
 print()
 
-# Keychain check (macOS only)
+# What Claude Code uses: on macOS its keychain item, read before the file
 if is_macos:
-    try:
-        out = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, check=True
-        )
-        raw = out.stdout.strip()
-        if raw:
-            try:
-                kd = json.loads(raw)
-            except json.JSONDecodeError:
-                kd = json.loads(binascii.unhexlify(raw).decode("utf-8"))
-            ko = kd.get("claudeAiOauth", {})
-            ktoken = ko.get("accessToken", "")
-            has_refresh = bool(ko.get("refreshToken"))
-            kmatch, kfp = match_token(ktoken)
-            kind = "OAuth" if has_refresh else "setup-token"
-            label = f"account {kmatch}" if kmatch else "UNKNOWN"
-            print(f"  Keychain: {kfp} ({label}, {kind}) ** HAS PRIORITY **")
-        else:
-            print(f"  Keychain: empty (OK)")
-    except subprocess.CalledProcessError:
-        print(f"  Keychain: not found (OK)")
+    ko = oauth.parse(oauth.Keychain().read(oauth.cc_service()))
+    if ko:
+        kmatch, kfp = match_token(ko["accessToken"])
+        if kmatch is None and oauth.is_full(ko):
+            kmatch = oauth.owner(ko, accounts)
+        label = f"account {kmatch}" if kmatch else "UNKNOWN"
+        kind = ("full login, Claude in Chrome ready" if oauth.is_full(ko)
+                else "setup-token, no Claude in Chrome")
+        print(f"  Keychain: {kfp} ({label}, {kind}) — what Claude Code uses")
+    else:
+        print("  Keychain: not set (Claude Code reads .credentials.json)")
+for _, msg in events:
+    print(f"  Login sync: {msg}")
 
 # .credentials.json check
 try:
@@ -643,6 +1340,8 @@ from datetime import datetime, timedelta, timezone
 
 engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 
 store_path = sys.argv[1]
 with open(store_path) as f:
@@ -1011,6 +1710,7 @@ W_PL = 6            # plan: MAX20X / MAX5X / PRO / FREE
 W_BAR = BAR_W + 5   # bar + space + "100%"
 W_RST = 6
 W_RS = 3            # free limit resets left
+W_CH = 3            # Claude in Chrome login
 NCAL, CW = 8, 7     # today..+7: the 7d reset can fall exactly 7 days out
 DAY_NAMES = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 
@@ -1051,6 +1751,19 @@ cal_days = [today + timedelta(days=k) for k in range(NCAL)]
 cal_bounds = [tuple(datetime.combine(d + timedelta(days=k), datetime.min.time())
                     .timestamp() for k in (0, 1)) for d in cal_days]
 
+def chrome_cell(acc):
+    """The account's full login, which Claude in Chrome needs: ✓ good,
+    days (or hours) left when it is about to die, ✕ redo it, - none."""
+    st, left = oauth.login_state(acc, time.time())
+    if st == "none":
+        return paint(GREY, pad("-", W_CH, right=True))
+    if st == "dead":
+        return paint(RED, pad("✕", W_CH, right=True))
+    if st == "expiring":
+        txt = f"{left / 86400:.0f}d" if left >= 86400 else f"{max(0, left) / 3600:.0f}h"
+        return paint(RED if left < 86400 else YELLOW, pad(txt, W_CH, right=True))
+    return paint(GREEN, pad("✓", W_CH, right=True))
+
 def ep(dt):
     return dt.timestamp() if dt else None
 
@@ -1080,7 +1793,8 @@ def left_part(*cells):
 header = left_part(
     pad(" #", W_N), pad("Account", W_LB), pad("Plan", W_PL),
     pad("5h", W_BAR), pad("reset", W_RST),
-    pad("7d", W_BAR), pad("Fable", W_BAR), pad("Rst", W_RS, right=True))
+    pad("7d", W_BAR), pad("Fable", W_BAR), pad("Rst", W_RS, right=True),
+    pad("Chr", W_CH, right=True))
 cal_header = "".join(center(f"{DAY_NAMES[d.weekday()]}{d.day}", CW) for d in cal_days)
 split = vlen(header)
 
@@ -1115,7 +1829,7 @@ def render_row(row):
         num, name_cell, plan_cell(row["plan"], row["plan_end"] is not None),
         pct_cell(row["u5"]), reset5_cell(row["r5"]),
         pct_cell(row["u7"]), pct_cell(row["fable"]),
-        resets_cell(row["resets"])) + "│" + cal
+        resets_cell(row["resets"]), chrome_cell(acc)) + "│" + cal
 
     if row["error"] and row["error"] != "RATE LIMITED":
         line += "  " + paint(RED, row["error"])
@@ -1133,7 +1847,21 @@ print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
       + paint(GREY, " ───") + " no plan (" + paint(GREY, "─22:00─")
       + " renews if resubscribed)"
       + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
-                    "   │   Rst: free limit resets left (? = no valid cookie)"))
+                    "   │   Rst: free limit resets left (? = no valid cookie)"
+                    "   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)"))
+
+# Claude in Chrome only works on an account with its own full login
+if 1 <= active <= len(accounts) and not accounts[active - 1].get("disabled"):
+    st, _ = oauth.login_state(accounts[active - 1], time.time())
+    if st != "ok":
+        why = {"none": "has no full login", "dead": "lost its full login",
+               "expiring": "has a full login about to expire"}[st]
+        print("  " + paint(YELLOW, "Claude in Chrome: ")
+              + f"#{active} {why}" + paint(GREY, f" · claude-swap auth {active}"))
+    elif sys.platform == "darwin" and not oauth.chrome_ready(accounts[active - 1]):
+        print("  " + paint(YELLOW, "Claude in Chrome: ")
+              + f"#{active} has its login, but no Chrome profile has the extension"
+                " signed in to it" + paint(GREY, " · sign it in, then keys-sync"))
 
 def short(label):
     # 'Cuenta 3 (Gmail)' -> 'Gmail': the part in brackets names it best
@@ -1565,82 +2293,82 @@ PYEOF
 }
 
 _do_rotate() {
-  local target="$1"
+  # Swap Claude Code to account N: keep the login in use, then install N's
+  # full login (Claude in Chrome works) or, without one, its setup-token.
+  # Claude Code's keychain item is overwritten, never deleted: running
+  # sessions keep serving a deleted item from their cache.
+  python3 - "$STORE" "$1" "$IS_MACOS" <<'PYEOF'
+import os, sys, time, types
 
-  local token expires label
-  read -r token expires label < <(python3 -c "
-import json, sys
-with open('$STORE') as f:
-    d = json.load(f)
-acc = d['accounts'][int('$target') - 1]
-print(acc['token'], acc.get('expires', 0), acc.get('label', '?'))
-")
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 
-  [ -n "$token" ] || { echo "Error: account $target has no token"; exit 1; }
+store_path, target, macos = sys.argv[1], sys.argv[2], sys.argv[3] == "true"
+store = oauth.load_store(store_path)
+accounts = store.get("accounts", [])
+n = int(target) if target.isdigit() else 0
+if not 1 <= n <= len(accounts):
+    print(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
+    sys.exit(1)
+acc = accounts[n - 1]
+if not acc.get("token"):
+    print(f"Error: account {n} has no token")
+    sys.exit(1)
 
-  echo ""
-  echo "Rotating to account $target ($label)"
-  echo ""
+secrets, live, http = oauth.default_io(macos)
+now, prev = time.time(), store.get("active", 0)
+print()
+print(f"Rotating to account {n} ({acc.get('label', '?')})")
+print()
 
-  # 1. Keychain (macOS only)
-  if [ "$IS_MACOS" = true ]; then
-    security delete-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 && \
-      echo "  [1/4] Keychain cleared" || \
-      echo "  [1/4] Keychain already clear"
-  else
-    echo "  [1/4] Keychain skip (Linux)"
-  fi
+# 1. Claude Code's copy of a full login holds its newest refresh token
+k, what, _ = oauth.sync(store, secrets, live, http, now)
+print("  [1/4] " + {
+    "saved": f"Login in use saved to #{k}",
+    "same": f"Login in use already saved (#{k})",
+    "setup": "Nothing to save (a setup-token was in use)",
+    "unknown": "The login in use is of no account here: it gets replaced",
+    "vault-failed": f"Could not save #{k}'s login to the keychain"}[what])
+if what == "vault-failed":
+    print("\nStopped: swapping now would lose that login.")
+    sys.exit(1)
 
-  # 2. Write .credentials.json
-  python3 -c "
-import json, os
-creds = {
-    'claudeAiOauth': {
-        'accessToken': '$token',
-        'refreshToken': '',
-        'expiresAt': $expires,
-        'scopes': ['user:file_upload','user:inference','user:mcp_servers','user:profile','user:sessions:claude_code'],
-        'subscriptionType': 'max',
-        'rateLimitTier': 'default_claude_max_20x'
-    }
-}
-path = os.path.expanduser('~/.claude/.credentials.json')
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w') as f:
-    json.dump(creds, f, indent=2)
-os.chmod(path, 0o600)
-"
-  echo "  [2/4] .credentials.json updated"
+# 2-3. Claude Code's credential and the account it shows
+mode, note = oauth.install(store, n, secrets, live, http, now)
+if mode == "failed":
+    oauth.commit(store_path, store)
+    print(f"  [2/4] {note}")
+    print("\nStopped: Claude Code is still on the previous account.")
+    sys.exit(1)
+if mode == "oauth":
+    print("  [2/4] Full login installed: Claude in Chrome ready")
+    print(f"  [3/4] Claude Code account set to {acc.get('email') or '?'}")
+else:
+    print("  [2/4] Setup-token installed (Claude in Chrome needs a full login)")
+    print("  [3/4] Claude Code account cleared")
+if note:
+    print(f"        {note}")
 
-  # 3. Clear oauthAccount
-  if [ -f "$CLAUDE_JSON" ]; then
-    python3 -c "
-import json
-path = '$CLAUDE_JSON'
-with open(path) as f:
-    d = json.load(f)
-d.pop('oauthAccount', None)
-with open(path, 'w') as f:
-    json.dump(d, f, indent=2)
-"
-    echo "  [3/4] oauthAccount cleared"
-  else
-    echo "  [3/4] oauthAccount skip (no .claude.json)"
-  fi
-
-  # 4. Update store
-  python3 -c "
-import json
-with open('$STORE') as f:
-    d = json.load(f)
-d['active'] = $target
-with open('$STORE', 'w') as f:
-    json.dump(d, f, indent=2)
-"
-  echo "  [4/4] Store updated"
-
-  echo ""
-  echo "Done. New Claude Code sessions will use account $target."
+# 4. Store
+store["active"] = n
+oauth.mark_live(store, n, mode, now,
+                prev if prev != n else (store.get("live") or {}).get("from"))
+oauth.commit(store_path, store)
+print("  [4/4] Store updated")
+print()
+print(f"Done. Running sessions move to account {n} within 30 s; new ones start on it.")
+if mode == "oauth":
+    prof = acc.get("chrome_profile")
+    if oauth.chrome_ready(acc):
+        print(f"Claude in Chrome drives Chrome profile"
+              f" '{oauth.profile_names().get(prof, prof)}' (keep it open). A session"
+              " already connected keeps its browser until /mcp → Reconnect.")
+    else:
+        print(f"Claude in Chrome: no Chrome profile has the extension signed in to"
+              f" {acc.get('email')} yet — sign it in, then claude-swap keys-sync.")
+elif macos:
+    print(f"For Claude in Chrome on this account: claude-swap auth {n}")
+PYEOF
 }
 
 cmd_add() {
@@ -1746,7 +2474,10 @@ PYEOF
 cmd_keys_sync() {
   check_store
   python3 - "$STORE" <<'PYEOF'
-import json, sys, os, glob, shutil, tempfile, time, urllib.request, urllib.error
+import json, sys, os, glob, shutil, tempfile, time, types, urllib.request, urllib.error
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 
 try:
     import browser_cookie3
@@ -1815,6 +2546,8 @@ bases = [
 
 print("Scanning Chrome profiles...")
 seen = {}  # email -> (session_key, profile)
+profiles = {}  # email -> every profile logged in to it, for Claude in Chrome
+uuids = {}     # email -> account uuid, to find the extension signed in to it
 for base in bases:
     for db in sorted(glob.glob(os.path.join(base, "*", "Cookies"))):
         prof = os.path.basename(os.path.dirname(db))
@@ -1841,9 +2574,23 @@ for base in bases:
                     tier = o.get("rate_limit_tier") or ""
                     break
             seen[email.lower()] = (sk, prof, tier)
+            profiles.setdefault(email.lower(), []).append(prof)
+            uuids[email.lower()] = (boot.get("account") or {}).get("uuid")
             print(f"  {prof}: {email} OK")
         except Exception as e:
             print(f"  {prof}: extraction failed ({type(e).__name__})")
+
+def sync_chrome(acc, cookie_profiles):
+    """...and the browser Claude in Chrome drives: the profile whose
+    extension is signed in to the account. Returns notes for the report."""
+    global updated
+    cp = oauth.chrome_profile_for(oauth.account_uuid(acc), cookie_profiles,
+                                  acc.get("chrome_profile"))
+    if cp and cp != acc.get("chrome_profile"):
+        acc["chrome_profile"] = cp
+        updated += 1
+        return [f"Chrome profile {cp}"]
+    return []
 
 print()
 updated = 0
@@ -1851,6 +2598,12 @@ for i, acc in enumerate(accounts):
     if acc.get("disabled"):
         continue
     em = (acc.get("email") or "").lower()
+    if em and em not in seen:
+        # no cookie today, but the extension may still name its profile
+        n0 = updated
+        notes = sync_chrome(acc, [])
+        if updated != n0:
+            print(f"  Account {i+1} ({em}): " + ", ".join(notes))
     if em and em in seen:
         sk, prof, tier = seen[em]
         notes = []
@@ -1864,6 +2617,15 @@ for i, acc in enumerate(accounts):
             acc.pop("org_id", None)
             updated += 1
             notes.append(f"sessionKey updated (from {prof})")
+        if uuids.get(em) and acc.get("uuid") != uuids[em]:
+            acc["uuid"] = uuids[em]
+            updated += 1
+        # where `auth` opens the login page (claude.ai logged in to it)...
+        lp = oauth.login_profile_for(oauth.account_uuid(acc), profiles[em])
+        if lp and lp != acc.get("login_profile"):
+            acc["login_profile"] = lp
+            updated += 1
+        notes.extend(sync_chrome(acc, profiles[em]))
         print(f"  Account {i+1} ({em}): " + (", ".join(notes) or "up to date"))
 
 if updated:
@@ -1906,6 +2668,297 @@ if stale:
     print("Stored sessionKey NOT confirmed (no logged-in Chrome profile for it — it may be expired):")
     for m in stale:
         print(f"  - {m}")
+
+if sys.platform == "darwin":
+    names = oauth.profile_names()
+
+    def free(a):
+        t = (a.get("plan") or "").lower()
+        return "free" in t or t in ("", "default_claude_ai")
+    no_ext = []
+    for i, acc in live:
+        if free(acc) or oauth.chrome_ready(acc):
+            continue
+        where = acc.get("chrome_profile") or acc.get("login_profile")
+        no_ext.append(f"{i+1} ({acc.get('email')})"
+                      + (f" — e.g. in {where} '{names.get(where, '?')}'" if where else ""))
+    if no_ext:
+        print()
+        print("No Chrome profile has the Claude extension signed in to (Claude in Chrome"
+              " cannot work on them until one does):")
+        for m in no_ext:
+            print(f"  - {m}")
+PYEOF
+}
+
+# --- Full logins (Claude in Chrome) ---
+
+cmd_auth() {
+  check_store
+  if [ "$IS_MACOS" != true ]; then
+    echo "claude-swap auth needs macOS for now (keychain and Chrome profiles)."
+    exit 1
+  fi
+  command -v claude >/dev/null 2>&1 || { echo "Error: claude (Claude Code) is not in PATH"; exit 1; }
+  # passed with -c, not on stdin: stdin stays the terminal, which claude's
+  # "Paste code here" prompt and our questions read (claude cannot use a
+  # reopened /dev/tty on macOS: kqueue refuses it)
+  local auth_py
+  read -r -d '' auth_py <<'PYEOF' || true
+import json, os, shutil, signal, subprocess, sys, tempfile, time, types
+from datetime import datetime
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+
+store_path, args = sys.argv[1], sys.argv[2:]
+secrets, live, http = oauth.default_io(True)
+# a closed terminal or a kill still clears the throwaway login (finally:)
+signal.signal(signal.SIGTERM, signal.default_int_handler)
+signal.signal(signal.SIGHUP, signal.default_int_handler)
+BASE = os.path.expanduser("~/.claude/claude-swap-auth")
+
+def sweep():
+    """Throwaway logins an earlier run could not clear (the machine slept,
+    or it was killed hard): their keychain item and directory."""
+    try:
+        old = [os.path.join(BASE, d) for d in os.listdir(BASE)]
+    except OSError:
+        return
+    for d in old:
+        try:
+            if time.time() - os.stat(d).st_mtime < 3600:
+                continue  # perhaps another auth still running
+        except OSError:
+            continue
+        secrets.delete("Claude Code-credentials-" + oauth.config_hash(os.path.realpath(d)))
+        shutil.rmtree(d, ignore_errors=True)
+names = oauth.profile_names()
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+def paint(code, s):
+    return f"\x1b[{code}m{s}\x1b[0m" if COLOR else s
+
+def is_free(tier):
+    t = (tier or "").lower()
+    return "free" in t or t in ("", "default_claude_ai")
+
+def day(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%a %d %b")
+
+def state_text(a, now):
+    st, left = oauth.login_state(a, now)
+    m = a.get("oauth") or {}
+    if st == "none":
+        return paint("90", "none")
+    if st == "dead":
+        why = "refused" if m.get("dead") else "expired"
+        return paint("31", f"{why} — redo it")
+    until = f"until {day(m['rt_expires'])}" if m.get("rt_expires") else "no expiry known"
+    if st == "expiring":
+        return paint("33", f"{until} ({left / 86400:.0f}d left) — redo it soon")
+    return paint("32", f"ok {until}") + paint("90", f" ({left / 86400:.0f}d)" if left else "")
+
+def show(store):
+    now = time.time()
+    accounts = store.get("accounts", [])
+    print("Full logins: what Claude in Chrome needs, one per account.")
+    print()
+    for i, a in enumerate(accounts, 1):
+        prof = a.get("chrome_profile")
+        where = names.get(prof, prof) if prof else "-"
+        mark = "*" if i == store.get("active") else " "
+        if a.get("disabled"):
+            line = paint("90", "disabled")
+        elif is_free(a.get("plan")) and "plan" in a:
+            line = paint("90", "free plan: Claude Code does not run on it")
+        else:
+            line = state_text(a, now)
+        print(f" {mark}{i:>2}  {(a.get('label') or '?')[:24]:<24} {(a.get('email') or '-')[:30]:<30} "
+              f"{where[:20]:<20} {line}")
+    print()
+    print("  claude-swap auth <n>   authorize account n in its Chrome profile (one click)")
+    print("  claude-swap auth all   every paid account without a good login, one after another")
+
+def login(n):
+    """One browser authorization for account n, saved to its slot. -> bool"""
+    store = oauth.load_store(store_path)
+    acc = store["accounts"][n - 1]
+    email = (acc.get("email") or "").strip()
+    if not email:
+        print(f"#{n} has no email in the store, so its login could not be matched.")
+        return False
+    prof = acc.get("login_profile") or acc.get("chrome_profile")
+    os.makedirs(BASE, mode=0o700, exist_ok=True)
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix=f"{n}-", dir=BASE))
+    svc = "Claude Code-credentials-" + oauth.config_hash(tmp)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+                        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES")}
+    env["CLAUDE_CONFIG_DIR"] = tmp
+    if prof:
+        opener = os.path.join(tmp, "open-chrome")
+        with open(opener, "w") as f:
+            f.write('#!/bin/sh\nexec open -na "Google Chrome" --args '
+                    f'"--profile-directory={prof}" "$1"\n')
+        os.chmod(opener, 0o700)
+        env["BROWSER"] = opener
+    print()
+    print(paint("1", f"#{n} {email}") + ": authorize it in "
+          + (f"Chrome profile '{names.get(prof, prof)}'" if prof else "the browser that opens")
+          + f". Check the page shows {email}, then Authorize.")
+    if not prof:
+        print("  (no Chrome profile known for it: run keys-sync, or claude-swap chrome"
+              f" {n} \"<Profile dir>\")")
+    try:
+        r = subprocess.run(["claude", "auth", "login", "--claudeai", "--email", email], env=env)
+        o = oauth.parse(secrets.read(svc))
+        try:
+            with open(os.path.join(tmp, ".claude.json")) as f:
+                account = json.load(f).get("oauthAccount")
+        except Exception:
+            account = None
+        if not oauth.is_full(o) or not account:
+            print(f"  No login came back (exit {r.returncode}): nothing changed.")
+            return False
+        got = (account.get("emailAddress") or "").strip().lower()
+        store = oauth.load_store(store_path)  # it may have taken minutes
+        k = n if got == email.lower() else oauth.by_identity(store["accounts"], None, got)
+        if k is None:
+            print(f"  That login is {got}, which is not in claude-swap: discarded.")
+            return False
+        if k != n:
+            print(f"  That login is {got}: kept for #{k} instead.")
+        acc = store["accounts"][k - 1]
+        if not secrets.write(oauth.VAULT, oauth.dump(o), oauth.slot(acc)):
+            print("  Could not save it to the keychain: nothing changed.")
+            return False
+        now = time.time()
+        oauth.note_login(acc, o, now, account)
+        installed = False
+        if store.get("active") == k:
+            mode, _ = oauth.install(store, k, secrets, live, http, now)
+            if mode == "oauth":
+                oauth.mark_live(store, k, mode, now, (store.get("live") or {}).get("from"))
+                installed = True
+        oauth.commit(store_path, store)
+        until = f" until {day(o['refreshTokenExpiresAt'])}" if o.get("refreshTokenExpiresAt") else ""
+        print(paint("32", f"  Saved: good{until}.")
+              + (" Active account, so installed now: Claude in Chrome ready." if installed else ""))
+        acc = oauth.load_store(store_path)["accounts"][k - 1]
+        cp = acc.get("chrome_profile")
+        if oauth.chrome_ready(acc):
+            print(f"  Claude in Chrome will drive Chrome profile '{names.get(cp, cp)}'.")
+        else:
+            print(f"  For Claude in Chrome, sign the extension in to {got} in a Chrome"
+                  " profile, then run keys-sync.")
+        return True
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        raise
+    finally:
+        secrets.delete(svc)
+        oauth.restore_native_hosts(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+store = oauth.load_store(store_path)
+accounts = store.get("accounts", [])
+if not args:
+    show(store)
+    sys.exit(0)
+sweep()
+if args[0] == "all":
+    now = time.time()
+    targets = [i for i, a in enumerate(accounts, 1)
+               if a.get("token") and not a.get("disabled") and not is_free(a.get("plan"))
+               and oauth.login_state(a, now)[0] != "ok"]
+    if not targets:
+        print("Every paid account already holds a good login.")
+        sys.exit(0)
+    print("To authorize: " + ", ".join(f"#{i} {accounts[i - 1].get('email')}" for i in targets))
+elif args[0].isdigit() and 1 <= int(args[0]) <= len(accounts):
+    targets = [int(args[0])]
+else:
+    print(f"Usage: claude-swap auth [n|all]   (n in 1-{len(accounts)})")
+    sys.exit(1)
+done = 0
+try:
+    for j, n in enumerate(targets):
+        if j:
+            nxt = accounts[n - 1]
+            if input(f"\nEnter for #{n} {nxt.get('email')}, q to stop: ").strip().lower() == "q":
+                break
+        done += login(n)
+except (KeyboardInterrupt, EOFError):
+    print()
+print()
+if len(targets) > 1:
+    print(f"{done} of {len(targets)} saved.")
+show(oauth.load_store(store_path))
+PYEOF
+  python3 -c "$auth_py" "$STORE" "$@"
+}
+
+cmd_chrome() {
+  check_store
+  [ "$IS_MACOS" = true ] || { echo "claude-swap chrome needs macOS."; exit 1; }
+  python3 - "$STORE" "$@" <<'PYEOF'
+import os, sys, types
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+
+store_path, args = sys.argv[1], sys.argv[2:]
+store = oauth.load_store(store_path)
+accounts = store.get("accounts", [])
+names = oauth.profile_names()
+
+def is_free(tier):
+    t = (tier or "").lower()
+    return "free" in t or t in ("", "default_claude_ai")
+
+if len(args) == 2 and args[0].isdigit():
+    # claude-swap chrome <n> "<Profile dir or name>": which profile is n's
+    n, want = int(args[0]), args[1]
+    if not 1 <= n <= len(accounts):
+        sys.exit(f"Error: account {n} does not exist (valid: 1-{len(accounts)})")
+    prof = want if want in names else next((k for k, v in names.items() if v == want), None)
+    if not prof:
+        sys.exit(f"No Chrome profile '{want}'. Profiles: "
+                 + ", ".join(f"{k} ({v})" for k, v in sorted(names.items())))
+    a = store["accounts"][n - 1]
+    a["chrome_profile"] = prof
+    oauth.save_store(store_path, store)
+    ext = ("" if oauth.chrome_ready(a) else
+           " — its Claude extension is not signed in to this account" if oauth.has_extension(prof)
+           else " — the Claude extension is not installed there")
+    print(f"#{n}'s Chrome profile: {prof} ({names[prof]}){ext}")
+    sys.exit(0)
+
+if not args:
+    targets = [store.get("active", 0)]
+elif args[0] == "all":
+    targets = [i for i, a in enumerate(accounts, 1)
+               if not a.get("disabled") and not is_free(a.get("plan"))]
+elif args[0].isdigit():
+    targets = [int(args[0])]
+else:
+    sys.exit("Usage: claude-swap chrome [n|all] · claude-swap chrome <n> \"<Profile dir>\"")
+for n in targets:
+    if not 1 <= n <= len(accounts):
+        print(f"#{n}: no such account")
+        continue
+    a = accounts[n - 1]
+    prof = a.get("chrome_profile")
+    if not prof:
+        print(f"#{n} {a.get('email')}: no Chrome profile known (keys-sync finds it,"
+              f" or claude-swap chrome {n} \"<Profile dir>\")")
+        continue
+    oauth.open_profile(prof)
+    ext = ("" if oauth.chrome_ready(a) else
+           " — its Claude extension is not signed in to this account" if oauth.has_extension(prof)
+           else " — no Claude extension installed there")
+    print(f"#{n} {a.get('email')}: opened {prof} ({names.get(prof, prof)}){ext}")
 PYEOF
 }
 
@@ -2171,8 +3224,9 @@ _launchd_install() {
 import os, plistlib, sys
 path, label, log, path_env, *argv = sys.argv[1:]
 env = {"PATH": path_env}
-if os.environ.get("CLAUDE_SWAP_STORE"):
-    env["CLAUDE_SWAP_STORE"] = os.environ["CLAUDE_SWAP_STORE"]
+for k in ("CLAUDE_SWAP_STORE", "CLAUDE_CONFIG_DIR", "CLAUDE_SWAP_VAULT"):
+    if os.environ.get(k):
+        env[k] = os.environ[k]
 with open(path, "wb") as f:
     plistlib.dump({"Label": label, "ProgramArguments": argv,
                    "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 60,
@@ -2325,6 +3379,8 @@ from datetime import datetime
 
 engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 
 store_path, self_bin, strategy, state_path = sys.argv[1:5]
 auto_reset = sys.argv[5] == "1"
@@ -2556,7 +3612,8 @@ try:
     # reset too soon; the active account is adopted afresh below
     with open(state_path) as f:
         prev = json.load(f)
-    for k in ("reset_warned", "reset_tried", "reset_failed", "last_switch"):
+    for k in ("reset_warned", "reset_tried", "reset_failed", "last_switch",
+              "login_warned"):
         if k in prev:
             state[k] = prev[k]
 except Exception:
@@ -2691,6 +3748,65 @@ def spend_reset(n, store, rows):
             notify(f"Reset on #{n} {label} did not empty the week — see the watch log")
     save_state()
 
+# ---------- full logins (Claude in Chrome) ----------
+# Claude Code refreshes the login in use every ~8 h; a minute later it is in
+# its slot. A session that refreshed the account just left and wrote it back
+# over the new one is undone, and a /login by hand becomes the active account.
+login_io = oauth.default_io(sys.platform == "darwin")
+said = {}  # message -> when it was last logged: a repeating one stays quiet
+
+def login_tick():
+    try:
+        events = oauth.tick(store_path, *login_io)
+    except Exception as e:
+        events = [("log", f"login sync failed: {type(e).__name__}: {e}")]
+    now = time.time()
+    for kind, msg in events:
+        if now - said.get(msg, 0) < 3600:
+            continue
+        said[msg] = now
+        log(msg)
+        if kind == "notify":
+            notify(msg)
+    try:
+        with open(store_path) as f:
+            accounts = json.load(f).get("accounts", [])
+    except Exception:
+        return
+    warned = state.get("login_warned", [])
+    due = oauth.due_reminders(accounts, now, warned)
+    for key, msg in due:
+        log(msg)
+        notify(msg)
+        warned.append(key)
+    if due:
+        # keys carry the login's death date (ms): drop those a month gone
+        state["login_warned"] = [k for k in warned if int(k.split(":")[1]) == 0
+                                 or int(k.split(":")[1]) / 1000 > now - 30 * 86400]
+        save_state()
+
+def nap(seconds):
+    """Sleep, minding the logins every minute. Wakes early when the active
+    account changes under the watch (a swap by hand, or a /login)."""
+    end = time.time() + seconds
+    try:
+        with open(store_path) as f:
+            start = json.load(f).get("active")
+    except Exception:
+        start = None
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(60, left))
+        login_tick()
+        try:
+            with open(store_path) as f:
+                if json.load(f).get("active") != start:
+                    return
+        except Exception:
+            pass
+
 # launchd and `watch stop` send SIGTERM: leave through the same door as ^C
 signal.signal(signal.SIGTERM, signal.default_int_handler)
 try:
@@ -2705,6 +3821,7 @@ notify(f"Watch running (strategy {strategy})")
 
 while True:
     try:
+        login_tick()
         with open(store_path) as f:
             store = json.load(f)
         active = store.get("active", 0)
@@ -2748,11 +3865,11 @@ while True:
                               "manual": False, "wall_noted": False,
                               "prewarned": False, "active": d["target"]})
                 save_state()
-                time.sleep(60)
+                nap(60)
             else:
                 log("rotation failed")
                 notify("Rotation failed — check the watch log")
-                time.sleep(300)
+                nap(300)
             continue
 
         cadence = 600 if peak < 80 else (180 if peak < 95 else 60)
@@ -2787,13 +3904,13 @@ while True:
             # +20 s: let the window actually roll over before looking
             sleep_for = min(cadence, max(30, d["wake"] - time.time() + 20))
         log(f"#{active} {desc} — {d['reason']} — next look {clock(time.time() + sleep_for)}")
-        time.sleep(sleep_for)
+        nap(sleep_for)
     except KeyboardInterrupt:
         log("watch stopped")
         break
     except Exception as e:
         log(f"unexpected error: {type(e).__name__}: {e} — retrying in 5 min")
-        time.sleep(300)
+        nap(300)
 PYEOF
 }
 
@@ -2851,11 +3968,15 @@ PYEOF
   case "$confirm" in
     [yY]*)
       python3 -c "
-import json
+import json, os, types
 with open('$STORE') as f:
     d = json.load(f)
 target = $target
-d['accounts'].pop(target - 1)
+gone = d['accounts'].pop(target - 1)
+if gone.get('oauth') and gone.get('email'):  # its saved full login goes too
+    oauth = types.ModuleType('oauth')
+    exec(os.environ['CLAUDE_SWAP_OAUTH'], oauth.__dict__)
+    oauth.default_io()[0].delete(oauth.VAULT, oauth.slot(gone))
 active = d.get('active', 0)
 if active == target:
     d['active'] = 1 if d['accounts'] else 0
@@ -2947,6 +4068,14 @@ case "${1:-}" in
     ;;
   reset)
     cmd_reset "${2:-}" "${3:-}"
+    ;;
+  auth)
+    shift
+    cmd_auth "$@"
+    ;;
+  chrome)
+    shift
+    cmd_chrome "$@"
     ;;
   disable)
     cmd_set_disabled "${2:-}" 1 disable
