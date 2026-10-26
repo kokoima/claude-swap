@@ -2807,6 +2807,9 @@ def login(n):
     print(paint("1", f"#{n} {email}") + ": authorize it in "
           + (f"Chrome profile '{names.get(prof, prof)}'" if prof else "the browser that opens")
           + f". Check the page shows {email}, then Authorize.")
+    print("  If claude.ai asks you to sign in again (it does when the last sign-in is not"
+          " recent), do it in that same window: the code it emails goes in that"
+          " window's box.")
     if not prof:
         print("  (no Chrome profile known for it: run keys-sync, or claude-swap chrome"
               f" {n} \"<Profile dir>\")")
@@ -2898,8 +2901,18 @@ print()
 if len(targets) > 1:
     print(f"{done} of {len(targets)} saved.")
 show(oauth.load_store(store_path))
+sys.exit(3 if done else 0)  # tells the shell to refresh the cookies
 PYEOF
-  python3 -c "$auth_py" "$STORE" "$@"
+  local rc=0
+  python3 -c "$auth_py" "$STORE" "$@" || rc=$?
+  if [ "$rc" = 3 ]; then
+    # signing in to claude.ai again renews its cookie, so the stored one dies
+    echo ""
+    echo "Refreshing the claude.ai cookies (signing in again renews them)..."
+    cmd_keys_sync 2>&1 | sed -n '/^  Account/,$p' || true
+    rc=0
+  fi
+  return "$rc"
 }
 
 cmd_chrome() {

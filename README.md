@@ -474,6 +474,14 @@ with the Claude extension signed in to that same account
 (`claude-swap chrome` opens it). A session that was already connected
 before the switch needs `/mcp` → Reconnect.
 
+**`auth` asks you to sign in to claude.ai again** — claude.ai wants a
+recent sign-in before it grants access ("Sign in again to continue"). Do
+it in that same window; the emailed link opens a page with a code, and
+that code goes in the box of the window where you started, not anywhere
+else. Signing in again renews claude.ai's cookie, so `auth` runs
+`keys-sync` afterwards. A tab ending on `error_description=account_on_hold`
+means claude.ai has that account restricted (`claude.ai/restricted`).
+
 **`Chr` shows `✕`** — that account's login was refused or expired:
 `claude-swap auth <n>`. Until then it runs on its setup token.
 
