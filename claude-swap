@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.11.0"
+VERSION="1.12.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # Claude Code's files, where it looks for them (CLAUDE_CONFIG_DIR moves both)
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
@@ -42,7 +42,7 @@ IS_MACOS=false
 read -r -d '' ENGINE_PY <<'PYEOF' || true
 # A row: n, label, u5/u7 (% or None), r5/r7 (window resets, epoch or None),
 # plan_end (cancellation or downgrade, epoch or None), cancel_at (when a
-# cancelled plan stops, epoch or None), free, disabled, error,
+# cancelled plan stops, epoch or None), free, disabled, reserved, error,
 # rate_limited, resets (spendable count or None), resets_ends (when they
 # lapse, epoch or None), reset_cooldown (epoch or None).
 #
@@ -95,7 +95,9 @@ def deadline(r, now):
 
 
 def eligible(r):
-    return (not (r.get("disabled") or r.get("free") or r.get("error"))
+    # reserved: kept for `claude-swap run` sessions, never the shared login
+    return (not (r.get("disabled") or r.get("free") or r.get("reserved")
+                 or r.get("error"))
             and r.get("u5") is not None)
 
 
@@ -214,7 +216,7 @@ def decide(rows, active, now, state, auto_reset=False):
                            f"#{r['n']} spent its week ({usage(r)}) and holds a reset")
 
     if (cur is not None and cur.get("error")
-            and not (cur.get("disabled") or cur.get("free"))):
+            and not (cur.get("disabled") or cur.get("free") or cur.get("reserved"))):
         return out("stay", active, f"#{active} probe failed ({cur['error']})",
                    now + ERROR_RETRY)
 
@@ -1077,7 +1079,7 @@ cmd_help() {
   echo "  claude-swap watch stop   Stop the watcher"
   echo "  claude-swap watch status Watcher status + log"
   echo "  claude-swap reset <n>    Spend account N's free limit reset (asks first; cannot be undone)"
-  echo "  claude-swap add          Add a new account"
+  echo "  claude-swap add [--reserved]  Add a new account (--reserved: see below)"
   echo "  claude-swap remove <n>   Remove an account"
   echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/Fable for that account)"
   echo "  claude-swap keys-sync    Auto-import sessionKeys from Chrome profiles (by email)"
@@ -1085,6 +1087,10 @@ cmd_help() {
   echo "  claude-swap chrome [n|all]  Open the Chrome profile of account N (default: active)"
   echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
   echo "  claude-swap enable <n>   Re-enable a disabled account"
+  echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's)"
+  echo "  claude-swap unreserve <n>  Make it an ordinary account again"
+  echo "  claude-swap run [n] [-- <claude args>]"
+  echo "                           Start claude on account N, or on the reserved one with most room"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -1109,6 +1115,13 @@ cmd_help() {
   echo "  To leave at another level, write it to ~/.claude/claude-swap-leave"
   echo "  (or set CLAUDE_SWAP_LEAVE) and restart the watch. 100 uses every"
   echo "  account to its limit, at the cost of the odd rejected request."
+  echo ""
+  echo "  A reserved account (a Team plan for sensitive clients, say) never"
+  echo "  becomes the shared login and auto and the watch never pick it, so"
+  echo "  no swap moves work onto it or off it. 'run' starts a session on it"
+  echo "  with CLAUDE_CODE_OAUTH_TOKEN, which Claude Code puts before the"
+  echo "  keychain: swaps leave that session where it is. It runs on the"
+  echo "  setup-token, so without Claude in Chrome. check still shows it."
   echo ""
   echo "  Claude in Chrome refuses setup-tokens: it needs each account's full"
   echo "  login. 'auth' takes it once per account, in that account's Chrome"
@@ -1383,8 +1396,11 @@ def fetch_web_usage(acc):
             orgs = get("https://claude.ai/api/organizations")
         except Exception:
             return  # e.g. free accounts return 403 here; don't break the rest
-        o = next((o for o in orgs if "chat" in (o.get("capabilities") or [])),
-                 orgs[0] if orgs else None)
+        # A Team member can also keep the personal free org it signed up
+        # with: the paid one is the account's plan.
+        chat = [o for o in orgs if "chat" in (o.get("capabilities") or [])]
+        o = next((o for o in chat if not is_free(o.get("rate_limit_tier"))),
+                 chat[0] if chat else (orgs[0] if orgs else None))
         if not o:
             return
         old, new = acc.get("plan"), o.get("rate_limit_tier") or ""
@@ -1584,6 +1600,7 @@ for i, acc in enumerate(accounts):
     row = {"n": n, "label": acc.get("label", ""), "error": None,
            "u5": None, "u7": None, "fable": None, "plan": acc.get("plan"),
            "r5": None, "r7": None, "rf": None, "disabled": False,
+           "reserved": bool(acc.get("reserved")),
            "src": None, "resets": None, "plan_end": None}
 
     if acc.get("disabled"):
@@ -1682,7 +1699,7 @@ if store_dirty[0]:
 # runs on every prompt. A failure here must never break the dashboard.
 def cache_row(r):
     c = {k: r.get(k) for k in ("n", "label", "u5", "u7", "fable",
-                               "plan", "error", "disabled", "src")}
+                               "plan", "error", "disabled", "reserved", "src")}
     res = r.get("resets")
     c["resets"] = res["left"] if res else None
     c["resets_ends"] = res["ends"].timestamp() if res and res["ends"] else None
@@ -1721,6 +1738,8 @@ def plan_name(tier):
     t = tier.lower()
     if "max_20x" in t:
         return "MAX20X", CYAN
+    if "team" in t or "raven" in t:  # raven: claude.ai's name for Team
+        return "TEAM", CYAN
     if "max_5x" in t:
         return "MAX5X", CYAN
     if "pro" in t:
@@ -1957,7 +1976,8 @@ for r in results:
         "cancel_at": ep(cancel),
         # a cancelled plan past its end date is free, whatever is cached
         "free": is_free(r["plan"]) or bool(cancel and cancel <= datetime.now()),
-        "disabled": r["disabled"], "error": None if limited else r["error"],
+        "disabled": r["disabled"], "reserved": r["reserved"],
+        "error": None if limited else r["error"],
         "rate_limited": limited,
         "resets": (res["left"] if res["eligible"] else 0) if res else None,
         "resets_ends": ep(res["ends"]) if res else None,
@@ -2005,6 +2025,14 @@ elif d["action"] == "switch":
 else:
     head = "wait" + (f" until {when(d['wake'])}" if d["wake"] else "")
 print("  " + paint(BOLD, "Now: " + head) + paint(GREY, f" — {d['reason']}"))
+
+# reserved accounts sit out of that order: only `claude-swap run` opens them
+kept = [r for r in results if r["reserved"] and not r["disabled"]]
+if kept:
+    print("  " + paint(CYAN, "Reserved: ")
+          + ", ".join(f"#{r['n']} {short(r['label'])}" for r in kept)
+          + paint(GREY, " — never the shared login; a session on them:"
+                        " claude-swap run [n] -- <claude args>"))
 PYEOF
 }
 
@@ -2102,8 +2130,8 @@ def is_free(tier):
 results = []
 for i, acc in enumerate(accounts):
     n = i + 1
-    if not acc.get("token") or acc.get("disabled"):
-        continue
+    if not acc.get("token") or acc.get("disabled") or acc.get("reserved"):
+        continue  # reserved: only `claude-swap run` uses it
     # when the plan stops (cancellation or booked downgrade, cached by check):
     # a cancellation in the past leaves the account free
     cancel = iso_epoch(acc.get("plan_ends")) if acc.get("plan_ends") else None
@@ -2314,6 +2342,13 @@ acc = accounts[n - 1]
 if not acc.get("token"):
     print(f"Error: account {n} has no token")
     sys.exit(1)
+if acc.get("reserved"):
+    # the shared login reaches every session and the watch would move them
+    # off it: a reserved account only runs sessions of its own
+    print(f"Account {n} is reserved: it never becomes the shared login.")
+    print(f"Open a session on it with:  claude-swap run {n} -- <claude args>")
+    print(f"(or make it an ordinary account first: claude-swap unreserve {n})")
+    sys.exit(1)
 
 secrets, live, http = oauth.default_io(macos)
 now, prev = time.time(), store.get("active", 0)
@@ -2373,14 +2408,23 @@ PYEOF
 
 cmd_add() {
   check_store
-  _add_account_interactive
+  local reserved=0
+  case "${1:-}" in
+    --reserved) reserved=1 ;;
+    "") ;;
+    *) echo "Usage: claude-swap add [--reserved]"; exit 1 ;;
+  esac
+  _add_account_interactive "$reserved"
 }
 
 _add_account_interactive() {
+  local reserved="${1:-0}"
   echo "Generate a setup token:"
   echo "  1. Open a new terminal"
-  echo "  2. Log in:  claude login"
-  echo "  3. Run:     claude setup-token"
+  echo "  2. Run:     CLAUDE_CONFIG_DIR=\$(mktemp -d) claude setup-token"
+  echo "     (a throwaway config, so the login in use stays as it is)"
+  echo "  3. Authorize it in the browser signed in to that account"
+  echo "     (if another one opens, copy the URL it prints to the right profile)"
   echo "  4. Paste the token here"
   echo ""
 
@@ -2426,6 +2470,8 @@ d['accounts'].append({
     'token': '''$token''',
     'expires': int(time.time() * 1000) + 365 * 86400 * 1000
 })
+if '$reserved' == '1':
+    d['accounts'][-1]['reserved'] = True
 with open('$STORE', 'w') as f:
     json.dump(d, f, indent=2)
 print(len(d['accounts']))
@@ -2434,6 +2480,10 @@ print(len(d['accounts']))
   count=$(python3 -c "import json; print(len(json.load(open('$STORE'))['accounts']))")
   echo ""
   echo "Account $count added (expires in 365d)"
+  if [ "$reserved" = "1" ]; then
+    echo "Reserved: the watch never uses it. Sessions on it: claude-swap run [$count] -- <claude args>"
+  fi
+  echo "Next: log claude.ai in to it in a Chrome profile, then claude-swap keys-sync"
 }
 
 cmd_key() {
@@ -2571,8 +2621,10 @@ for base in bases:
             for m in (boot.get("account") or {}).get("memberships") or []:
                 o = m.get("organization") or {}
                 if "chat" in (o.get("capabilities") or []):
-                    tier = o.get("rate_limit_tier") or ""
-                    break
+                    t = o.get("rate_limit_tier") or ""
+                    if tier is None or (tier.lower() in ("", "default_claude_ai")
+                                        and t.lower() not in ("", "default_claude_ai")):
+                        tier = t  # a paid org (Team) beats a personal free one
             seen[email.lower()] = (sk, prof, tier)
             profiles.setdefault(email.lower(), []).append(prof)
             uuids[email.lower()] = (boot.get("account") or {}).get("uuid")
@@ -2879,6 +2931,7 @@ if args[0] == "all":
     now = time.time()
     targets = [i for i, a in enumerate(accounts, 1)
                if a.get("token") and not a.get("disabled") and not is_free(a.get("plan"))
+               and not a.get("reserved")  # never the shared login: no Chrome
                and oauth.login_state(a, now)[0] != "ok"]
     if not targets:
         print("Every paid account already holds a good login.")
@@ -3565,6 +3618,7 @@ def probe_all(store):
         row = {"n": i + 1, "label": acc.get("label") or acc.get("email") or "?",
                "plan": acc.get("plan"), "plan_end": plan_end, "cancel_at": cancel,
                "disabled": bool(acc.get("disabled")),
+               "reserved": bool(acc.get("reserved")),
                "free": is_free(acc.get("plan")) or ended,
                "u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
                "rf": None, "resets": None, "resets_ends": None,
@@ -3586,8 +3640,8 @@ def probe_all(store):
         snapshot = {"updated": time.time(), "active": store.get("active", 0),
                     "accounts": [{k: r.get(k) for k in
                                   ("n", "label", "u5", "u7", "fable",
-                                   "plan", "error", "disabled", "src",
-                                   "resets", "resets_ends")}
+                                   "plan", "error", "disabled", "reserved",
+                                   "src", "resets", "resets_ends")}
                                  for r in rows]}
         with open(CACHE_PATH + ".tmp", "w") as f:
             json.dump(snapshot, f)
@@ -3611,7 +3665,8 @@ def fable_decide(rows, active):
         return {"action": "stay", "target": active, "wake": None,
                 "reason": f"#{active} below 99%"}
     cands = [r for r in rows
-             if r["n"] != active and not (r["disabled"] or r["free"] or r["error"])
+             if r["n"] != active
+             and not (r["disabled"] or r["free"] or r["reserved"] or r["error"])
              and not r["rate_limited"] and r["u5"] is not None
              and not (r["fable"] is not None and r["fable"] >= 99)]
     reason = f"#{active} at the limit"
@@ -3958,6 +4013,129 @@ print(f"Account {target} ({who}) {'disabled: check/auto/keys-sync will skip it' 
 PYEOF
 }
 
+cmd_set_reserved() {
+  check_store
+  local target="$1" val="$2"
+  [ -n "$target" ] || { echo "Usage: claude-swap $3 <n>"; exit 1; }
+
+  python3 - "$STORE" "$target" "$val" <<'PYEOF'
+import json, sys
+store_path, target, val = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+with open(store_path) as f:
+    d = json.load(f)
+accounts = d.get("accounts", [])
+n = int(target) if target.isdigit() else 0
+if not 1 <= n <= len(accounts):
+    print(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
+    sys.exit(1)
+acc = accounts[n - 1]
+if val:
+    acc["reserved"] = True
+else:
+    acc.pop("reserved", None)
+with open(store_path, "w") as f:
+    json.dump(d, f, indent=2)
+who = acc.get("label") or acc.get("email") or "?"
+if val:
+    print(f"Account {n} ({who}) reserved: auto and the watch never use it, and it never"
+          " becomes the shared login.")
+    print(f"Sessions on it: claude-swap run [{n}] -- <claude args>")
+    if d.get("active") == n:
+        print("It is the shared login right now: the watch moves off it at its next look"
+              " (or swap by hand: claude-swap <n>).")
+else:
+    print(f"Account {n} ({who}) is an ordinary account again: auto and the watch may use it.")
+PYEOF
+}
+
+cmd_run() {
+  # A Claude Code session of its own on one account, whatever the shared
+  # login does: the token goes in CLAUDE_CODE_OAUTH_TOKEN, which Claude Code
+  # puts before the keychain, so no swap and no watch can move the session.
+  # Without a number it takes the reserved account with the most room.
+  check_store
+  command -v claude >/dev/null 2>&1 || { echo "Error: claude (Claude Code) is not in PATH"; exit 1; }
+  # passed with -c, not on stdin: claude takes this process over (exec) and
+  # needs the terminal as its stdin
+  local run_py
+  read -r -d '' run_py <<'PYEOF' || true
+import json, os, sys, time, types
+
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
+CACHE = os.path.expanduser("~/.claude/claude-swap-usage.json")
+
+store_path, args = sys.argv[1], sys.argv[2:]
+head, rest = (args[:args.index("--")], args[args.index("--") + 1:]) \
+    if "--" in args else (args, [])
+if len(head) > 1 or (head and not head[0].isdigit()):
+    sys.exit("Usage: claude-swap run [n] [-- <claude args>]")
+with open(store_path) as f:
+    accounts = json.load(f).get("accounts", [])
+
+# usage from the snapshot check and the watch keep (no request here); a row
+# counts only if it is still the same account (a remove renumbers them)
+try:
+    with open(CACHE) as f:
+        snap = json.load(f)
+    cached = {r.get("n"): r for r in snap.get("accounts", [])}
+except Exception:
+    snap, cached = {}, {}
+
+def usage(n, acc):
+    c = cached.get(n)
+    if c and c.get("label") == acc.get("label") and (
+            c.get("u5") is not None or c.get("u7") is not None):
+        return c  # a 5h window not started yet reads None: 7d still counts
+    return None
+
+if head:
+    n = int(head[0])
+    if not 1 <= n <= len(accounts):
+        sys.exit(f"Error: account {n} does not exist (valid: 1-{len(accounts)})")
+    acc = accounts[n - 1]
+    if acc.get("disabled") or not acc.get("token"):
+        sys.exit(f"Error: account {n} is disabled or has no token")
+else:
+    pool = [(i, a) for i, a in enumerate(accounts, 1)
+            if a.get("reserved") and a.get("token") and not a.get("disabled")]
+    if not pool:
+        sys.exit("No reserved account: mark one with  claude-swap reserve <n>")
+
+    def order(item):
+        i, a = item
+        c = usage(i, a)
+        if c is None:
+            return (1, 0, i)  # no figures: after the ones with room
+        load = max(c.get("u5") or 0, c.get("u7") or 0)
+        return (2 if load >= engine.LEAVE else 0, load, i)
+    n, acc = min(pool, key=order)
+
+c = usage(n, acc)
+fig = (f"5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%" if c
+       else "no usage figures yet")
+age = time.time() - (snap.get("updated") or 0)
+if c and age > 600:
+    fig += f" ({int(age // 60)} min old)"
+lane = "reserved" if acc.get("reserved") else "NOT reserved: the watch may also use it"
+sys.stderr.write(f"claude-swap run: #{n} {acc.get('label') or '?'} · {acc.get('email') or '-'}"
+                 f" · {fig} · {lane}\n")
+if "--chrome" in rest:
+    # the Claude in Chrome bridge turns setup-tokens away (missing scope)
+    rest = [a for a in rest if a != "--chrome"]
+    sys.stderr.write("claude-swap run: --chrome dropped (Claude in Chrome needs a full"
+                     " login, and these sessions run on the setup-token)\n")
+
+env = {k: v for k, v in os.environ.items()
+       if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES")}
+env["CLAUDE_CODE_OAUTH_TOKEN"] = acc["token"]
+env["CLAUDE_SWAP_PINNED"] = str(n)  # the statusline shows this account
+os.execvpe("claude", ["claude"] + rest, env)
+PYEOF
+  exec python3 -c "$run_py" "$STORE" "$@"
+}
+
 cmd_remove() {
   check_store
   local target="$1"
@@ -4079,7 +4257,17 @@ case "${1:-}" in
     esac
     ;;
   add)
-    cmd_add
+    cmd_add "${2:-}"
+    ;;
+  run)
+    shift
+    cmd_run "$@"
+    ;;
+  reserve)
+    cmd_set_reserved "${2:-}" 1 reserve
+    ;;
+  unreserve)
+    cmd_set_reserved "${2:-}" 0 unreserve
     ;;
   remove|rm)
     cmd_remove "${2:-}"

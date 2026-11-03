@@ -180,6 +180,43 @@ class Returning(unittest.TestCase):
         self.assertEqual((d["action"], d["target"]), ("switch", 8))
 
 
+class Reserved(unittest.TestCase):
+    """A reserved account (Team plan for sensitive clients) runs sessions of
+    its own through `claude-swap run`: the shared login never goes there."""
+
+    def test_left_out_of_the_order_even_with_the_soonest_expiry(self):
+        rows = today({2: {"reserved": True, "r7": NOW + 30 * H}})
+        self.assertNotIn(2, [r["n"] for r in E["rank"](rows, NOW)])
+
+    def test_never_the_target_of_a_switch(self):
+        # #2 alone has room, and it is reserved: wait rather than go there
+        rows = today({3: {"u5": 99}, 5: {"u7": 99}, 2: {"reserved": True}})
+        d = decide(rows, 3, LONG_AGO)
+        self.assertNotEqual(d["target"], 2)
+        self.assertEqual(d["action"], "wall")
+
+    def test_never_the_target_of_a_return(self):
+        rows = today({2: {"reserved": True, "plan_end": NOW + 20 * H}})
+        d = decide(rows, 5, LONG_AGO)
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+
+    def test_a_shared_login_on_a_reserved_account_is_left(self):
+        d = decide(today({3: {"reserved": True}}), 3, LONG_AGO)
+        self.assertEqual((d["action"], d["target"]), ("switch", 5))
+
+    def test_a_probe_error_on_it_is_not_waited_for(self):
+        rows = today({3: {"reserved": True, "error": "URLError",
+                          "u5": None, "u7": None}})
+        d = decide(rows, 3, LONG_AGO)
+        self.assertEqual((d["action"], d["target"]), ("switch", 5))
+
+    def test_its_free_reset_is_never_spent_by_the_watch(self):
+        rows = today({2: {"reserved": True, "u7": 100, "resets": 1,
+                          "resets_ends": NOW + 500 * H}})
+        d = decide(rows, 3, LONG_AGO, auto_reset=True)
+        self.assertNotEqual((d["action"], d["target"]), ("reset", 2))
+
+
 class Wall(unittest.TestCase):
     def test_all_blocked_waits_for_the_soonest_unblock(self):
         rows = today({3: {"u5": 99}, 5: {"u7": 99}, 2: {"u5": 99}})

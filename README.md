@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.11.0
+claude-swap v1.12.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -316,13 +316,15 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap watch stop` | Stop the watcher |
 | `claude-swap watch status` | Watcher state + last probe + log tail |
 | `claude-swap reset <n> [--yes]` | Spend account N's free limit reset (shows what it clears, asks for `yes` unless `--yes`) |
-| `claude-swap add` | Add a new account |
+| `claude-swap add [--reserved]` | Add a new account (`--reserved`: see Reserved accounts) |
 | `claude-swap remove <n>` | Remove an account |
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
 | `claude-swap keys-sync` | Auto-import sessionKeys from Chrome profiles (by email); also notes each account's Chrome profile |
 | `claude-swap auth [n\|all]` | Full login for account N (or every paid account lacking one), authorized in its Chrome profile — what Claude in Chrome needs. No argument: who has one and until when |
 | `claude-swap chrome [n\|all]` | Open the Chrome profile of account N (default: the active one); `chrome <n> "Profile 3"` sets it |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
+| `claude-swap reserve <n>` / `unreserve <n>` | Keep account N for sessions of its own: auto and the watch never use it |
+| `claude-swap run [n] [-- <claude args>]` | Start `claude` on account N, or on the reserved account with the most room, whatever the shared login is |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
@@ -393,6 +395,37 @@ Data sources for the dashboard:
   contradicts it) and `/api/bootstrap` during `keys-sync`.
 - **Fallback** — an account with no working cookie gets 5h/7d from the
   response headers of a minimal Haiku request to `api.anthropic.com`.
+
+### Reserved accounts
+
+Some work should stay on one account: a Team plan kept for sensitive
+clients, for example. Swapping cannot do that, because the shared login
+reaches every session on the machine and the watch moves it around. Mark
+such an account **reserved** (`claude-swap add --reserved`, or
+`claude-swap reserve <n>`):
+
+- `auto` and the watch never pick it, and `claude-swap <n>` refuses to make
+  it the shared login, so no switch moves work onto it or off it;
+- `check` still shows its usage, plan and calendar, and lists it on a
+  `Reserved:` line below the watcher order;
+- `claude-swap run [n] -- <claude args>` starts a session on it. The token
+  goes in `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code puts before the
+  keychain, so later swaps leave that session where it is. Should the token
+  be refused (401), Claude Code keeps it and reports the error rather than
+  falling back to the stored login. Without a number, `run` takes the
+  reserved account with the most room in the last usage snapshot.
+
+These sessions run on the setup-token, so Claude in Chrome is not available
+in them (`run` drops `--chrome`). A convenient alias:
+
+```bash
+alias clt="claude-swap run -- --dangerously-skip-permissions"
+clt                      # new session on the roomiest reserved account
+clt --resume <uuid>      # resume one there
+```
+
+Generate the setup-token in a throwaway config so the login in use is not
+touched: `CLAUDE_CONFIG_DIR=$(mktemp -d) claude setup-token`.
 
 ### Free limit resets
 
