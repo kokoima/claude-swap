@@ -2729,7 +2729,8 @@ if sys.platform == "darwin":
         return "free" in t or t in ("", "default_claude_ai")
     no_ext = []
     for i, acc in live:
-        if free(acc) or oauth.chrome_ready(acc):
+        # reserved accounts never take the shared login: no Claude in Chrome
+        if free(acc) or acc.get("reserved") or oauth.chrome_ready(acc):
             continue
         where = acc.get("chrome_profile") or acc.get("login_profile")
         no_ext.append(f"{i+1} ({acc.get('email')})"
