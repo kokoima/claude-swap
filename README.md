@@ -324,7 +324,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap chrome [n\|all]` | Open the Chrome profile of account N (default: the active one); `chrome <n> "Profile 3"` sets it |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
 | `claude-swap reserve <n>` / `unreserve <n>` | Keep account N for sessions of its own: auto and the watch never use it |
-| `claude-swap run [n] [-- <claude args>]` | Start `claude` on account N, or on the reserved account with the most room, whatever the shared login is |
+| `claude-swap run [n] [-- <claude args>]` | Start `claude` on account N, whatever the shared login is (no N: the only reserved account) |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
@@ -413,14 +413,18 @@ such an account **reserved** (`claude-swap add --reserved`, or
   keychain, so later swaps leave that session where it is. Should the token
   be refused (401), Claude Code keeps it and reports the error rather than
   falling back to the stored login. Without a number, `run` takes the
-  reserved account with the most room in the last usage snapshot.
+  reserved account only when there is just one: it never chooses between
+  several by usage, since a Team seat belongs to one person;
+- inside such a session, `claude-swap status` starts with a `This session:`
+  line naming its account. Claude Code keeps `CLAUDE_CODE_OAUTH_TOKEN` from
+  the commands it runs, so `status` reads it from the `claude` process.
 
 These sessions run on the setup-token, so Claude in Chrome is not available
 in them (`run` drops `--chrome`). A convenient alias:
 
 ```bash
-alias clt="claude-swap run -- --dangerously-skip-permissions"
-clt                      # new session on the roomiest reserved account
+alias clt="claude-swap run 11 -- --dangerously-skip-permissions"
+clt                      # new session on account 11
 clt --resume <uuid>      # resume one there
 ```
 

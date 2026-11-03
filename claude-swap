@@ -1090,7 +1090,7 @@ cmd_help() {
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's)"
   echo "  claude-swap unreserve <n>  Make it an ordinary account again"
   echo "  claude-swap run [n] [-- <claude args>]"
-  echo "                           Start claude on account N, or on the reserved one with most room"
+  echo "                           Start claude on account N (no N: the only reserved account)"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -1248,12 +1248,56 @@ def match_token(token):
             return i + 1, fp
     return None, fp
 
+def session_token():
+    """(pid, token or None) of the Claude Code session this runs in, or None.
+
+    A session started by `claude-swap run` carries its account's token in
+    CLAUDE_CODE_OAUTH_TOKEN, and Claude Code keeps that variable from the
+    commands it runs: so it is read from the claude process itself."""
+    import subprocess
+
+    def ps(*args):
+        return subprocess.run(["ps", *args], capture_output=True, text=True,
+                               timeout=5).stdout.strip()
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            return None
+        try:
+            ppid, cmd = ps("-o", "ppid=,command=", "-p", str(pid)).split(None, 1)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            return None
+        if os.path.basename(cmd.split()[0]) == "claude":
+            try:
+                env = ps("eww", "-o", "command=", "-p", str(pid))
+            except (OSError, subprocess.SubprocessError):
+                env = ""
+            tok = next((w.split("=", 1)[1] for w in env.split()
+                        if w.startswith("CLAUDE_CODE_OAUTH_TOKEN=")), None)
+            return pid, tok or None
+        pid = int(ppid)
+    return None
+
 print(f"claude-swap v{version}")
 print()
 
 if not accounts:
     print("No accounts configured. Run 'claude-swap add' to add one.")
     sys.exit(0)
+
+if is_macos:
+    found = session_token()
+    if found and found[1]:
+        k, _ = match_token(found[1])
+        if k:
+            a = accounts[k - 1]
+            kind = "reserved, " if a.get("reserved") else ""
+            print(f"This session: {k} ({a.get('label', '?')} / {a.get('email') or '-'})"
+                  f" — {kind}claude-swap run; the Active login below does not reach it")
+        else:
+            print("This session: a token of its own, which is none of claude-swap's")
+    elif found:
+        print("This session: on the Active login below")
 
 if 1 <= active <= len(accounts):
     acc = accounts[active - 1]
@@ -4053,17 +4097,15 @@ cmd_run() {
   # A Claude Code session of its own on one account, whatever the shared
   # login does: the token goes in CLAUDE_CODE_OAUTH_TOKEN, which Claude Code
   # puts before the keychain, so no swap and no watch can move the session.
-  # Without a number it takes the reserved account with the most room.
+  # Without a number it takes the reserved account, when there is just one.
   check_store
   command -v claude >/dev/null 2>&1 || { echo "Error: claude (Claude Code) is not in PATH"; exit 1; }
   # passed with -c, not on stdin: claude takes this process over (exec) and
   # needs the terminal as its stdin
   local run_py
   read -r -d '' run_py <<'PYEOF' || true
-import json, os, sys, time, types
+import json, os, sys, time
 
-engine = types.ModuleType("engine")
-exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 CACHE = os.path.expanduser("~/.claude/claude-swap-usage.json")
 
 store_path, args = sys.argv[1], sys.argv[2:]
@@ -4098,19 +4140,17 @@ if head:
     if acc.get("disabled") or not acc.get("token"):
         sys.exit(f"Error: account {n} is disabled or has no token")
 else:
+    # Never a choice by usage: a Team seat belongs to one person, and
+    # alternating seats to stretch the limits is not what they are for.
     pool = [(i, a) for i, a in enumerate(accounts, 1)
             if a.get("reserved") and a.get("token") and not a.get("disabled")]
     if not pool:
         sys.exit("No reserved account: mark one with  claude-swap reserve <n>")
-
-    def order(item):
-        i, a = item
-        c = usage(i, a)
-        if c is None:
-            return (1, 0, i)  # no figures: after the ones with room
-        load = max(c.get("u5") or 0, c.get("u7") or 0)
-        return (2 if load >= engine.LEAVE else 0, load, i)
-    n, acc = min(pool, key=order)
+    if len(pool) > 1:
+        sys.exit("Several reserved accounts ("
+                 + ", ".join(f"#{i} {a.get('email') or a.get('label') or '?'}" for i, a in pool)
+                 + "): say which one,  claude-swap run <n> -- <claude args>")
+    n, acc = pool[0]
 
 c = usage(n, acc)
 fig = (f"5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%" if c
