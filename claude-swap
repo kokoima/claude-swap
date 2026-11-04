@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.13.0"
+VERSION="1.13.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # Claude Code's files, where it looks for them (CLAUDE_CONFIG_DIR moves both)
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
@@ -383,6 +383,20 @@ def needs_billed_probe(free, web_ok, has_windows):
     if web_ok and (has_windows or free):
         return False
     return True
+
+
+def five_hour(u5, u7):
+    """The 5h figure, given what a reply carried for the 5h and 7d windows.
+
+    While no 5h window is running (nothing used in the last five hours)
+    claude.ai sends five_hour as null and the ratelimit headers leave the
+    5h ones out (seen 4-nov-2026). That is 0%, not unknown: read as no data,
+    it took every idle account out of the rotation. Unknown is only when
+    the 7d window is missing too, as on a free plan.
+    """
+    if u5 is None and u7 is not None:
+        return 0.0
+    return u5
 PYEOF
 export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
@@ -1533,7 +1547,8 @@ def fetch_web_usage(acc):
             d = get(f"https://claude.ai/api/organizations/{org}/{USAGE_QS}")
             # A plan that contradicts the reply (usage windows on a free
             # plan, none on a paid one) changed since it was cached.
-            has_windows = bool(d.get("five_hour") or d.get("limits"))
+            has_windows = bool(d.get("five_hour") or d.get("seven_day")
+                               or d.get("limits"))
             if has_windows == is_free(acc.get("plan")) and plan_age() > 3600:
                 refresh_org()
             if time.time() - acc.get("sub_checked", 0) > PLAN_TTL:
@@ -1546,6 +1561,7 @@ def fetch_web_usage(acc):
                 w = d.get(key) or {}
                 out[pk] = w.get("utilization")
                 out[rk] = parse_iso(w.get("resets_at"))
+            out["u5"] = engine.five_hour(out["u5"], out["u7"])
             # Model-scoped weekly windows come as a list tagged by display
             # name, so a new model with its own quota appears on its own.
             for l in d.get("limits", []):
@@ -1751,6 +1767,7 @@ for i, acc in enumerate(accounts):
             row["u5"] = float(u5) * 100
         if u7:
             row["u7"] = float(u7) * 100
+        row["u5"] = engine.five_hour(row["u5"], row["u7"])
         row["r5"] = parse_epoch(headers.get("anthropic-ratelimit-unified-5h-reset"))
         row["r7"] = parse_epoch(headers.get("anthropic-ratelimit-unified-7d-reset"))
 
@@ -2215,6 +2232,7 @@ def fetch_web_usage(acc):
         w = d.get(key) or {}
         out[pk] = w.get("utilization")
         out[rk] = epoch(w.get("resets_at"))
+    out["u5"] = engine.five_hour(out["u5"], out["u7"])
     for l in d.get("limits", []):
         m = (l.get("scope") or {}).get("model") or {}
         if (m.get("display_name") or "").lower() == "fable":
@@ -2307,6 +2325,7 @@ for i, acc in enumerate(accounts):
             v = headers.get(f"anthropic-ratelimit-unified-{hdr}-utilization")
             if v:
                 entry[k] = float(v) * 100
+        entry["u5"] = engine.five_hour(entry["u5"], entry["u7"])
         for k, hdr in (("r5", "5h"), ("r7", "7d")):
             try:
                 entry[k] = int(headers.get(f"anthropic-ratelimit-unified-{hdr}-reset", ""))
@@ -3171,12 +3190,14 @@ _reset_run() {
   #          grant id on stdout (everything else goes to stderr).
   # claim:   spend that grant, then re-read claude.ai to report the outcome.
   python3 - "$STORE" "$@" <<'PYEOF'
-import json, os, sys, time, uuid
+import json, os, sys, time, types, uuid
 import urllib.request, urllib.error
 from datetime import datetime
 
 store_path, mode, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
 grant_id = sys.argv[4] if len(sys.argv) > 4 else None
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
@@ -3232,8 +3253,9 @@ def windows(d):
     fable = next((l.get("percent") for l in d.get("limits", [])
                   if (((l.get("scope") or {}).get("model") or {})
                       .get("display_name") or "").lower() == "fable"), None)
-    return ((d.get("five_hour") or {}).get("utilization"),
-            (d.get("seven_day") or {}), fable)
+    seven = d.get("seven_day") or {}
+    return (engine.five_hour((d.get("five_hour") or {}).get("utilization"),
+                             seven.get("utilization")), seven, fable)
 
 def pct(v):
     return "-" if v is None else f"{v:.0f}%"
@@ -3617,6 +3639,7 @@ def web_usage(acc):
     out["u5"], out["u7"] = five.get("utilization"), seven.get("utilization")
     out["r5"] = iso_epoch(five.get("resets_at"))
     out["r7"] = iso_epoch(seven.get("resets_at"))
+    out["u5"] = engine.five_hour(out["u5"], out["u7"])
     for l in d.get("limits", []):
         m = (l.get("scope") or {}).get("model") or {}
         if (m.get("display_name") or "").lower() == "fable":
@@ -3680,6 +3703,7 @@ def probe(acc):
         u7 = headers.get("anthropic-ratelimit-unified-7d-utilization")
         if u5: out["u5"] = float(u5) * 100
         if u7: out["u7"] = float(u7) * 100
+        out["u5"] = engine.five_hour(out["u5"], out["u7"])
         for key, hdr in (("r5", "5h"), ("r7", "7d")):
             try:
                 out[key] = int(headers.get(f"anthropic-ratelimit-unified-{hdr}-reset", ""))

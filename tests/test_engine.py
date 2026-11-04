@@ -558,5 +558,34 @@ class BilledProbe(unittest.TestCase):
         self.assertTrue(self.needed(False, False, False))
 
 
+class FiveHour(unittest.TestCase):
+    """claude.ai sends no 5h window while none is running (4-nov-2026)."""
+
+    def test_no_window_but_a_week_is_zero(self):
+        # idle for five hours: five_hour null, seven_day there
+        self.assertEqual(E["five_hour"](None, 3.0), 0.0)
+        self.assertEqual(E["five_hour"](None, 100.0), 0.0)
+
+    def test_a_running_window_is_kept(self):
+        self.assertEqual(E["five_hour"](42.0, 96.0), 42.0)
+        self.assertEqual(E["five_hour"](0.0, 0.0), 0.0)
+
+    def test_no_windows_at_all_stays_unknown(self):
+        # a free plan, or a reply that failed
+        self.assertIsNone(E["five_hour"](None, None))
+
+    def test_idle_accounts_are_back_in_the_rotation(self):
+        # the wall of 4-nov: #7 idle at 96% of its week, #1 idle and fresh,
+        # #8 spent; every idle one used to read as "no data"
+        rows = [acct(7, u5=E["five_hour"](None, 96.0), u7=96, r7=NOW + 60 * H),
+                acct(1, u5=E["five_hour"](None, 1.0), u7=1, r7=NOW + 80 * H),
+                acct(8, u7=100, r7=NOW + 90 * H)]
+        d = E100["decide"](rows, 7, NOW, {"last_switch": NOW - H})
+        self.assertEqual(d["action"], "stay")
+        rows[0]["u7"] = 100
+        d = E100["decide"](rows, 7, NOW, {"last_switch": NOW - H})
+        self.assertEqual((d["action"], d["target"]), ("switch", 1))
+
+
 if __name__ == "__main__":
     unittest.main()

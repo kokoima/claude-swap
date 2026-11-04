@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.13.0
+claude-swap v1.13.1
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -214,7 +214,8 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
   Nov`, `ends Sun 22 Nov`), next to when its setup token expires.
 - **5h / 7d / Fable** — color bars: green <50%, yellow 50–80%, red ≥80%.
   `-` means no data: an expired sessionKey, or a plan with no such
-  window.
+  window. An account unused for five hours has no 5h window running and
+  shows `0%` with no reset time.
 - **reset** — exact time the 5h window resets (`+HH:MM` = tomorrow).
 - **Rst** — free limit resets left on the account (green). `0` = all
   spent, `-` = the plan is not offered any, `?` = unknown because the
