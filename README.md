@@ -13,26 +13,26 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.12.0
+claude-swap v1.13.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
 
- #   Account       Plan    5h           reset   7d           Fable        Rst  Chr │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
-───────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1   3d │   ·      ·    22:00 ✕11:06 ────────────────────────────
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0    ✓ │   ·      ·      ·      ·      ·      ·    08:00    ·
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    -    - │   ·      ·      ·      ·      ·    17:00    ·      ·
-  4  Old Account   FREE   — disabled —
+ #   Account       Plan    Renews   5h           reset   7d           Fable        Rst  Chr │ Th23   Fr24   Sa25   Su26   Mo27   Tu28   We29   Th30
+────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────
+  1  Personal      MAX20X  ✕26 Sep  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1   3d │   ·      ·    22:00 ✕11:06 ────────────────────────────
+ *2  Work          MAX20X  14 Oct   █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0    ✓ │   ·      ·      ·      ·      ·      ·    08:00    ·
+  3  Side Project  MAX20X  02 Oct   ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    -    - │   ·      ·      ·      ·      ·    17:00    ·      ·
+  4  Old Account   FREE             — disabled —
 
   calendar: 7d reset time · Fable when it falls on a different day · ↓ downgrade · ✕ plan ends ─── no plan (─22:00─ renews if resubscribed)   │   bars: <50% green · 50–80% yellow · ≥80% red   │   Rst: free limit resets left (? = no valid cookie)   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)
   Plan ending: #1 Personal MAX20X cancelled, ends Sun 26 Sep 11:06 (in 3d) · renews Sat 25 22:00 → 13h 6m until then
   Free limit resets: #1 Personal ×1 · until Sun 26 Sep 11:06 (in 3d) — plan ends · spend one: claude-swap reset <n>
 
   Watcher order — what is lost first goes first · leaves at 98% of 5h or 7d, comes back once there is room
-  3  Side Project  MAX20X  ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    -    - │   ·      ·      ·      ·      ·    17:00    ·      ·     renews Tue 28 17:00
- *2  Work          MAX20X  █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0    ✓ │   ·      ·      ·      ·      ·      ·    08:00    ·     renews Wed 29 08:00
-  1  Personal      MAX20X  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1   3d │   ·      ·    22:00 ✕11:06 ────────────────────────────  blocked until Sat 25 22:00
+  3  Side Project  MAX20X  02 Oct   ░░░░░░   0%  +01:10  ███▊░░  63%  ██████ 100%    -    - │   ·      ·      ·      ·      ·    17:00    ·      ·     renews Tue 28 17:00
+ *2  Work          MAX20X  14 Oct   █▊░░░░  30%   21:10  ██▋░░░  43%  ███▊░░  62%    0    ✓ │   ·      ·      ·      ·      ·      ·    08:00    ·     renews Wed 29 08:00
+  1  Personal      MAX20X  ✕26 Sep  ░░░░░░   0%   20:30  ██████ 100%  ██████ 100%    1   3d │   ·      ·    22:00 ✕11:06 ────────────────────────────  blocked until Sat 25 22:00
   Now: switch to #3 — #3 goes first (5h 0% · 7d 63%)
 ```
 
@@ -206,6 +206,12 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
   Both are read daily from `/subscription_details`, by `check` and by the
   running watcher, so a cancellation or a resubscription shows up
   without anyone running `check`.
+- **Renews** — when the plan next renews, which is the day it charges
+  (claude.ai's `next_charge_at`): `21 Nov`. A cancelled plan shows the day
+  it ends instead, `✕22 Nov` in red, and a booked downgrade `↓22 Nov` in
+  cyan. `?` = not read yet (it needs a working sessionKey), `-` = a free
+  plan. `claude-swap status` lists the same per account (`renews Sat 21
+  Nov`, `ends Sun 22 Nov`), next to when its setup token expires.
 - **5h / 7d / Fable** — color bars: green <50%, yellow 50–80%, red ≥80%.
   `-` means no data: an expired sessionKey, or a plan with no such
   window.

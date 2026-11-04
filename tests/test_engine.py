@@ -478,8 +478,10 @@ class Subscription(unittest.TestCase):
     def test_parses_a_cancellation(self):
         self.assertEqual(
             E["parse_subscription"]({"plan_ending_at": "2026-10-02T09:05:45Z",
+                                     "next_charge_at": "2026-10-02T09:05:45Z",
                                      "scheduled_downgrade": None}),
-            {"plan_ends": "2026-10-02T09:05:45Z", "plan_next": None})
+            # the "next charge" of a cancelled plan is its end, not a renewal
+            {"plan_ends": "2026-10-02T09:05:45Z", "plan_next": None, "plan_renews": None})
 
     def test_parses_a_downgrade(self):
         s = {"plan_ending_at": None,
@@ -488,11 +490,49 @@ class Subscription(unittest.TestCase):
         self.assertEqual(E["parse_subscription"](s),
                          {"plan_ends": None,
                           "plan_next": {"plan": "claude_pro",
-                                        "date": "2026-10-10T00:00:00Z"}})
+                                        "date": "2026-10-10T00:00:00Z"},
+                          "plan_renews": None})
 
     def test_a_renewed_subscription_clears_the_end(self):
         self.assertEqual(E["parse_subscription"]({"plan_ending_at": None}),
-                         {"plan_ends": None, "plan_next": None})
+                         {"plan_ends": None, "plan_next": None, "plan_renews": None})
+
+    def test_parses_the_next_renewal(self):
+        self.assertEqual(
+            E["parse_subscription"]({"plan_ending_at": None, "status": "active",
+                                     "next_charge_at": "2026-11-21T15:31:48Z"}),
+            {"plan_ends": None, "plan_next": None, "plan_renews": "2026-11-21T15:31:48Z"})
+
+
+class Billing(unittest.TestCase):
+    """What the plan does next, as check and status show it."""
+    T = 1_800_000_000  # 2027-01-15
+
+    def iso(self, ts):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def test_a_running_plan_shows_its_renewal(self):
+        acc = {"plan_renews": self.iso(self.T + 6 * 86400)}
+        self.assertEqual(E["billing"](acc, self.T), ("renews", self.T + 6 * 86400))
+
+    def test_a_cancelled_plan_shows_its_end(self):
+        acc = {"plan_ends": self.iso(self.T + 3 * 86400),
+               "plan_renews": self.iso(self.T + 9 * 86400)}
+        self.assertEqual(E["billing"](acc, self.T)[0], "ends")
+
+    def test_a_booked_downgrade_comes_before_the_renewal(self):
+        acc = {"plan_next": {"plan": "claude_pro", "date": self.iso(self.T + 86400)},
+               "plan_renews": self.iso(self.T + 86400)}
+        self.assertEqual(E["billing"](acc, self.T)[0], "down")
+
+    def test_unknown_or_gone_by_is_a_question_mark(self):
+        self.assertEqual(E["billing"]({}, self.T), ("?", None))
+        self.assertEqual(E["billing"]({"plan_renews": self.iso(self.T - 60)}, self.T),
+                         ("?", None))
+        # an end already past does not hide a renewal read since
+        acc = {"plan_ends": self.iso(self.T - 86400), "plan_renews": self.iso(self.T + 86400)}
+        self.assertEqual(E["billing"](acc, self.T)[0], "renews")
 
 
 class BilledProbe(unittest.TestCase):

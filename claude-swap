@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.12.0"
+VERSION="1.13.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # Claude Code's files, where it looks for them (CLAUDE_CONFIG_DIR moves both)
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
@@ -308,16 +308,45 @@ def ending(r, end):
 
 
 def parse_subscription(s):
-    """plan_ends / plan_next as the store keeps them, from subscription_details.
+    """plan_ends / plan_next / plan_renews as the store keeps them, from
+    subscription_details.
 
     plan_ending_at is claude.ai's "Your subscription ends on …"; a smaller
-    plan booked for later comes as scheduled_downgrade instead.
+    plan booked for later comes as scheduled_downgrade instead. next_charge_at
+    is the next renewal; on a cancelled plan it repeats the end, which is not
+    a renewal, so it is only kept while the plan goes on.
     """
     s = s or {}
     down = s.get("scheduled_downgrade") or {}
-    return {"plan_ends": s.get("plan_ending_at"),
+    ends = s.get("plan_ending_at")
+    return {"plan_ends": ends,
             "plan_next": ({"plan": down.get("plan_type"), "date": down.get("date")}
-                          if down.get("plan_type") else None)}
+                          if down.get("plan_type") else None),
+            "plan_renews": None if ends else s.get("next_charge_at")}
+
+
+def _iso(v):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def billing(acc, now):
+    """What the plan does next: ("ends", t) cancelled, ("down", t) a smaller
+    plan booked, ("renews", t) the next charge, or ("?", None) when it is not
+    known yet or the cached date has gone by (re-read within a day)."""
+    end = _iso(acc.get("plan_ends"))
+    if end and end > now:
+        return "ends", end
+    down = _iso((acc.get("plan_next") or {}).get("date"))
+    if down and down > now:
+        return "down", down
+    ren = _iso(acc.get("plan_renews"))
+    if ren and ren > now:
+        return "renews", ren
+    return "?", None
 
 
 def subs_due(accounts, now, tried):
@@ -1365,9 +1394,23 @@ except Exception as e:
 
 print()
 
-# Account list
+# Account list: what each plan does next, and when its setup-token expires
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
+
+def plan_next(acc):
+    t = (acc.get("plan") or "").lower()
+    if "free" in t or t == "default_claude_ai":
+        return "free plan"
+    kind, ts = engine.billing(acc, time.time())
+    if kind == "?":
+        return "?"
+    when = datetime.fromtimestamp(ts).strftime("%a %d %b")
+    return {"ends": f"ends {when}", "down": f"downgrade {when}",
+            "renews": f"renews {when}"}[kind]
+
 nw = len(str(len(accounts)))
-print(f"  {'#':>{nw + 1}}  {'Label':<20} {'Email':<30} Expires")
+print(f"  {'#':>{nw + 1}}  {'Label':<20} {'Email':<30} {'Plan':<20} Token")
 for i, acc in enumerate(accounts):
     n = i + 1
     marker = "*" if n == active else " "
@@ -1378,7 +1421,7 @@ for i, acc in enumerate(accounts):
         exp_dt = datetime.fromtimestamp(exp_ms / 1000).strftime("%Y-%m-%d")
     else:
         exp_dt = "EXPIRED"
-    print(f"  {marker}{n:>{nw}}  {label:<20} {email:<30} {exp_dt}")
+    print(f"  {marker}{n:>{nw}}  {label:<20} {email:<30} {plan_next(acc):<20} {exp_dt}")
 PYEOF
 }
 
@@ -1768,6 +1811,7 @@ W_N = 3
 # Account column as wide as the longest label (full names visible)
 W_LB = max([14] + [len(a.get("label", "")) for a in accounts if len(a.get("label", "")) <= 40])
 W_PL = 6            # plan: MAX20X / MAX5X / PRO / FREE
+W_RN = 7            # what the plan does next: 21 Nov · ✕22 Nov · ↓22 Nov
 W_BAR = BAR_W + 5   # bar + space + "100%"
 W_RST = 6
 W_RS = 3            # free limit resets left
@@ -1796,6 +1840,21 @@ def plan_cell(tier, ending=False):
     """Yellow when the plan is cancelled or has a downgrade booked."""
     name, col = plan_name(tier)
     return paint(YELLOW if ending else col, pad(name, W_PL))
+
+def renews_cell(acc, tier):
+    """The next renewal (the day it charges); ✕ the day a cancelled plan
+    ends, ↓ a booked downgrade; ? not read yet; - on a free plan."""
+    if is_free(tier):
+        return paint(GREY, pad("-", W_RN))
+    kind, t = engine.billing(acc, time.time())
+    if kind == "?":
+        return paint(GREY, pad("?", W_RN))
+    txt = datetime.fromtimestamp(t).strftime("%d %b")
+    if kind == "ends":
+        return paint(RED, pad("✕" + txt, W_RN))
+    if kind == "down":
+        return paint(CYAN, pad("↓" + txt, W_RN))
+    return pad(txt, W_RN)
 
 def resets_cell(res):
     """Green count = resets waiting; 0 = all spent; - = none offered;
@@ -1854,7 +1913,7 @@ def left_part(*cells):
     return "  ".join(cells) + " "
 
 header = left_part(
-    pad(" #", W_N), pad("Account", W_LB), pad("Plan", W_PL),
+    pad(" #", W_N), pad("Account", W_LB), pad("Plan", W_PL), pad("Renews", W_RN),
     pad("5h", W_BAR), pad("reset", W_RST),
     pad("7d", W_BAR), pad("Fable", W_BAR), pad("Rst", W_RS, right=True),
     pad("Chr", W_CH, right=True))
@@ -1871,7 +1930,7 @@ def render_row(row):
 
     if row["disabled"]:
         return (left_part(paint(GREY, num), paint(GREY, pad(name, W_LB)),
-                          plan_cell(row["plan"]))
+                          plan_cell(row["plan"]), paint(GREY, pad("", W_RN)))
                 + paint(GREY, "— disabled —"))
 
     if row["error"] == "RATE LIMITED":
@@ -1890,6 +1949,7 @@ def render_row(row):
 
     line = left_part(
         num, name_cell, plan_cell(row["plan"], row["plan_end"] is not None),
+        renews_cell(acc, row["plan"]),
         pct_cell(row["u5"]), reset5_cell(row["r5"]),
         pct_cell(row["u7"]), pct_cell(row["fable"]),
         resets_cell(row["resets"]), chrome_cell(acc)) + "│" + cal
@@ -1911,7 +1971,8 @@ print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
       + " renews if resubscribed)"
       + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
                     "   │   Rst: free limit resets left (? = no valid cookie)"
-                    "   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)"))
+                    "   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)"
+                    "   │   Renews: next charge (✕ plan ends · ↓ downgrade · ? not read yet)"))
 
 # Claude in Chrome only works on an account with its own full login
 if 1 <= active <= len(accounts) and not accounts[active - 1].get("disabled"):
