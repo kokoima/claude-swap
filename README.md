@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.13.1
+claude-swap v1.14.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -399,7 +399,10 @@ Data sources for the dashboard:
   authenticated with the account's `sessionKey` cookie: 5h, 7d, every
   per-model window (Fable) and the free limit resets. Zero token cost.
 - **Plan tier** — `/api/organizations` (daily, or when the usage reply
-  contradicts it) and `/api/bootstrap` during `keys-sync`.
+  contradicts it) and `/api/bootstrap` during `keys-sync`. An account in
+  several orgs (its personal one and a Team's, say as the Team's admin)
+  stays on the one in use while it is paid, else takes its own
+  subscription, else the paid one.
 - **Fallback** — an account with no working cookie gets 5h/7d from the
   response headers of a minimal Haiku request to `api.anthropic.com`.
 
@@ -415,19 +418,40 @@ such an account **reserved** (`claude-swap add --reserved`, or
   it the shared login, so no switch moves work onto it or off it;
 - `check` still shows its usage, plan and calendar, and lists it on a
   `Reserved:` line below the watcher order;
-- `claude-swap run [n] -- <claude args>` starts a session on it. The token
-  goes in `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code puts before the
-  keychain, so later swaps leave that session where it is. Should the token
-  be refused (401), Claude Code keeps it and reports the error rather than
-  falling back to the stored login. Without a number, `run` takes the
-  reserved account only when there is just one: it never chooses between
-  several by usage, since a Team seat belongs to one person;
+- `claude-swap run [n] -- <claude args>` starts a session on it that later
+  swaps leave where it is. Without a number, `run` takes the reserved
+  account only when there is just one: it never chooses between several by
+  usage, since a Team seat belongs to one person;
 - inside such a session, `claude-swap status` starts with a `This session:`
-  line naming its account. Claude Code keeps `CLAUDE_CODE_OAUTH_TOKEN` from
-  the commands it runs, so `status` reads it from the `claude` process.
+  line naming its account and how it is signed in.
 
-These sessions run on the setup-token, so Claude in Chrome is not available
-in them (`run` drops `--chrome`). A convenient alias:
+How `run` signs the session in depends on the account:
+
+- **With a full login** (`claude-swap auth <n>`, see Claude in Chrome), the
+  session gets a Claude Code config directory of the account's own,
+  `~/.claude-swap/run/<email>`. Its credential is that directory's keychain
+  item, which Claude Code refreshes in place for all the account's
+  sessions, so **Claude in Chrome works** there (with the extension signed
+  in to the account in some Chrome profile) and the login keeps itself
+  fresh. Everything else is `~/.claude` itself, linked: transcripts,
+  memory, settings, `CLAUDE.md`, plugins, skills and the session list, so
+  `--resume` finds the same sessions and a settings change lands in
+  `~/.claude/settings.json`. Kept apart are what belongs to the account
+  (the keychain item, the org's policies and model caches, Claude Code's
+  own config `.claude.json`, its backups and its background daemon); at
+  each start `run` copies into that `.claude.json` your preferences, your
+  MCP servers and what each project allows from `~/.claude.json`. The
+  watcher and `status` save the login its sessions refresh back to the
+  account, and never write that item. A fresh `auth` replaces it at the
+  next start.
+- **Without one**, the setup-token goes in `CLAUDE_CODE_OAUTH_TOKEN`, which
+  Claude Code puts before the keychain. Should it be refused (401), Claude
+  Code keeps it and reports the error rather than falling back to the
+  stored login. Claude in Chrome is not available on it (`run` drops
+  `--chrome`).
+
+Sessions already running keep the way they started; `--resume` one to move
+it. A convenient alias:
 
 ```bash
 alias clt="claude-swap run 11 -- --dangerously-skip-permissions"
@@ -474,6 +498,7 @@ Everything lives locally under `~/.claude/`:
 | `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe and decision, log |
 | `~/Library/LaunchAgents/com.claude-swap.watch.plist` | The watcher's LaunchAgent (macOS, while it runs) |
 | Keychain, service `claude-swap` | Each account's full login for Claude in Chrome (refresh token included), one entry per email. The store only keeps fingerprints and expiry dates of it |
+| `~/.claude-swap/run/<email>/` | A reserved account's own Claude Code config for `run` on its full login: links into `~/.claude`, plus its `.claude.json`, policies and caches. Its credential is the keychain item `Claude Code-credentials-<hash of the path>` |
 | `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 
 Tokens are only ever sent to `api.anthropic.com` (and refresh tokens to

@@ -20,8 +20,14 @@
 
 set -e
 
-VERSION="1.13.1"
+VERSION="1.14.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
+# A session of `claude-swap run` on a full login has its account's own
+# CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
+# always works on the shared login.
+case "${CLAUDE_CONFIG_DIR:-}" in
+  "${CLAUDE_SWAP_RUN:-$HOME/.claude-swap/run}"/*) unset CLAUDE_CONFIG_DIR ;;
+esac
 # Claude Code's files, where it looks for them (CLAUDE_CONFIG_DIR moves both)
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
@@ -556,6 +562,33 @@ def by_identity(accounts, uuid=None, email=None):
     return None
 
 
+# ---------- claude.ai organizations ----------
+
+def free_tier(tier):
+    t = (tier or "").lower()
+    return "free" in t or t in ("", "default_claude_ai")
+
+def pick_org(orgs, current=None):
+    """The claude.ai org an account's plan and usage are read from.
+
+    An account can belong to several: the personal one it signed up with,
+    free or with its own subscription, and a Team's (an admin of the Team
+    too). The pick must not hang on the order claude.ai lists them in: the
+    org already in use while it is still paid, else the account's own
+    subscription (Max, Pro), else a paid one (a Team seat), else the first
+    chat org.
+    """
+    chat = [o for o in orgs or [] if "chat" in (o.get("capabilities") or [])]
+    paid = [o for o in chat if not free_tier(o.get("rate_limit_tier"))]
+    for o in paid:
+        if current and o.get("uuid") == current:
+            return o
+    for o in paid:
+        if {"claude_max", "claude_pro"} & set(o.get("capabilities") or []):
+            return o
+    return (paid or chat or list(orgs or []) or [None])[0]
+
+
 # ---------- the outside world ----------
 
 class Http:
@@ -690,11 +723,13 @@ def disk_account(path=None):
     except Exception:
         return None
 
-def set_account(account, path=None):
-    """Write Claude Code's oauthAccount, or drop it with None, under the lock
-    Claude Code takes on that file (a `<file>.lock` directory)."""
-    path = os.path.realpath(path or cc_json())
-    if not os.path.exists(path):
+def edit_config(path, fn, create=False):
+    """Change a JSON config of Claude Code's under the lock it takes on it (a
+    `<file>.lock` directory), writing it whole and atomically. fn gets the
+    contents and returns the new ones, or None to leave the file as it is.
+    create: start from {} when there is no file yet. -> bool"""
+    path = os.path.realpath(path)
+    if not create and not os.path.exists(path):
         return False
     lock, held = path + ".lock", False
     for _ in range(40):
@@ -713,19 +748,21 @@ def set_account(account, path=None):
         except OSError:
             break
     try:
-        with open(path) as f:
-            d = json.load(f)
-        if d.get("oauthAccount") == account:
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            if not create:
+                return False
+            d, mode = {}, 0o600
+        new = fn(d)
+        if new is None:
             return True
-        if account is None:
-            d.pop("oauthAccount", None)
-        else:
-            d["oauthAccount"] = account
         tmp = f"{path}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                     os.stat(path).st_mode & 0o777)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as f:
-            json.dump(d, f, indent=2)
+            json.dump(new, f, indent=2)
         os.replace(tmp, path)
         return True
     except Exception:
@@ -736,6 +773,19 @@ def set_account(account, path=None):
                 os.rmdir(lock)
             except OSError:
                 pass
+
+def set_account(account, path=None):
+    """Write Claude Code's oauthAccount, or drop it with None."""
+    def put(d):
+        if d.get("oauthAccount") == account:
+            return None
+        d = dict(d)
+        if account is None:
+            d.pop("oauthAccount", None)
+        else:
+            d["oauthAccount"] = account
+        return d
+    return edit_config(path or cc_json(), put)
 
 def load_store(path):
     with open(path) as f:
@@ -855,13 +905,9 @@ def sync(store, secrets, live, http, now):
     note_login(acc, o, now, account or m.get("account"))
     return n, "saved", sure
 
-def install(store, n, secrets, live, http, now):
-    """Make account n Claude Code's credential: its full login if it holds a
-    usable one (refreshed first when about to expire), else its setup-token.
-
-    -> (mode, note): mode 'oauth', 'setup' or 'failed' (Claude Code's
-    credential could not be written; nothing changed).
-    """
+def vault_login(store, n, secrets, http, now):
+    """Account n's saved full login, ready to install: refreshed first when
+    about to expire. -> (login or None, note)"""
     acc = store["accounts"][n - 1]
     o, note = None, None
     if usable(acc, now):
@@ -881,6 +927,17 @@ def install(store, n, secrets, live, http, now):
                     note_login(acc, r, now)
                 o = r
             # no answer: install it as it is, Claude Code refreshes it later
+    return o, note
+
+def install(store, n, secrets, live, http, now):
+    """Make account n Claude Code's credential: its full login if it holds a
+    usable one (refreshed first when about to expire), else its setup-token.
+
+    -> (mode, note): mode 'oauth', 'setup' or 'failed' (Claude Code's
+    credential could not be written; nothing changed).
+    """
+    acc = store["accounts"][n - 1]
+    o, note = vault_login(store, n, secrets, http, now)
     if o:
         if live.write(o):
             live.backup(setup_login(acc))
@@ -919,9 +976,11 @@ def tick(store_path, secrets, live, http, now=None):
     store = load_store(store_path)
     before = json.dumps(store, sort_keys=True)
     accounts, active = store.get("accounts", []), store.get("active", 0)
+    ev = run_sync(store, secrets, now)
     if not 1 <= active <= len(accounts):
-        return []
-    ev = []
+        if json.dumps(store, sort_keys=True) != before:
+            commit(store_path, store)
+        return ev
     n_live, what, sure = sync(store, secrets, live, http, now)
     if what == "saved":
         ev.append(("log", f"saved #{n_live}'s refreshed login"))
@@ -1076,6 +1135,230 @@ def restore_native_hosts(tmpdir):
                     json.dump(m, f, indent=2)
         except Exception:
             continue
+
+
+# ---------- a reserved account's own sessions (claude-swap run) ----------
+# A reserved account is never the shared login, so its sessions used to run
+# on its setup-token (CLAUDE_CODE_OAUTH_TOKEN), which Claude in Chrome turns
+# away. Once it holds a full login they get a Claude Code config directory of
+# their own instead: their credential is that directory's keychain item,
+# which Claude Code refreshes in place for all the account's sessions, and
+# nearly everything else is ~/.claude itself, linked, so transcripts, memory,
+# settings, plugins and claude-snapshot work as in any other session.
+#
+# Measured on Claude Code 2.1.288 (6 Nov 2026): transcripts, sessions/<pid>.json
+# and the prompt history are written through those links, and a settings
+# change made in such a session lands in ~/.claude/settings.json. The Chrome
+# bridge takes the room of the account the token in use belongs to.
+
+RUN_BASE = os.environ.get("CLAUDE_SWAP_RUN") or os.path.expanduser("~/.claude-swap/run")
+# Each account's own: Claude Code's backups of its config (it restores them),
+# its caches of the org's models and policies, its logs, and its background
+# daemon and jobs, which sign in with the directory's login. Files are shared
+# only when named in RUN_FILES: Claude Code keeps account caches next to them,
+# and other tools find their files in ~/.claude by full path.
+RUN_OWN = ("backups", "cache", "daemon", "debug", "jobs", "statsig", "telemetry",
+           "claude-swap-auth")
+RUN_FILES = ("settings.json", "settings.local.json", "CLAUDE.md", "history.jsonl",
+             "keybindings.json")
+# Claude Code's cleanup deletes some of its directories when they are empty
+# (plans, todos...), which would leave a link to nothing: an empty directory
+# is linked only if it is one of these, which it keeps. Until then a session
+# makes its own, and what it holds moves into ~/.claude once that has one.
+RUN_KEEP = ("projects", "sessions", "skills", "agents", "commands", "hooks",
+            "output-styles", "plugins", "ide", "chrome")
+# copied from ~/.claude.json at each start: preferences, the user's MCP servers
+# and what each project allows, nothing about the account
+RUN_CONFIG = ("mcpServers", "hasCompletedOnboarding", "lastOnboardingVersion",
+              "lastReleaseNotesSeen", "installMethod", "autoUpdates",
+              "autoUpdatesProtectedForNative", "verbose", "theme", "editorMode",
+              "preferredNotifChannel", "hasIdeOnboardingBeenShown",
+              "shiftEnterKeyBindingInstalled", "optionAsMetaKeyInstalled",
+              "hasAcknowledgedCostThreshold", "hasCompletedClaudeInChromeOnboarding",
+              "claudeInChromeDefaultEnabled", "cachedChromeExtensionInstalled",
+              "githubRepoPaths", "deepLinkTerminal", "copyFullResponse",
+              "diffSidebarOpen", "showSpinnerTree")
+RUN_PROJECT = ("allowedTools", "mcpServers", "enabledMcpServers", "disabledMcpServers",
+               "enabledMcpjsonServers", "disabledMcpjsonServers", "mcpContextUris",
+               "ignorePatterns")
+# a yes given in either place holds in both
+RUN_PROJECT_YES = ("hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved",
+                   "hasClaudeMdExternalIncludesWarningShown")
+CHAIN_SLACK = 3600 * 1000  # ms; the refresh tokens of one authorization die together
+
+def run_dir(acc, base=None):
+    """Where an account's own sessions keep their config, named by its email."""
+    email = (acc.get("email") or "").strip().lower()
+    if not email or "/" in email or email.startswith("."):
+        return None
+    return os.path.realpath(os.path.join(base or RUN_BASE, email))
+
+def run_service(d):
+    """Claude Code's keychain item for config dir d (passed as its realpath)."""
+    return "Claude Code-credentials-" + config_hash(d)
+
+def run_account(config_dir, accounts, base=None):
+    """The account whose own sessions run on config_dir, or None."""
+    if not config_dir:
+        return None
+    d = os.path.realpath(config_dir)
+    if os.path.dirname(d) != os.path.realpath(base or RUN_BASE):
+        return None
+    return by_identity(accounts, None, os.path.basename(d))
+
+def same_chain(o, m):
+    """Whether login o comes from the authorization the store records (m):
+    a refresh changes the tokens, not when the refresh token dies."""
+    rt, mine = o.get("refreshTokenExpiresAt"), m.get("rt_expires")
+    return (fp(o.get("refreshToken")) == m.get("fp")
+            or bool(rt and mine and abs(rt - mine) < CHAIN_SLACK))
+
+def alive(o, now):
+    rt = (o or {}).get("refreshTokenExpiresAt")
+    return is_full(o) and (not rt or rt / 1000 > now)
+
+def merge_into(src, dst):
+    """Move into directory dst what src holds and dst lacks; -> whether src
+    was emptied (and removed)."""
+    for e in os.listdir(src):
+        a, b = os.path.join(src, e), os.path.join(dst, e)
+        if not os.path.lexists(b):
+            os.rename(a, b)
+        elif os.path.isdir(a) and not os.path.islink(a) and os.path.isdir(b):
+            merge_into(a, b)
+    try:
+        os.rmdir(src)
+        return True
+    except OSError:
+        return False
+
+def link_config(d, home):
+    """Have config dir d share ~/.claude (home): a link for each directory but
+    an account's own ones, and for each file in RUN_FILES.
+    -> the names left alone (a session's own, clashing with home's)."""
+    home = os.path.realpath(home)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    for name in ("projects", "sessions"):
+        try:
+            os.makedirs(os.path.join(home, name), exist_ok=True)
+        except OSError:
+            pass
+    want = {}
+    for name in os.listdir(home):
+        src = os.path.join(home, name)
+        if name.startswith(".") or name in RUN_OWN:
+            continue  # .credentials.json above all
+        if os.path.isdir(src):
+            try:
+                if name in RUN_KEEP or os.listdir(src):
+                    want[name] = src
+            except OSError:
+                pass
+        elif name in RUN_FILES and os.path.isfile(src):
+            want[name] = src
+    kept = []
+    for name, src in sorted(want.items()):
+        dst = os.path.join(d, name)
+        if os.path.islink(dst):
+            if os.readlink(dst) == src:
+                continue
+            os.unlink(dst)
+        elif os.path.isdir(dst) and os.path.isdir(src):
+            if not merge_into(dst, src):
+                kept.append(name)
+                continue
+        elif os.path.lexists(dst):
+            kept.append(name)
+            continue
+        os.symlink(src, dst)
+    for name in os.listdir(d):  # links to what home no longer has
+        p = os.path.join(d, name)
+        if (name not in want and os.path.islink(p)
+                and os.readlink(p).startswith(home + os.sep)):
+            os.unlink(p)
+    return kept
+
+def run_config(d, home_json, account):
+    """Config dir d's .claude.json: its account's oauthAccount, and from
+    ~/.claude.json (home_json) the preferences and what each project allows."""
+    try:
+        with open(home_json) as f:
+            g = json.load(f)
+    except Exception:
+        g = {}
+
+    def merge(c):
+        n = dict(c)
+        for k in RUN_CONFIG:
+            if k in g:
+                n[k] = g[k]
+        projects = dict(n.get("projects") or {})
+        for path, gp in (g.get("projects") or {}).items():
+            if not isinstance(gp, dict):
+                continue
+            share = {k: gp[k] for k in RUN_PROJECT if k in gp}
+            share.update({k: True for k in RUN_PROJECT_YES if gp.get(k)})
+            if share:
+                projects[path] = {**(projects.get(path) or {}), **share}
+        n["projects"] = projects
+        if account:
+            n["oauthAccount"] = account
+        return None if n == c else n
+    return edit_config(os.path.join(d, ".claude.json"), merge, create=True)
+
+def run_prepare(store, n, secrets, http, now, base=None, home=None, home_json=None):
+    """Get account n's own config directory ready for a session on its full
+    login. -> (dir, note): with dir None there is no full login to run on and
+    note says why (or is None: it never had one)."""
+    acc = store["accounts"][n - 1]
+    d = run_dir(acc, base)
+    if d is None:
+        return None, "it has no email in the store"
+    svc, m = run_service(d), acc.get("oauth") or {}
+    cur = parse(secrets.read(svc))
+    note = None
+    refused = cur and m.get("dead") and fp(cur.get("refreshToken")) == m.get("fp")
+    if alive(cur, now) and m.get("fp") and same_chain(cur, m) and not refused:
+        # what its sessions refreshed there is the live copy: the vault's
+        # refresh token is spent, so it is the one kept
+        if fp(cur["refreshToken"]) != m["fp"] and secrets.write(VAULT, dump(cur), slot(acc)):
+            note_login(acc, cur, now)
+    else:
+        # none yet, a dead one, or another authorization's (a fresh
+        # `claude-swap auth`, a /login in one of its sessions): the vault's
+        o, note = vault_login(store, n, secrets, http, now)
+        if not o:
+            if not note and m.get("fp"):
+                note = (f"its full login {'was refused' if m.get('dead') else 'expired'}:"
+                        f" claude-swap auth {n}")
+            return None, note
+        if not secrets.write(svc, dump(o)):
+            return None, "could not write its keychain item"
+    link_config(d, home or cc_dir())
+    run_config(d, home_json or cc_json(), (acc.get("oauth") or {}).get("account"))
+    return d, note
+
+def run_sync(store, secrets, now, base=None):
+    """Save to the vault the logins Claude Code refreshed in the reserved
+    accounts' own keychain items, which are read, never written.
+    -> [(kind, msg)]"""
+    ev = []
+    for i, acc in enumerate(store.get("accounts", []), 1):
+        m = acc.get("oauth") or {}
+        if not acc.get("reserved") or not m.get("fp"):
+            continue
+        d = run_dir(acc, base)
+        if not d or not os.path.isdir(d):
+            continue
+        o = parse(secrets.read(run_service(d)))
+        if not alive(o, now) or fp(o["refreshToken"]) == m["fp"] or not same_chain(o, m):
+            continue
+        if secrets.write(VAULT, dump(o), slot(acc)):
+            note_login(acc, o, now)
+            ev.append(("log", f"saved #{i}'s login, refreshed by its own sessions"))
+        else:
+            ev.append(("log", f"could not save #{i}'s login to the vault"))
+    return ev
 PYEOF
 export CLAUDE_SWAP_OAUTH="$OAUTH_PY"
 
@@ -1133,7 +1416,8 @@ cmd_help() {
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's)"
   echo "  claude-swap unreserve <n>  Make it an ordinary account again"
   echo "  claude-swap run [n] [-- <claude args>]"
-  echo "                           Start claude on account N (no N: the only reserved account)"
+  echo "                           Start claude on account N (no N: the only reserved account);"
+  echo "                           with its full login (auth <n>) it has Claude in Chrome"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -1292,11 +1576,14 @@ def match_token(token):
     return None, fp
 
 def session_token():
-    """(pid, token or None) of the Claude Code session this runs in, or None.
+    """(pid, token or None, config dir or None) of the Claude Code session
+    this runs in, or None.
 
     A session started by `claude-swap run` carries its account's token in
-    CLAUDE_CODE_OAUTH_TOKEN, and Claude Code keeps that variable from the
-    commands it runs: so it is read from the claude process itself."""
+    CLAUDE_CODE_OAUTH_TOKEN, or, on a full login, the account's own
+    CLAUDE_CONFIG_DIR. Claude Code keeps the token from the commands it runs
+    (and claude-swap drops that directory), so both are read from the claude
+    process itself."""
     import subprocess
 
     def ps(*args):
@@ -1315,9 +1602,11 @@ def session_token():
                 env = ps("eww", "-o", "command=", "-p", str(pid))
             except (OSError, subprocess.SubprocessError):
                 env = ""
-            tok = next((w.split("=", 1)[1] for w in env.split()
-                        if w.startswith("CLAUDE_CODE_OAUTH_TOKEN=")), None)
-            return pid, tok or None
+
+            def var(name):
+                return next((w.split("=", 1)[1] for w in env.split()
+                             if w.startswith(name + "=")), None) or None
+            return pid, var("CLAUDE_CODE_OAUTH_TOKEN"), var("CLAUDE_CONFIG_DIR")
         pid = int(ppid)
     return None
 
@@ -1330,13 +1619,23 @@ if not accounts:
 
 if is_macos:
     found = session_token()
-    if found and found[1]:
+    k_own = found and oauth.run_account(found[2], accounts)
+    if k_own:
+        a = accounts[k_own - 1]
+        kind = "reserved, " if a.get("reserved") else ""
+        chrome = ("Claude in Chrome ready" if oauth.chrome_ready(a)
+                  else f"no Chrome profile has the extension signed in to {a.get('email')}")
+        print(f"This session: {k_own} ({a.get('label', '?')} / {a.get('email') or '-'})"
+              f" — {kind}claude-swap run on its own full login, {chrome};"
+              " the Active login below does not reach it")
+    elif found and found[1]:
         k, _ = match_token(found[1])
         if k:
             a = accounts[k - 1]
             kind = "reserved, " if a.get("reserved") else ""
             print(f"This session: {k} ({a.get('label', '?')} / {a.get('email') or '-'})"
-                  f" — {kind}claude-swap run; the Active login below does not reach it")
+                  f" — {kind}claude-swap run on its setup-token, no Claude in Chrome;"
+                  " the Active login below does not reach it")
         else:
             print("This session: a token of its own, which is none of claude-swap's")
     elif found:
@@ -1497,11 +1796,8 @@ def fetch_web_usage(acc):
             orgs = get("https://claude.ai/api/organizations")
         except Exception:
             return  # e.g. free accounts return 403 here; don't break the rest
-        # A Team member can also keep the personal free org it signed up
-        # with: the paid one is the account's plan.
-        chat = [o for o in orgs if "chat" in (o.get("capabilities") or [])]
-        o = next((o for o in chat if not is_free(o.get("rate_limit_tier"))),
-                 chat[0] if chat else (orgs[0] if orgs else None))
+        # several orgs (a personal one and a Team's): see oauth.pick_org
+        o = oauth.pick_org(orgs, acc.get("org_id"))
         if not o:
             return
         old, new = acc.get("plan"), o.get("rate_limit_tier") or ""
@@ -2741,15 +3037,9 @@ for base in bases:
                 print(f"  {prof}: sessionKey EXPIRED (anonymous session) — log claude.ai back in on that profile")
                 continue
             time.sleep(1)  # space out the scan so claude.ai does not start 403ing
-            tier = None
-            for m in (boot.get("account") or {}).get("memberships") or []:
-                o = m.get("organization") or {}
-                if "chat" in (o.get("capabilities") or []):
-                    t = o.get("rate_limit_tier") or ""
-                    if tier is None or (tier.lower() in ("", "default_claude_ai")
-                                        and t.lower() not in ("", "default_claude_ai")):
-                        tier = t  # a paid org (Team) beats a personal free one
-            seen[email.lower()] = (sk, prof, tier)
+            orgs = [m.get("organization") or {}
+                    for m in (boot.get("account") or {}).get("memberships") or []]
+            seen[email.lower()] = (sk, prof, orgs)
             profiles.setdefault(email.lower(), []).append(prof)
             uuids[email.lower()] = (boot.get("account") or {}).get("uuid")
             print(f"  {prof}: {email} OK")
@@ -2781,8 +3071,12 @@ for i, acc in enumerate(accounts):
         if updated != n0:
             print(f"  Account {i+1} ({em}): " + ", ".join(notes))
     if em and em in seen:
-        sk, prof, tier = seen[em]
+        sk, prof, orgs = seen[em]
         notes = []
+        # the org check reads it from (oauth.pick_org): a personal one and a
+        # Team's can both be paid
+        o = oauth.pick_org(orgs, acc.get("org_id"))
+        tier = (o.get("rate_limit_tier") or "") if o else None
         if tier is not None and acc.get("plan") != tier:
             notes.append(f"plan {acc.get('plan') or '?'} -> {tier}")
             acc["plan"] = tier
@@ -3030,6 +3324,9 @@ def login(n):
         until = f" until {day(o['refreshTokenExpiresAt'])}" if o.get("refreshTokenExpiresAt") else ""
         print(paint("32", f"  Saved: good{until}.")
               + (" Active account, so installed now: Claude in Chrome ready." if installed else ""))
+        if store["accounts"][k - 1].get("reserved"):
+            print(f"  Reserved: its new sessions (claude-swap run {k}) start on this login, with"
+                  " Claude in Chrome. Open ones keep their setup-token until restarted.")
         acc = oauth.load_store(store_path)["accounts"][k - 1]
         cp = acc.get("chrome_profile")
         if oauth.chrome_ready(acc):
@@ -3056,7 +3353,7 @@ if args[0] == "all":
     now = time.time()
     targets = [i for i, a in enumerate(accounts, 1)
                if a.get("token") and not a.get("disabled") and not is_free(a.get("plan"))
-               and not a.get("reserved")  # never the shared login: no Chrome
+               and not a.get("reserved")  # someone's seat: one by one, auth <n>
                and oauth.login_state(a, now)[0] != "ok"]
     if not targets:
         print("Every paid account already holds a good login.")
@@ -4180,8 +4477,10 @@ PYEOF
 
 cmd_run() {
   # A Claude Code session of its own on one account, whatever the shared
-  # login does: the token goes in CLAUDE_CODE_OAUTH_TOKEN, which Claude Code
-  # puts before the keychain, so no swap and no watch can move the session.
+  # login does, so no swap and no watch can move it. On the account's full
+  # login it gets the account's own CLAUDE_CONFIG_DIR (Claude in Chrome works,
+  # and Claude Code keeps the login fresh there); without one, the setup-token
+  # in CLAUDE_CODE_OAUTH_TOKEN, which Claude Code puts before the keychain.
   # Without a number it takes the reserved account, when there is just one.
   check_store
   command -v claude >/dev/null 2>&1 || { echo "Error: claude (Claude Code) is not in PATH"; exit 1; }
@@ -4189,9 +4488,19 @@ cmd_run() {
   # needs the terminal as its stdin
   local run_py
   read -r -d '' run_py <<'PYEOF' || true
-import json, os, sys, time
+import json, os, subprocess, sys, time, types
 
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 CACHE = os.path.expanduser("~/.claude/claude-swap-usage.json")
+# Claude Code points the browsers' native-messaging manifests into the config
+# dir it runs on: a moment after it starts they point back into ~/.claude
+# (the same script either way, through the link).
+RESTORE = ("import os, time, types\n"
+           "time.sleep(20)\n"
+           "oauth = types.ModuleType('oauth')\n"
+           "exec(os.environ['CLAUDE_SWAP_OAUTH'], oauth.__dict__)\n"
+           "oauth.restore_native_hosts(os.path.realpath(oauth.RUN_BASE))\n")
 
 store_path, args = sys.argv[1], sys.argv[2:]
 head, rest = (args[:args.index("--")], args[args.index("--") + 1:]) \
@@ -4199,7 +4508,9 @@ head, rest = (args[:args.index("--")], args[args.index("--") + 1:]) \
 if len(head) > 1 or (head and not head[0].isdigit()):
     sys.exit("Usage: claude-swap run [n] [-- <claude args>]")
 with open(store_path) as f:
-    accounts = json.load(f).get("accounts", [])
+    store = json.load(f)
+accounts = store.get("accounts", [])
+before = json.dumps(store, sort_keys=True)
 
 # usage from the snapshot check and the watch keep (no request here); a row
 # counts only if it is still the same account (a remove renumbers them)
@@ -4237,6 +4548,17 @@ else:
                  + "): say which one,  claude-swap run <n> -- <claude args>")
     n, acc = pool[0]
 
+# the account's own config dir, on its full login (macOS: its keychain)
+own, note = None, None
+if sys.platform == "darwin":
+    secrets, _, http = oauth.default_io(True)
+    try:
+        own, note = oauth.run_prepare(store, n, secrets, http, time.time())
+    except Exception as e:
+        own, note = None, f"its own config dir could not be set up ({type(e).__name__}: {e})"
+    if json.dumps(store, sort_keys=True) != before:
+        oauth.commit(store_path, store, top=())  # its login only
+
 c = usage(n, acc)
 fig = (f"5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%" if c
        else "no usage figures yet")
@@ -4245,17 +4567,39 @@ if c and age > 600:
     fig += f" ({int(age // 60)} min old)"
 lane = "reserved" if acc.get("reserved") else "NOT reserved: the watch may also use it"
 sys.stderr.write(f"claude-swap run: #{n} {acc.get('label') or '?'} · {acc.get('email') or '-'}"
-                 f" · {fig} · {lane}\n")
-if "--chrome" in rest:
-    # the Claude in Chrome bridge turns setup-tokens away (missing scope)
-    rest = [a for a in rest if a != "--chrome"]
-    sys.stderr.write("claude-swap run: --chrome dropped (Claude in Chrome needs a full"
-                     " login, and these sessions run on the setup-token)\n")
+                 f" · {fig} · {lane} · {'full login' if own else 'setup-token'}\n")
+if own:
+    prof = acc.get("chrome_profile")
+    if oauth.chrome_ready(acc):
+        sys.stderr.write("claude-swap run: Claude in Chrome drives Chrome profile"
+                         f" '{oauth.profile_names().get(prof, prof)}'\n")
+    else:
+        sys.stderr.write("claude-swap run: for Claude in Chrome, sign the extension in to"
+                         f" {acc.get('email')} in a Chrome profile, then claude-swap keys-sync\n")
+else:
+    if note:
+        sys.stderr.write(f"claude-swap run: on the setup-token: {note}\n")
+    if "--chrome" in rest:
+        # the Claude in Chrome bridge turns setup-tokens away (missing scope)
+        rest = [a for a in rest if a != "--chrome"]
+        sys.stderr.write("claude-swap run: --chrome dropped (Claude in Chrome needs a full"
+                         " login: claude-swap auth " + str(n) + ")\n")
 
 env = {k: v for k, v in os.environ.items()
-       if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES")}
-env["CLAUDE_CODE_OAUTH_TOKEN"] = acc["token"]
+       if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES",
+                    "CLAUDE_SWAP_ENGINE", "CLAUDE_SWAP_OAUTH")}
+if own:
+    env["CLAUDE_CONFIG_DIR"] = own
+    # detached, so it outlives this process turning into claude and leaves
+    # no child behind for claude to reap
+    subprocess.run([sys.executable, "-c",
+                    "import subprocess, sys; subprocess.Popen([sys.executable, '-c',"
+                    " sys.argv[1]], start_new_session=True, stdin=subprocess.DEVNULL,"
+                    " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)", RESTORE],
+                   timeout=10)
+else:
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = acc["token"]
 env["CLAUDE_SWAP_PINNED"] = str(n)  # the statusline shows this account
 os.execvpe("claude", ["claude"] + rest, env)
 PYEOF

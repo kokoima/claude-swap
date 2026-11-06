@@ -377,6 +377,226 @@ class Config(Base):
         self.assertEqual(O["parse"](O["dump"](o).encode().hex()), o)
 
 
+class OwnSessions(Base):
+    """`claude-swap run` on a reserved account's full login: a config dir of
+    its own, sharing ~/.claude, whose keychain item Claude Code refreshes."""
+    def setUp(self):
+        super().setUp()
+        self.base = os.path.join(self.dir, "run")
+        self.home = os.path.join(self.dir, "home")
+        for d in ("projects", "skills", "backups", "daemon", "cache"):
+            os.makedirs(os.path.join(self.home, d))
+        for f in ("settings.json", "CLAUDE.md", ".credentials.json", "policy-limits.json",
+                  "claude-swap.json"):
+            with open(os.path.join(self.home, f), "w") as fh:
+                fh.write("{}")
+        self.home_json = os.path.join(self.dir, "home.claude.json")
+        with open(self.home_json, "w") as f:
+            json.dump({"hasCompletedOnboarding": True, "mcpServers": {"m": {"command": "x"}},
+                       "oauthAccount": ident(1), "s1mAccessCache": {"org-1": True},
+                       "chromeExtension": {"pairedDeviceId": "dev-1"},
+                       "projects": {"/w/client": {"hasTrustDialogAccepted": True,
+                                                 "allowedTools": ["Bash(ls)"],
+                                                 "lastSessionFirstPrompt": "personal",
+                                                 "lastCost": 9},
+                                    "/w/stats-only": {"lastCost": 1}}}, f)
+        self.store["accounts"][2]["reserved"] = True
+        self.acc = self.store["accounts"][2]
+        self.d = O["run_dir"](self.acc, self.base)
+        self.svc = O["run_service"](self.d)
+
+    def prepare(self, http=None):
+        return O["run_prepare"](self.store, 3, self.secrets, http or FakeHttp(), NOW,
+                                self.base, self.home, self.home_json)
+
+    def own(self):
+        return O["parse"](self.secrets.read(self.svc))
+
+    def config(self):
+        with open(os.path.join(self.d, ".claude.json")) as f:
+            return json.load(f)
+
+    def test_named_by_email_and_recognised_from_its_path(self):
+        self.assertEqual(os.path.basename(self.d), "a3@x.io")
+        self.assertEqual(O["run_account"](self.d, self.store["accounts"], self.base), 3)
+        self.assertIsNone(O["run_account"](self.cc, self.store["accounts"], self.base))
+        self.assertIsNone(O["run_dir"]({"email": ""}, self.base))
+
+    def test_without_a_full_login_nothing_is_made(self):
+        self.assertEqual(self.prepare(), (None, None))
+        self.assertFalse(os.path.exists(self.d))
+        self.assertIsNone(self.own())
+
+    def test_the_saved_login_goes_into_its_own_keychain_item(self):
+        self.give(3, login("v"))
+        d, note = self.prepare()
+        self.assertEqual(d, self.d)
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-v")
+        self.assertIsNone(self.live_now())  # the shared login is not touched
+        self.assertEqual(self.config()["oauthAccount"], ident(3))
+
+    def test_it_shares_home_but_what_is_an_accounts_own(self):
+        self.give(3, login("v"))
+        self.prepare()
+        for name in ("projects", "skills", "settings.json", "CLAUDE.md"):
+            p = os.path.join(self.d, name)
+            self.assertTrue(os.path.islink(p), name)
+            self.assertEqual(os.path.realpath(p), os.path.realpath(os.path.join(self.home, name)))
+        for name in ("backups", "daemon", "cache", ".credentials.json", "policy-limits.json",
+                     "claude-swap.json"):
+            self.assertFalse(os.path.lexists(os.path.join(self.d, name)), name)
+        # the directories a session writes in exist in home, so it never makes its own
+        self.assertTrue(os.path.isdir(os.path.join(self.home, "sessions")))
+        self.assertTrue(os.path.islink(os.path.join(self.d, "sessions")))
+
+    def touch(self, base, rel):
+        p = os.path.join(base, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write("x")
+
+    def test_an_empty_directory_is_linked_only_if_claude_code_keeps_it(self):
+        # its cleanup deletes some when empty (plans...), which would leave a
+        # link to nothing; ide it keeps
+        os.makedirs(os.path.join(self.home, "plans"))
+        os.makedirs(os.path.join(self.home, "ide"))
+        self.give(3, login("v"))
+        self.prepare()
+        self.assertFalse(os.path.lexists(os.path.join(self.d, "plans")))
+        self.assertTrue(os.path.islink(os.path.join(self.d, "ide")))
+
+    def test_linking_again_mends_links_and_merges_a_sessions_own_directory(self):
+        self.give(3, login("v"))
+        self.touch(self.home, "old/x")
+        self.prepare()
+        self.assertTrue(os.path.islink(os.path.join(self.d, "old")))
+        shutil.rmtree(os.path.join(self.home, "old"))      # gone from home
+        self.touch(self.d, "plans/mine.md")                # a session made its own...
+        self.touch(self.home, "plans/theirs.md")           # ...before home had one
+        self.assertEqual(O["link_config"](self.d, self.home), [])
+        self.assertFalse(os.path.lexists(os.path.join(self.d, "old")))
+        self.assertTrue(os.path.islink(os.path.join(self.d, "plans")))
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "plans", "mine.md")))
+        # the same name on both sides: kept apart, and said so
+        self.touch(self.d, "todos/a.json")
+        self.touch(self.home, "todos/a.json")
+        self.assertEqual(O["link_config"](self.d, self.home), ["todos"])
+        self.assertEqual(O["link_config"](self.d, self.home), ["todos"])
+
+    def test_its_config_takes_preferences_and_project_rules_not_the_account(self):
+        self.give(3, login("v"))
+        os.makedirs(self.d)
+        with open(os.path.join(self.d, ".claude.json"), "w") as f:
+            json.dump({"numStartups": 3, "projects": {"/w/client": {
+                "lastCost": 2, "hasTrustDialogAccepted": False,
+                "allowedTools": ["old"]}, "/w/own": {"hasTrustDialogAccepted": True}}}, f)
+        self.prepare()
+        c = self.config()
+        self.assertEqual(c["oauthAccount"], ident(3))
+        self.assertTrue(c["hasCompletedOnboarding"])
+        self.assertEqual(c["mcpServers"], {"m": {"command": "x"}})
+        self.assertEqual(c["numStartups"], 3)
+        for k in ("s1mAccessCache", "chromeExtension"):
+            self.assertNotIn(k, c)
+        client = c["projects"]["/w/client"]
+        self.assertEqual(client["allowedTools"], ["Bash(ls)"])
+        self.assertTrue(client["hasTrustDialogAccepted"])
+        self.assertEqual(client["lastCost"], 2)  # its own figures stay
+        self.assertNotIn("lastSessionFirstPrompt", client)
+        self.assertNotIn("/w/stats-only", c["projects"])
+        self.assertTrue(c["projects"]["/w/own"]["hasTrustDialogAccepted"])
+
+    def test_a_login_its_sessions_refreshed_is_kept_and_saved_back(self):
+        self.give(3, login("v"))
+        self.prepare()
+        refreshed = login("r", at_left=8 * H)  # same authorization, new tokens
+        refreshed["refreshTokenExpiresAt"] = login("v")["refreshTokenExpiresAt"]
+        self.secrets.write(self.svc, O["dump"](refreshed))
+        self.prepare()
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-r")
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
+        self.assertEqual(self.acc["oauth"]["fp"], O["fp"]("sk-ant-ort01-r"))
+
+    def test_a_fresh_authorization_replaces_the_old_one(self):
+        self.give(3, login("v", rt_left=2 * 86400))
+        self.prepare()
+        self.give(3, login("new", rt_left=28 * 86400))  # claude-swap auth 3
+        self.prepare()
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-new")
+
+    def test_another_accounts_login_there_is_replaced(self):
+        self.give(3, login("v"))
+        self.secrets.write(self.svc, O["dump"](login("stranger", rt_left=9 * 86400)))
+        self.prepare()
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-v")
+
+    def test_a_refused_login_falls_back_to_the_setup_token(self):
+        self.give(3, login("v"))
+        self.prepare()
+        self.acc["oauth"]["dead"] = NOW
+        d, note = self.prepare()
+        self.assertIsNone(d)
+        self.assertIn("refused", note)
+        self.assertIn("auth 3", note)
+
+    def test_a_saved_login_about_to_expire_is_refreshed_before_it_goes_in(self):
+        self.give(3, login("v", at_left=60))
+        http = FakeHttp(token=(200, {"access_token": "sk-ant-oat01-n",
+                                     "refresh_token": "sk-ant-ort01-n", "expires_in": 28800}))
+        self.prepare(http)
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-n")
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-n")
+
+    def test_the_watch_saves_what_its_sessions_refreshed_and_never_writes_there(self):
+        self.give(3, login("v"))
+        self.prepare()
+        refreshed = login("r", at_left=8 * H)
+        refreshed["refreshTokenExpiresAt"] = login("v")["refreshTokenExpiresAt"]
+        self.secrets.write(self.svc, O["dump"](refreshed))
+        O["save_store"](self.store_path, self.store)
+        written = []
+        real = self.secrets.write
+        self.secrets.write = lambda s, t, a=None: (written.append(s), real(s, t, a))[1]
+        with mock.patch.dict(O, {"RUN_BASE": self.base}):
+            ev = O["tick"](self.store_path, self.secrets, self.live, FakeHttp(), NOW)
+        self.assertIn(("log", "saved #3's login, refreshed by its own sessions"), ev)
+        self.assertNotIn(self.svc, written)
+        acc = O["load_store"](self.store_path)["accounts"][2]
+        self.assertEqual(acc["oauth"]["fp"], O["fp"]("sk-ant-ort01-r"))
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
+
+
+class Orgs(unittest.TestCase):
+    """Which claude.ai org an account's plan and usage come from."""
+    MAX = {"uuid": "max", "rate_limit_tier": "default_claude_max_20x",
+           "capabilities": ["claude_max", "chat"]}
+    TEAM = {"uuid": "team", "rate_limit_tier": "default_raven",
+            "capabilities": ["chat", "raven"]}
+    FREE = {"uuid": "free", "rate_limit_tier": "default_claude_ai", "capabilities": ["chat"]}
+
+    def pick(self, orgs, current=None):
+        return (O["pick_org"](orgs, current) or {}).get("uuid")
+
+    def test_an_admin_of_a_team_keeps_its_own_max_whatever_the_order(self):
+        # a Team's admin: its own Max, and the Team it runs
+        self.assertEqual(self.pick([self.TEAM, self.MAX]), "max")
+        self.assertEqual(self.pick([self.MAX, self.TEAM]), "max")
+        self.assertEqual(self.pick([self.TEAM, self.MAX], "max"), "max")
+
+    def test_a_team_seat_beats_the_personal_free_org(self):
+        self.assertEqual(self.pick([self.FREE, self.TEAM]), "team")
+        self.assertEqual(self.pick([self.FREE, self.TEAM], "free"), "team")
+
+    def test_the_org_in_use_stays_while_it_is_paid(self):
+        self.assertEqual(self.pick([self.MAX, self.TEAM], "team"), "team")
+        ended = dict(self.MAX, rate_limit_tier="default_claude_ai")
+        self.assertEqual(self.pick([ended, self.TEAM], "max"), "team")
+
+    def test_without_a_paid_org_the_first_chat_one(self):
+        self.assertEqual(self.pick([{"uuid": "api", "capabilities": ["api"]}, self.FREE]), "free")
+        self.assertIsNone(O["pick_org"]([], None))
+
+
 class ChromeProfiles(unittest.TestCase):
     """Which Chrome profile is whose: the extension's own storage says."""
     U1 = "11111111-1111-4111-8111-111111111111"
