@@ -454,10 +454,13 @@ Sessions already running keep the way they started; `--resume` one to move
 it. A convenient alias:
 
 ```bash
-alias clt="claude-swap run 11 -- --dangerously-skip-permissions"
+alias clt="claude-swap run 11 -- --dangerously-skip-permissions --chrome"
 clt                      # new session on account 11
 clt --resume <uuid>      # resume one there
 ```
+
+As with any session, Claude in Chrome needs `--chrome`; on the setup-token
+`run` drops it and says so.
 
 Generate the setup-token in a throwaway config so the login in use is not
 touched: `CLAUDE_CONFIG_DIR=$(mktemp -d) claude setup-token`.
