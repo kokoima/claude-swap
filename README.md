@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.16.0
+claude-swap v1.16.1
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -332,7 +332,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
 | `claude-swap reserve <n>` / `unreserve <n>` | Keep account N for sessions of its own: auto and the watch never use it |
 | `claude-swap watch reserved [n ...\|off]` | Reserved accounts the watch may move the reserved sessions among when theirs reaches its limit |
-| `claude-swap run [n] [-- <claude args>]` | Start `claude` on reserved account N, whatever the shared login is (no N: the reserved account the reserved sessions are on) |
+| `claude-swap run [n] [-- <claude args>]` | Start `claude` on the reserved account the reserved sessions are on, whatever the shared login is (N: only while they are on none) |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
@@ -463,9 +463,11 @@ config `.claude.json`, its backups and its background daemon); at each
 start `run` copies into that `.claude.json` your preferences, your MCP
 servers and what each project allows from `~/.claude.json`.
 
-`run <n>` starts on reserved account N, moving the reserved sessions there
-too if they were on another one; without a number it starts on the account
-they are on (or the only reserved account). On another account, or off
+A new reserved session always starts on the account the others are on:
+`run <n>` names an account only while they are on none (or there are
+several reserved accounts and no session has started yet), and never moves
+them; that is `claude-swap <n>`'s job, so a stale alias in an open shell
+cannot send them all to a seat at its limit. On another account, or off
 macOS, `run` passes the setup-token in `CLAUDE_CODE_OAUTH_TOKEN`, which
 Claude Code puts before the keychain: that session stays on it, and a move
 does not reach it until it is restarted (`claude-swap <n>` lists such

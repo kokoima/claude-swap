@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.16.0"
+VERSION="1.16.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -1597,8 +1597,8 @@ cmd_help() {
   echo "                           Reserved accounts the watch may move the reserved sessions"
   echo "                           among when theirs reaches its limit (off: never)"
   echo "  claude-swap run [n] [-- <claude args>]"
-  echo "                           Start claude on reserved account N (no N: the one the reserved"
-  echo "                           sessions are on); claude-swap <n> moves them all, open ones too"
+  echo "                           Start claude on the reserved account the reserved sessions are"
+  echo "                           on (N: only while they are on none); claude-swap <n> moves them"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -4840,7 +4840,8 @@ cmd_run() {
   # does: no swap of it and no watch moves it. The reserved sessions share a
   # config dir, the lane, which `claude-swap <n>` moves from one reserved
   # account to another, open sessions included (on its full login Claude in
-  # Chrome works). Without a number it starts on the account the lane is on.
+  # Chrome works). A new one starts on the account the lane is on; a number
+  # only picks one while the lane is on none.
   # Another account's session gets its setup-token in CLAUDE_CODE_OAUTH_TOKEN,
   # which Claude Code puts before the keychain, and stays on it.
   check_store
@@ -4900,6 +4901,17 @@ if head:
     acc = accounts[n - 1]
     if acc.get("disabled") or not acc.get("token"):
         sys.exit(f"Error: account {n} is disabled or has no token")
+    ln = oauth.lane_of(store) if macos and acc.get("reserved") else None
+    if ln and ln != n:
+        # a number never moves the others (an old alias in an open shell
+        # did, onto a seat at its limit): only claude-swap <n> does
+        c = usage(ln, accounts[ln - 1])
+        sys.stderr.write(f"claude-swap run: the reserved sessions are on #{ln}"
+                         + (f" (5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%)"
+                            if c else "")
+                         + f": this one joins them. To move them all to #{n}:"
+                         f"  claude-swap {n}\n")
+        n, acc = ln, accounts[ln - 1]
 else:
     # the account the reserved sessions are on; else the only reserved one
     pool = [(i, a) for i, a in enumerate(accounts, 1)
