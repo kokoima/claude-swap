@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.15.0
+claude-swap v1.16.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -331,6 +331,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap chrome [n\|all]` | Open the Chrome profile of account N (default: the active one); `chrome <n> "Profile 3"` sets it |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
 | `claude-swap reserve <n>` / `unreserve <n>` | Keep account N for sessions of its own: auto and the watch never use it |
+| `claude-swap watch reserved [n ...\|off]` | Reserved accounts the watch may move the reserved sessions among when theirs reaches its limit |
 | `claude-swap run [n] [-- <claude args>]` | Start `claude` on reserved account N, whatever the shared login is (no N: the reserved account the reserved sessions are on) |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
@@ -425,6 +426,12 @@ such an account **reserved** (`claude-swap add --reserved`, or
   sessions to it, the open ones included, within 30 s and without
   restarting them: when one Team seat reaches its limit, its sessions carry
   on on another. The shared login stays where it was;
+- `claude-swap watch reserved <n> <m> ...` lets the watch do those moves:
+  when the account the reserved sessions are on reaches its limit, they go
+  to another of these, by the same order and rules as the shared login (a
+  move by hand is kept until that account reaches its limit). Keep apart
+  the seats of one Team that belong to one person: alternating them to
+  stretch the limits is not what they are for. `off` stops it;
 - inside such a session, `claude-swap status` starts with a `This session:`
   line naming the account it is on and how it is signed in, and the status
   line shows that account with a lock.

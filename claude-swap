@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.15.0"
+VERSION="1.16.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -255,6 +255,17 @@ def decide(rows, active, now, state, auto_reset=False):
         return out("switch", best["n"], ahead)
 
     return out("stay", active, f"#{active} goes first")
+
+
+def lane_decide(rows, lane, pool, now, state):
+    """The reserved sessions (claude-swap run), moved like the shared login
+    but only among pool, the reserved accounts the watch may put them on.
+    None when they are not the watch's to move: no pool, or on an account
+    outside it (a pick by hand there is left alone)."""
+    if len(pool) < 2 or lane not in pool:
+        return None
+    sub = [dict(r, reserved=False) for r in rows if r["n"] in pool]
+    return decide(sub, lane, now, state, auto_reset=False)
 
 
 # --- Plan timeline: what check draws, and when the watch re-reads it ---
@@ -1582,6 +1593,9 @@ cmd_help() {
   echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's)"
   echo "  claude-swap unreserve <n>  Make it an ordinary account again"
+  echo "  claude-swap watch reserved [n ...|off]"
+  echo "                           Reserved accounts the watch may move the reserved sessions"
+  echo "                           among when theirs reaches its limit (off: never)"
   echo "  claude-swap run [n] [-- <claude args>]"
   echo "                           Start claude on reserved account N (no N: the one the reserved"
   echo "                           sessions are on); claude-swap <n> moves them all, open ones too"
@@ -2633,11 +2647,16 @@ print("  " + paint(BOLD, "Now: " + head) + paint(GREY, f" — {d['reason']}"))
 kept = [r for r in results if r["reserved"] and not r["disabled"]]
 if kept:
     ln = (store.get("lane") or {}).get("n")
+    want = [e.lower() for e in store.get("lane_rotate") or []]
+    rot = [i for i, a in enumerate(store.get("accounts", []), 1)
+           if (a.get("email") or "").lower() in want and a.get("reserved")]
     print("  " + paint(CYAN, "Reserved: ")
           + ", ".join((paint(BOLD, f"#{r['n']} {short(r['label'])} ◂ sessions")
                        if r["n"] == ln else f"#{r['n']} {short(r['label'])}") for r in kept)
           + paint(GREY, " — never the shared login; their sessions: claude-swap run"
-                        " -- <claude args>, moved with claude-swap <n>"))
+                        " -- <claude args>, moved with claude-swap <n>"
+                        + (f"; the watch moves them among {', '.join(f'#{i}' for i in rot)}"
+                           if len(rot) > 1 else "")))
 PYEOF
 }
 
@@ -4084,6 +4103,8 @@ bits.append(f"last probe {s.get('last_time', '?')} ({s.get('last', 'no data')})"
 print("  " + " · ".join(bits))
 if s.get("decision"):
     print(f"  {s['decision']}")
+if s.get("lane_decision"):
+    print(f"  {s['lane_decision']}")
 PYEOF
   fi
   if [ -f "$WATCH_LOG" ]; then
@@ -4091,6 +4112,59 @@ PYEOF
     echo "Last log lines:"
     tail -5 "$WATCH_LOG" | sed 's/^/  /'
   fi
+}
+
+cmd_watch_reserved() {
+  # Which reserved accounts the watch may move the reserved sessions among
+  # when the one they are on reaches its limit (none: it leaves them alone).
+  check_store
+  python3 - "$STORE" "$@" <<'PYEOF'
+import json, os, sys
+store_path, args = sys.argv[1], sys.argv[2:]
+with open(store_path) as f:
+    d = json.load(f)
+accounts = d.get("accounts", [])
+
+def name(i):
+    a = accounts[i - 1]
+    return f"#{i} {a.get('label') or a.get('email') or '?'}"
+
+if args == ["off"]:
+    d.pop("lane_rotate", None)
+elif args:
+    picked = []
+    for x in args:
+        n = int(x) if x.isdigit() else 0
+        if not 1 <= n <= len(accounts):
+            sys.exit(f"Error: account {x} does not exist (valid: 1-{len(accounts)})")
+        a = accounts[n - 1]
+        if not a.get("reserved"):
+            sys.exit(f"Error: account {n} is not reserved: the watch moves it as the shared"
+                     " login already")
+        if not a.get("email"):
+            sys.exit(f"Error: account {n} has no email in the store")
+        if n not in picked:
+            picked.append(n)
+    if len(picked) < 2:
+        sys.exit("Say at least two reserved accounts, or off")
+    d["lane_rotate"] = [accounts[n - 1]["email"] for n in picked]
+if args:
+    tmp = store_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, store_path)
+want = [e.lower() for e in d.get("lane_rotate") or []]
+pool = [i for i, a in enumerate(accounts, 1) if (a.get("email") or "").lower() in want]
+if pool:
+    print("When the account the reserved sessions are on reaches its limit, the watch"
+          " moves them to another of: " + ", ".join(name(i) for i in pool))
+    print("A move by hand (claude-swap <n>) is kept until that account reaches its limit,"
+          " and one outside these is left alone.")
+else:
+    print("The watch leaves the reserved sessions where they are."
+          "  To let it move them: claude-swap watch reserved <n> <m> ...")
+PYEOF
 }
 
 cmd_watch_run() {
@@ -4452,6 +4526,58 @@ def refresh_subscriptions(store):
             log(f"subscription: {who} — {', '.join(changes)}")
             notify(f"{who}: {', '.join(changes)}")
 
+def lane_pool(store):
+    """The reserved accounts the watch may put the reserved sessions on
+    (claude-swap watch reserved), by number, in the store's current order."""
+    want = [e.lower() for e in store.get("lane_rotate") or []]
+    return [i for i, a in enumerate(store.get("accounts", []), 1)
+            if (a.get("email") or "").lower() in want and a.get("reserved")
+            and a.get("token") and not a.get("disabled")]
+
+def lane_step(store, rows):
+    """Move the reserved sessions off a reserved account at its limit, as the
+    shared login is moved. -> (decision or None, peak % of their account)"""
+    ln, pool = oauth.lane_of(store), lane_pool(store)
+    ls = state.setdefault("lane", {})
+    p = next((r for r in rows if r["n"] == ln), None)
+    peak = engine.load(p) if p and p["u5"] is not None else 0
+    if ln is None:
+        return None, peak
+    # a move the watch did not make is the user's pick, kept until its limit
+    if ls.get("set_by_watch") is None:
+        ls["set_by_watch"] = ln
+    elif ln != ls["set_by_watch"]:
+        ls.update({"set_by_watch": ln, "manual": True})
+        log(f"reserved sessions on #{ln} by hand — kept until it reaches its limit")
+    d = engine.lane_decide(rows, ln, pool, time.time(), ls)
+    state["lane_decision"] = (f"reserved sessions: {d['reason']}" if d else
+                              f"reserved sessions on #{ln}"
+                              + (" (not among the ones the watch moves them on)"
+                                 if len(pool) > 1 else " (the watch does not move them)"))
+    if d is None:
+        return None, peak
+    if d["action"] == "switch":
+        tgt = next((r for r in rows if r["n"] == d["target"]), {})
+        log(f"reserved sessions #{ln} -> #{d['target']} {tgt.get('label', '')}: {d['reason']}")
+        if run_logged([self_bin, str(d["target"])]):
+            notify(f"Reserved sessions moved to #{d['target']} {tgt.get('label', '')}"
+                   f" — {d['reason']}")
+            ls.update({"last_switch": time.time(), "set_by_watch": d["target"],
+                       "manual": False, "wall_noted": False})
+        else:
+            log("moving the reserved sessions failed")
+            notify("Moving the reserved sessions failed — check the watch log")
+    elif d["action"] == "wall":
+        if not ls.get("wall_noted"):
+            when = f" — first one free at {clock(d['wake'])}" if d["wake"] else ""
+            log(f"reserved sessions: {d['reason']}{when}")
+            notify("Reserved accounts all at the limit" + when)
+            ls["wall_noted"] = True
+    elif ls.get("wall_noted"):
+        ls["wall_noted"] = False
+    save_state()
+    return d, peak
+
 def run_logged(args):
     r = subprocess.run(args, capture_output=True, text=True)
     for line in ((r.stdout or "") + (r.stderr or "")).strip().splitlines():
@@ -4581,6 +4707,7 @@ while True:
         state.update({"active": active, "last": desc, "decision": d["reason"],
                       "last_time": datetime.now().strftime("%H:%M")})
         save_state()
+        ld, lane_peak = lane_step(store, rows)
 
         if d["action"] == "reset":
             spend_reset(d["target"], store, rows)
@@ -4603,7 +4730,8 @@ while True:
                 nap(300)
             continue
 
-        cadence = 600 if peak < 80 else (180 if peak < 95 else 60)
+        top = max(peak, lane_peak)  # the reserved sessions' account counts too
+        cadence = 600 if top < 80 else (180 if top < 95 else 60)
         if d["action"] == "wall":
             cadence = 600  # nothing to switch to: no point probing every minute
             if not state.get("wall_noted"):
@@ -4631,9 +4759,10 @@ while True:
                 save_state()
 
         sleep_for = cadence
-        if d["wake"]:
+        wakes = [w for w in (d["wake"], ld and ld["wake"]) if w]
+        if wakes:
             # +20 s: let the window actually roll over before looking
-            sleep_for = min(cadence, max(30, d["wake"] - time.time() + 20))
+            sleep_for = min(cadence, max(30, min(wakes) - time.time() + 20))
         log(f"#{active} {desc} — {d['reason']} — next look {clock(time.time() + sleep_for)}")
         nap(sleep_for)
     except KeyboardInterrupt:
@@ -4974,7 +5103,8 @@ case "${1:-}" in
       run) shift 2; cmd_watch_run "$@" ;;
       stop) cmd_watch_stop ;;
       status) cmd_watch_status ;;
-      *) echo "Usage: claude-swap watch [start [general|fable] [--auto-reset]|stop|status]"; exit 1 ;;
+      reserved) shift 2; cmd_watch_reserved "$@" ;;
+      *) echo "Usage: claude-swap watch [start [general|fable] [--auto-reset]|stop|status|reserved [n ...|off]]"; exit 1 ;;
     esac
     ;;
   add)

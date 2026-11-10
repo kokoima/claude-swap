@@ -217,6 +217,58 @@ class Reserved(unittest.TestCase):
         self.assertNotEqual((d["action"], d["target"]), ("reset", 2))
 
 
+class Lane(unittest.TestCase):
+    """The reserved sessions (claude-swap run) are moved like the shared login,
+    but only among the reserved accounts the watch may put them on."""
+
+    def rows(self, over=None):
+        rows = today({5: {"u7": 10}})
+        for n, kw in {11: {"u5": 0, "u7": 30, "r7": NOW + 100 * H},
+                      12: {"u5": 0, "u7": 0, "r7": NOW + 120 * H},
+                      13: {"u5": 0, "u7": 5, "r7": NOW + 140 * H}}.items():
+            rows.append(acct(n, reserved=True, **kw))
+        for r in rows:
+            r.update((over or {}).get(r["n"], {}))
+        return rows
+
+    def lane(self, rows, lane, pool=(11, 13), state=None):
+        return E["lane_decide"](rows, lane, list(pool), NOW, state or {})
+
+    def test_not_the_watchs_without_a_pool_or_off_it(self):
+        self.assertIsNone(self.lane(self.rows(), 11, pool=()))
+        self.assertIsNone(self.lane(self.rows(), 11, pool=(11,)))
+        # put on #12 by hand, which is not in the pool: left alone
+        self.assertIsNone(self.lane(self.rows({12: {"u5": 100}}), 12))
+
+    def test_its_account_at_the_limit_hands_them_to_the_other(self):
+        d = self.lane(self.rows({11: {"u5": 100, "rate_limited": True,
+                                      "r5": NOW + 4 * H}}), 11)
+        self.assertEqual((d["action"], d["target"]), ("switch", 13))
+
+    def test_never_onto_a_reserved_account_outside_it_nor_an_ordinary_one(self):
+        # #12 and #5 have all the room; the pool is spent: wait instead
+        d = self.lane(self.rows({11: {"u5": 100, "r5": NOW + 4 * H},
+                                 13: {"u5": 100, "r5": NOW + 2 * H}}), 11)
+        self.assertEqual(d["action"], "wall")
+        self.assertIsNone(d["target"])
+        self.assertEqual(d["wake"], NOW + 2 * H)
+
+    def test_a_move_by_hand_is_kept_until_its_limit(self):
+        # #11's week renews first, so it would go first: not over a pick by hand
+        d = self.lane(self.rows(), 13, state={"manual": True})
+        self.assertEqual((d["action"], d["target"]), ("stay", 13))
+        d = self.lane(self.rows({13: {"u5": 100}}), 13, state={"manual": True})
+        self.assertEqual((d["action"], d["target"]), ("switch", 11))
+
+    def test_back_to_the_quota_lost_first_once_it_has_room(self):
+        d = self.lane(self.rows(), 13, state={"last_switch": NOW - 3600})
+        self.assertEqual((d["action"], d["target"]), ("switch", 11))
+
+    def test_the_shared_logins_decision_still_ignores_them(self):
+        d = decide(self.rows({3: {"u5": 100}}), 3, LONG_AGO)
+        self.assertNotIn(d["target"], (11, 12, 13))
+
+
 class Wall(unittest.TestCase):
     def test_all_blocked_waits_for_the_soonest_unblock(self):
         rows = today({3: {"u5": 99}, 5: {"u7": 99}, 2: {"u5": 99}})
