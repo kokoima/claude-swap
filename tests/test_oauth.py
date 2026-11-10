@@ -91,6 +91,8 @@ class Base(unittest.TestCase):
             json.dump({"numStartups": 7, "oauthAccount": ident(1)}, f)
         self.env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": self.cc})
         self.env.start()
+        self.run_base = mock.patch.dict(O, {"RUN_BASE": os.path.join(self.dir, "run")})
+        self.run_base.start()
         self.secrets = FakeSecrets()
         self.live = O["Live"](self.secrets, True)
         self.store_path = os.path.join(self.dir, "store.json")
@@ -99,6 +101,7 @@ class Base(unittest.TestCase):
              "expires": int((NOW + 300 * 86400) * 1000)} for n in (1, 2, 3)]}
 
     def tearDown(self):
+        self.run_base.stop()
         self.env.stop()
         shutil.rmtree(self.dir, ignore_errors=True)
 
@@ -377,9 +380,10 @@ class Config(Base):
         self.assertEqual(O["parse"](O["dump"](o).encode().hex()), o)
 
 
-class OwnSessions(Base):
-    """`claude-swap run` on a reserved account's full login: a config dir of
-    its own, sharing ~/.claude, whose keychain item Claude Code refreshes."""
+class Lane(Base):
+    """`claude-swap run` on the reserved accounts: one config dir, the lane,
+    sharing ~/.claude, whose keychain item holds the login of the reserved
+    account it is on; `claude-swap <n>` moves it, open sessions included."""
     def setUp(self):
         super().setUp()
         self.base = os.path.join(self.dir, "run")
@@ -400,14 +404,25 @@ class OwnSessions(Base):
                                                  "lastSessionFirstPrompt": "personal",
                                                  "lastCost": 9},
                                     "/w/stats-only": {"lastCost": 1}}}, f)
-        self.store["accounts"][2]["reserved"] = True
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
         self.acc = self.store["accounts"][2]
-        self.d = O["run_dir"](self.acc, self.base)
+        self.d = O["lane_dir"](self.base)
         self.svc = O["run_service"](self.d)
 
-    def prepare(self, http=None):
-        return O["run_prepare"](self.store, 3, self.secrets, http or FakeHttp(), NOW,
-                                self.base, self.home, self.home_json)
+    def prepare(self, n=3, http=None, now=NOW):
+        return O["lane_prepare"](self.store, n, self.secrets, http or FakeHttp(), now,
+                                 self.base, self.home, self.home_json)
+
+    def move(self, n, now=NOW, http=None):
+        return O["lane_move"](self.store, n, self.secrets, http or FakeHttp(), now, self.base)
+
+    def sync(self, now=NOW, http=None):
+        return O["lane_sync"](self.store, self.secrets, http or FakeHttp(), now, self.base)
+
+    def two(self):
+        """#2's login, authorized days apart from #3's (login("v"))."""
+        return login("two", rt_left=25 * 86400)
 
     def own(self):
         return O["parse"](self.secrets.read(self.svc))
@@ -416,24 +431,39 @@ class OwnSessions(Base):
         with open(os.path.join(self.d, ".claude.json")) as f:
             return json.load(f)
 
-    def test_named_by_email_and_recognised_from_its_path(self):
-        self.assertEqual(os.path.basename(self.d), "a3@x.io")
-        self.assertEqual(O["run_account"](self.d, self.store["accounts"], self.base), 3)
-        self.assertIsNone(O["run_account"](self.cc, self.store["accounts"], self.base))
-        self.assertIsNone(O["run_dir"]({"email": ""}, self.base))
+    def refreshed(self, tag, of):
+        """What a session leaves after refreshing login `of`: new tokens, the
+        same authorization (its refresh token dies when the old one would)."""
+        o = login(tag, at_left=8 * H)
+        o["refreshTokenExpiresAt"] = of["refreshTokenExpiresAt"]
+        return o
 
-    def test_without_a_full_login_nothing_is_made(self):
-        self.assertEqual(self.prepare(), (None, None))
-        self.assertFalse(os.path.exists(self.d))
-        self.assertIsNone(self.own())
+    def test_one_dir_for_every_reserved_account(self):
+        self.assertEqual(os.path.basename(self.d), "reserved")
+        self.assertEqual(O["lane_of"](self.store), None)
+        self.prepare(3)
+        self.assertEqual(O["lane_of"](self.store), 3)
+        self.store["accounts"][2].pop("reserved")  # unreserved: the lane is on none
+        self.assertIsNone(O["lane_of"](self.store))
+        self.store["accounts"][2]["reserved"] = True
+        self.store["accounts"][2]["disabled"] = True
+        self.assertIsNone(O["lane_of"](self.store))
 
-    def test_the_saved_login_goes_into_its_own_keychain_item(self):
-        self.give(3, login("v"))
-        d, note = self.prepare()
-        self.assertEqual(d, self.d)
-        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-v")
+    def test_without_a_full_login_the_lane_runs_on_the_setup_token(self):
+        d, mode, note, moved = self.prepare()
+        self.assertEqual((d, mode, note, moved), (self.d, "setup", None, None))
+        self.assertEqual(self.own()["accessToken"], "sk-ant-oat01-setup3")
+        self.assertNotIn("oauthAccount", self.config())
         self.assertIsNone(self.live_now())  # the shared login is not touched
+
+    def test_the_saved_login_goes_into_the_lanes_keychain_item(self):
+        self.give(3, login("v"))
+        d, mode, _, _ = self.prepare()
+        self.assertEqual((d, mode), (self.d, "oauth"))
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-v")
+        self.assertIsNone(self.live_now())
         self.assertEqual(self.config()["oauthAccount"], ident(3))
+        self.assertEqual(self.store["lane"]["n"], 3)
 
     def test_it_shares_home_but_what_is_an_accounts_own(self):
         self.give(3, login("v"))
@@ -509,9 +539,7 @@ class OwnSessions(Base):
     def test_a_login_its_sessions_refreshed_is_kept_and_saved_back(self):
         self.give(3, login("v"))
         self.prepare()
-        refreshed = login("r", at_left=8 * H)  # same authorization, new tokens
-        refreshed["refreshTokenExpiresAt"] = login("v")["refreshTokenExpiresAt"]
-        self.secrets.write(self.svc, O["dump"](refreshed))
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
         self.prepare()
         self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-r")
         self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
@@ -524,9 +552,12 @@ class OwnSessions(Base):
         self.prepare()
         self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-new")
 
-    def test_another_accounts_login_there_is_replaced(self):
+    def test_a_login_of_no_reserved_account_there_is_replaced(self):
         self.give(3, login("v"))
+        self.prepare()
         self.secrets.write(self.svc, O["dump"](login("stranger", rt_left=9 * 86400)))
+        self.assertEqual(self.sync()[0], [("log", "the reserved sessions hold a login of no"
+                                                  " reserved account: left alone")])
         self.prepare()
         self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-v")
 
@@ -534,8 +565,9 @@ class OwnSessions(Base):
         self.give(3, login("v"))
         self.prepare()
         self.acc["oauth"]["dead"] = NOW
-        d, note = self.prepare()
-        self.assertIsNone(d)
+        d, mode, note, _ = self.prepare()
+        self.assertEqual((d, mode), (self.d, "setup"))
+        self.assertEqual(self.own()["accessToken"], "sk-ant-oat01-setup3")
         self.assertIn("refused", note)
         self.assertIn("auth 3", note)
 
@@ -543,27 +575,168 @@ class OwnSessions(Base):
         self.give(3, login("v", at_left=60))
         http = FakeHttp(token=(200, {"access_token": "sk-ant-oat01-n",
                                      "refresh_token": "sk-ant-ort01-n", "expires_in": 28800}))
-        self.prepare(http)
+        self.prepare(http=http)
         self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-n")
         self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-n")
 
-    def test_the_watch_saves_what_its_sessions_refreshed_and_never_writes_there(self):
+    def test_moving_saves_the_login_in_use_then_puts_the_others(self):
+        self.give(2, self.two())
+        self.give(3, login("v"))
+        self.prepare(3)
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
+        mode, note, ev = self.move(2)
+        self.assertEqual((mode, note), ("oauth", None))
+        self.assertIn(("log", "saved #3's login, refreshed by the reserved sessions"), ev)
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-two")
+        self.assertEqual(self.config()["oauthAccount"], ident(2))
+        self.assertEqual((self.store["lane"]["n"], self.store["lane"]["from"]), (2, 3))
+        self.assertIsNone(self.live_now())  # the shared login is not touched
+
+    def test_moving_to_an_account_without_a_full_login_puts_its_setup_token(self):
+        self.give(3, login("v"))
+        self.prepare(3)
+        mode, note, _ = self.move(2)
+        self.assertEqual((mode, note), ("setup", None))
+        self.assertEqual(self.own()["accessToken"], "sk-ant-oat01-setup2")
+        self.assertNotIn("oauthAccount", self.config())
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-v")  # kept, untouched
+
+    def test_a_login_that_cannot_be_saved_stops_the_move(self):
+        self.give(2, self.two())
+        self.give(3, login("v"))
+        self.prepare(3)
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
+        self.secrets.fail = True
+        mode, _, _ = self.move(2)
+        self.secrets.fail = False
+        self.assertEqual(mode, "failed")
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-r")
+        self.assertEqual(self.store["lane"]["n"], 3)
+
+    def test_a_session_writing_back_the_account_just_left_is_undone(self):
+        self.give(2, self.two())
+        self.give(3, login("v"))
+        self.prepare(3)
+        self.move(2)
+        # a session refreshed #3 a moment after the move and wrote it back
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
+        ev, ok = self.sync(NOW + 60)
+        self.assertTrue(ok)
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-two")
+        self.assertEqual(self.store["lane"]["n"], 2)
+        self.assertTrue(any("put back" in m for _, m in ev))
+
+    def test_two_seats_authorized_within_the_hour_are_told_apart_by_the_server(self):
+        self.give(2, login("two"))  # same day, same hour as #3's
+        self.give(3, login("v"))
+        self.prepare(3)
+        self.move(2)
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
+        ev, _ = self.sync(NOW + 60)  # no answer from the server: nobody's
+        self.assertIn("left alone", ev[0][1])
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-two")
+        self.sync(NOW + 60, FakeHttp(profile=profile_for(3)))
+        self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-two")
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-two")  # #2 put back
+
+    def test_a_reserved_login_turning_up_later_is_taken_as_the_pick(self):
+        self.give(2, self.two())
+        self.give(3, login("v"))
+        self.prepare(2)
+        self.secrets.write(self.svc, O["dump"](login("v")))
+        ev, _ = self.sync(NOW + 2 * O["RACE_WINDOW"])
+        self.assertEqual(self.store["lane"]["n"], 3)
+        self.assertEqual(ev[-1][0], "notify")
+
+    def test_run_on_another_reserved_account_moves_the_lane(self):
+        self.give(3, login("v"))
+        self.prepare(3)
+        d, mode, _, moved = self.prepare(2)
+        self.assertEqual((d, mode, moved), (self.d, "setup", 3))
+        self.assertEqual(self.own()["accessToken"], "sk-ant-oat01-setup2")
+        self.assertEqual(O["lane_of"](self.store), 2)
+
+    def test_a_setup_token_stays_until_a_full_login_turns_up(self):
+        self.prepare(2)
+        self.assertEqual(self.prepare(2)[1], "setup")
+        self.assertEqual(self.store["lane"]["at"], NOW)  # left as it was
+        self.give(2, self.two())  # claude-swap auth 2
+        self.assertEqual(self.prepare(2, now=NOW + 60)[1], "oauth")
+        self.assertEqual(self.own()["refreshToken"], "sk-ant-ort01-two")
+
+    def test_the_watch_saves_what_the_sessions_refreshed_and_never_writes_there(self):
         self.give(3, login("v"))
         self.prepare()
-        refreshed = login("r", at_left=8 * H)
-        refreshed["refreshTokenExpiresAt"] = login("v")["refreshTokenExpiresAt"]
-        self.secrets.write(self.svc, O["dump"](refreshed))
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
         O["save_store"](self.store_path, self.store)
         written = []
         real = self.secrets.write
         self.secrets.write = lambda s, t, a=None: (written.append(s), real(s, t, a))[1]
-        with mock.patch.dict(O, {"RUN_BASE": self.base}):
-            ev = O["tick"](self.store_path, self.secrets, self.live, FakeHttp(), NOW)
-        self.assertIn(("log", "saved #3's login, refreshed by its own sessions"), ev)
+        ev = O["tick"](self.store_path, self.secrets, self.live, FakeHttp(), NOW)
+        self.assertIn(("log", "saved #3's login, refreshed by the reserved sessions"), ev)
         self.assertNotIn(self.svc, written)
         acc = O["load_store"](self.store_path)["accounts"][2]
         self.assertEqual(acc["oauth"]["fp"], O["fp"]("sk-ant-ort01-r"))
         self.assertEqual(self.slot_of(3)["refreshToken"], "sk-ant-ort01-r")
+
+    def test_the_watch_keeps_a_move_made_meanwhile(self):
+        # `claude-swap 2` saved its move after the watch read the store: the
+        # watch's pass keeps the login it saved, not its old idea of the lane
+        self.give(3, login("v"))
+        self.prepare(3)
+        self.secrets.write(self.svc, O["dump"](self.refreshed("r", login("v"))))
+        O["save_store"](self.store_path, self.store)
+        real, calls = O["load_store"], []
+
+        def load(path):
+            s = real(path)
+            calls.append(path)
+            if len(calls) == 1:  # the watch's read; then the move lands on disk
+                moved = real(path)
+                moved["lane"] = {"n": 2, "mode": "setup", "at": NOW + 5, "from": 3}
+                O["save_store"](path, moved)
+            return s
+        with mock.patch.dict(O, {"load_store": load}):
+            O["tick"](self.store_path, self.secrets, self.live, FakeHttp(), NOW + 10)
+        disk = real(self.store_path)
+        self.assertEqual(disk["lane"]["n"], 2)
+        self.assertEqual(disk["accounts"][2]["oauth"]["fp"], O["fp"]("sk-ant-ort01-r"))
+
+    def test_a_1_14_dir_becomes_the_lane_with_its_sessions(self):
+        old = O["run_dir"](self.acc, self.base)          # 1.14: per account
+        os.makedirs(old)
+        self.secrets.write(O["run_service"](old), O["dump"](O["setup_login"](
+            self.store["accounts"][1])))               # moved by hand to #2's token
+        self.assertEqual(O["lane_adopt"](self.store, self.secrets, self.base), 2)
+        self.assertTrue(os.path.islink(os.path.join(self.base, "reserved")))
+        self.assertEqual(O["lane_dir"](self.base), old)  # same dir, same keychain item
+        self.assertEqual(self.store["lane"]["n"], 2)
+        self.assertIsNone(O["lane_adopt"](self.store, self.secrets, self.base))  # once
+
+    def test_with_several_1_14_dirs_none_is_taken(self):
+        for n in (2, 3):
+            os.makedirs(O["run_dir"](self.store["accounts"][n - 1], self.base))
+        self.assertIsNone(O["lane_adopt"](self.store, self.secrets, self.base))
+        self.assertFalse(os.path.lexists(os.path.join(self.base, "reserved")))
+
+    def test_the_open_reserved_sessions_and_which_follow_the_lane(self):
+        os.makedirs(self.d)
+        os.makedirs(os.path.join(self.cc, "sessions"))
+        with open(os.path.join(self.cc, "sessions", "11.json"), "w") as f:
+            json.dump({"name": "REVIEW"}, f)
+        ps = "\n".join([
+            f"   11 claude --resume x TERM=xterm CLAUDE_CONFIG_DIR={self.d} CLAUDE_SWAP_PINNED=reserved",
+            "   12 /usr/local/bin/claude CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-z CLAUDE_SWAP_PINNED=3",
+            "   13 claude TERM=xterm",
+            "   14 node claude CLAUDE_SWAP_PINNED=3",
+            ""])
+        with mock.patch.object(O["subprocess"], "run",
+                               return_value=mock.Mock(stdout=ps)):
+            got = O["reserved_sessions"](self.base)
+        self.assertEqual(got, [(11, "REVIEW", True), (12, None, False)])
 
 
 class Orgs(unittest.TestCase):

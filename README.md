@@ -13,7 +13,7 @@ first the quota that would be lost first.
 ```
 $ claude-swap check
 
-claude-swap v1.14.0
+claude-swap v1.15.0
 
 Active: 2 (Work / me@work.com)
 Watch:  RUNNING (general + auto-reset, PID 63012) — watching #2 — last probe 22:05: 5h 30% · 7d 43%
@@ -331,7 +331,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap chrome [n\|all]` | Open the Chrome profile of account N (default: the active one); `chrome <n> "Profile 3"` sets it |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
 | `claude-swap reserve <n>` / `unreserve <n>` | Keep account N for sessions of its own: auto and the watch never use it |
-| `claude-swap run [n] [-- <claude args>]` | Start `claude` on account N, whatever the shared login is (no N: the only reserved account) |
+| `claude-swap run [n] [-- <claude args>]` | Start `claude` on reserved account N, whatever the shared login is (no N: the reserved account the reserved sessions are on) |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
@@ -414,53 +414,71 @@ reaches every session on the machine and the watch moves it around. Mark
 such an account **reserved** (`claude-swap add --reserved`, or
 `claude-swap reserve <n>`):
 
-- `auto` and the watch never pick it, and `claude-swap <n>` refuses to make
-  it the shared login, so no switch moves work onto it or off it;
+- `auto` and the watch never pick it and it never becomes the shared
+  login, so no swap moves work onto it or off it;
 - `check` still shows its usage, plan and calendar, and lists it on a
-  `Reserved:` line below the watcher order;
-- `claude-swap run [n] -- <claude args>` starts a session on it that later
-  swaps leave where it is. Without a number, `run` takes the reserved
-  account only when there is just one: it never chooses between several by
-  usage, since a Team seat belongs to one person;
+  `Reserved:` line below the watcher order, marking the account the
+  reserved sessions are on;
+- `claude-swap run [-- <claude args>]` starts a session on the reserved
+  accounts, which later swaps of the shared login leave where it is;
+- `claude-swap <n>` on a reserved account moves **all** the reserved
+  sessions to it, the open ones included, within 30 s and without
+  restarting them: when one Team seat reaches its limit, its sessions carry
+  on on another. The shared login stays where it was;
 - inside such a session, `claude-swap status` starts with a `This session:`
-  line naming its account and how it is signed in.
+  line naming the account it is on and how it is signed in, and the status
+  line shows that account with a lock.
 
-How `run` signs the session in depends on the account:
+On macOS the reserved sessions share one Claude Code config directory,
+`~/.claude-swap/run/reserved`. Its credential is that directory's keychain
+item, which holds the login of the reserved account they are on, so moving
+them is writing another account's login there, the way a swap writes the
+shared login:
 
-- **With a full login** (`claude-swap auth <n>`, see Claude in Chrome), the
-  session gets a Claude Code config directory of the account's own,
-  `~/.claude-swap/run/<email>`. Its credential is that directory's keychain
-  item, which Claude Code refreshes in place for all the account's
-  sessions, so **Claude in Chrome works** there (with the extension signed
-  in to the account in some Chrome profile) and the login keeps itself
-  fresh. Everything else is `~/.claude` itself, linked: transcripts,
-  memory, settings, `CLAUDE.md`, plugins, skills and the session list, so
-  `--resume` finds the same sessions and a settings change lands in
-  `~/.claude/settings.json`. Kept apart are what belongs to the account
-  (the keychain item, the org's policies and model caches, Claude Code's
-  own config `.claude.json`, its backups and its background daemon); at
-  each start `run` copies into that `.claude.json` your preferences, your
-  MCP servers and what each project allows from `~/.claude.json`. The
-  watcher and `status` save the login its sessions refresh back to the
-  account, and never write that item. A fresh `auth` replaces it at the
-  next start.
-- **Without one**, the setup-token goes in `CLAUDE_CODE_OAUTH_TOKEN`, which
-  Claude Code puts before the keychain. Should it be refused (401), Claude
-  Code keeps it and reports the error rather than falling back to the
-  stored login. Claude in Chrome is not available on it (`run` drops
-  `--chrome`).
+- **With a full login** (`claude-swap auth <n>`, see Claude in Chrome) the
+  account's login goes in, which Claude Code refreshes in place for all the
+  sessions, so **Claude in Chrome works** (with the extension signed in to
+  the account in some Chrome profile) and the login keeps itself fresh. The
+  watcher, `status`, `run` and every move save what the sessions refreshed
+  back to the account first, and a session that writes back the account
+  just left, a moment after a move, is undone, as with the shared login. A
+  reserved account's full login is live in one place only, the vault or
+  that directory: a refresh token works once.
+- **Without one**, its setup-token goes in. Claude in Chrome is not
+  available on it (`run` drops `--chrome` and says so).
 
-Sessions already running keep the way they started; `--resume` one to move
-it. A convenient alias:
+Everything else is `~/.claude` itself, linked: transcripts, memory,
+settings, `CLAUDE.md`, plugins, skills and the session list, so `--resume`
+finds the same sessions and a settings change lands in
+`~/.claude/settings.json`. Kept apart are what belongs to the account (the
+keychain item, the org's policies and model caches, Claude Code's own
+config `.claude.json`, its backups and its background daemon); at each
+start `run` copies into that `.claude.json` your preferences, your MCP
+servers and what each project allows from `~/.claude.json`.
+
+`run <n>` starts on reserved account N, moving the reserved sessions there
+too if they were on another one; without a number it starts on the account
+they are on (or the only reserved account). On another account, or off
+macOS, `run` passes the setup-token in `CLAUDE_CODE_OAUTH_TOKEN`, which
+Claude Code puts before the keychain: that session stays on it, and a move
+does not reach it until it is restarted (`claude-swap <n>` lists such
+sessions).
+
+From 1.14, where each reserved account had a config directory of its own
+(`~/.claude-swap/run/<email>`): if there is just one, it becomes the shared
+one (`reserved` links to it), open sessions included; with several, the
+sessions in them keep their account until restarted.
+
+A convenient alias:
 
 ```bash
-alias clt="claude-swap run 11 -- --dangerously-skip-permissions --chrome"
-clt                      # new session on account 11
+alias clt="claude-swap run -- --dangerously-skip-permissions --chrome"
+clt                      # new reserved session, on the account they are on
 clt --resume <uuid>      # resume one there
+claude-swap 13           # move them all to reserved account 13
 ```
 
-As with any session, Claude in Chrome needs `--chrome`; on the setup-token
-`run` drops it and says so.
+As with any session, Claude in Chrome needs `--chrome`.
 
 Generate the setup-token in a throwaway config so the login in use is not
 touched: `CLAUDE_CONFIG_DIR=$(mktemp -d) claude setup-token`.
@@ -501,7 +519,7 @@ Everything lives locally under `~/.claude/`:
 | `claude-swap-watch.pid` / `.state` / `.log` | Watcher process id, last probe and decision, log |
 | `~/Library/LaunchAgents/com.claude-swap.watch.plist` | The watcher's LaunchAgent (macOS, while it runs) |
 | Keychain, service `claude-swap` | Each account's full login for Claude in Chrome (refresh token included), one entry per email. The store only keeps fingerprints and expiry dates of it |
-| `~/.claude-swap/run/<email>/` | A reserved account's own Claude Code config for `run` on its full login: links into `~/.claude`, plus its `.claude.json`, policies and caches. Its credential is the keychain item `Claude Code-credentials-<hash of the path>` |
+| `~/.claude-swap/run/reserved/` | The Claude Code config the reserved sessions (`run`) share: links into `~/.claude`, plus its `.claude.json`, policies and caches. Its credential is the keychain item `Claude Code-credentials-<hash of the path>`, which holds the login of the reserved account they are on |
 | `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 
 Tokens are only ever sent to `api.anthropic.com` (and refresh tokens to

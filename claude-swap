@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.14.0"
+VERSION="1.15.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -977,9 +977,15 @@ def tick(store_path, secrets, live, http, now=None):
     before = json.dumps(store, sort_keys=True)
     accounts, active = store.get("accounts", []), store.get("active", 0)
     ev = run_sync(store, secrets, now)
+    lane0 = json.dumps(store.get("lane"), sort_keys=True)
+    lane_adopt(store, secrets)
+    ev += lane_sync(store, secrets, http, now)[0]
+    # the lane's record only when this pass changed it: a move made meanwhile stays
+    top = ("active", "live") + (("lane",) if json.dumps(store.get("lane"), sort_keys=True)
+                                != lane0 else ())
     if not 1 <= active <= len(accounts):
         if json.dumps(store, sort_keys=True) != before:
-            commit(store_path, store)
+            commit(store_path, store, top)
         return ev
     n_live, what, sure = sync(store, secrets, live, http, now)
     if what == "saved":
@@ -1009,7 +1015,7 @@ def tick(store_path, secrets, live, http, now=None):
         elif note:
             ev.append(("log", f"#{active}: {note}"))
     if json.dumps(store, sort_keys=True) != before:
-        commit(store_path, store)
+        commit(store_path, store, top)
     return ev
 
 def due_reminders(accounts, now, warned):
@@ -1306,49 +1312,17 @@ def run_config(d, home_json, account):
         return None if n == c else n
     return edit_config(os.path.join(d, ".claude.json"), merge, create=True)
 
-def run_prepare(store, n, secrets, http, now, base=None, home=None, home_json=None):
-    """Get account n's own config directory ready for a session on its full
-    login. -> (dir, note): with dir None there is no full login to run on and
-    note says why (or is None: it never had one)."""
-    acc = store["accounts"][n - 1]
-    d = run_dir(acc, base)
-    if d is None:
-        return None, "it has no email in the store"
-    svc, m = run_service(d), acc.get("oauth") or {}
-    cur = parse(secrets.read(svc))
-    note = None
-    refused = cur and m.get("dead") and fp(cur.get("refreshToken")) == m.get("fp")
-    if alive(cur, now) and m.get("fp") and same_chain(cur, m) and not refused:
-        # what its sessions refreshed there is the live copy: the vault's
-        # refresh token is spent, so it is the one kept
-        if fp(cur["refreshToken"]) != m["fp"] and secrets.write(VAULT, dump(cur), slot(acc)):
-            note_login(acc, cur, now)
-    else:
-        # none yet, a dead one, or another authorization's (a fresh
-        # `claude-swap auth`, a /login in one of its sessions): the vault's
-        o, note = vault_login(store, n, secrets, http, now)
-        if not o:
-            if not note and m.get("fp"):
-                note = (f"its full login {'was refused' if m.get('dead') else 'expired'}:"
-                        f" claude-swap auth {n}")
-            return None, note
-        if not secrets.write(svc, dump(o)):
-            return None, "could not write its keychain item"
-    link_config(d, home or cc_dir())
-    run_config(d, home_json or cc_json(), (acc.get("oauth") or {}).get("account"))
-    return d, note
-
 def run_sync(store, secrets, now, base=None):
-    """Save to the vault the logins Claude Code refreshed in the reserved
-    accounts' own keychain items, which are read, never written.
-    -> [(kind, msg)]"""
-    ev = []
+    """Save to the vault the logins Claude Code refreshed in the keychain
+    items of the reserved accounts' own config dirs (1.14's, before the
+    lane), which are read, never written. -> [(kind, msg)]"""
+    ev, lane = [], lane_dir(base)
     for i, acc in enumerate(store.get("accounts", []), 1):
         m = acc.get("oauth") or {}
         if not acc.get("reserved") or not m.get("fp"):
             continue
         d = run_dir(acc, base)
-        if not d or not os.path.isdir(d):
+        if not d or not os.path.isdir(d) or d == lane:
             continue
         o = parse(secrets.read(run_service(d)))
         if not alive(o, now) or fp(o["refreshToken"]) == m["fp"] or not same_chain(o, m):
@@ -1359,6 +1333,199 @@ def run_sync(store, secrets, now, base=None):
         else:
             ev.append(("log", f"could not save #{i}'s login to the vault"))
     return ev
+
+# ---------- the reserved accounts' sessions: one lane ----------
+# Every session `claude-swap run` opens on a reserved account shares one
+# config dir, the lane (RUN_BASE/reserved): its keychain item holds the
+# login of the reserved account the lane is on (store["lane"]). Moving the
+# lane writes another reserved account's login there, and the open sessions
+# follow within 30 s, as the shared login's do: a Team seat at its limit
+# hands its sessions to another without restarting them. A reserved
+# account's full login is live in one place only, the lane or the vault,
+# since a refresh token is single-use.
+
+LANE = "reserved"
+
+def lane_dir(base=None):
+    return os.path.realpath(os.path.join(base or RUN_BASE, LANE))
+
+def lane_of(store):
+    """The reserved account the lane is on, while it still is one: n or None."""
+    n = (store.get("lane") or {}).get("n")
+    accounts = store.get("accounts", [])
+    if not isinstance(n, int) or not 1 <= n <= len(accounts):
+        return None
+    a = accounts[n - 1]
+    return n if a.get("reserved") and a.get("token") and not a.get("disabled") else None
+
+def lane_owner(o, store, http=None):
+    """The reserved account a full login found in the lane belongs to: by its
+    fingerprints, or as one the lane's sessions refreshed (the same
+    authorization). Two accounts authorized within the hour look alike that
+    way: then the server says whose it is, or nobody does. -> n or None"""
+    accounts = store.get("accounts", [])
+    n = owner(o, accounts)
+    if n:
+        return n if accounts[n - 1].get("reserved") else None
+    near = [i for i, a in enumerate(accounts, 1)
+            if a.get("reserved") and (a.get("oauth") or {}).get("fp")
+            and same_chain(o, a["oauth"])]
+    if len(near) == 1:
+        return near[0]
+    p = profile(o["accessToken"], http) if near and http else None
+    if p:
+        account = account_of(p)
+        n = by_identity(accounts, account["accountUuid"], account["emailAddress"])
+        return n if n in near else None
+    return None
+
+def lane_put(store, n, secrets, http, now, base=None):
+    """Put the lane on reserved account n: its full login if it holds a
+    usable one (refreshed first when about to expire), else its setup-token.
+    -> (mode, note): mode 'oauth', 'setup', or 'failed' (nothing changed)."""
+    d = lane_dir(base)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    acc = store["accounts"][n - 1]
+    o, note = vault_login(store, n, secrets, http, now)
+    m = acc.get("oauth") or {}
+    if not o and not note and m.get("fp"):
+        note = (f"its full login {'was refused' if m.get('dead') else 'expired'}:"
+                f" claude-swap auth {n}")
+    if not secrets.write(run_service(d), dump(o or setup_login(acc))):
+        return "failed", "could not write the reserved sessions' credential"
+    set_account((acc.get("oauth") or {}).get("account") if o else None,
+                os.path.join(d, ".claude.json"))
+    rec = store.get("lane") or {}
+    store["lane"] = {"n": n, "mode": "oauth" if o else "setup", "at": int(now),
+                     "from": rec.get("n") if rec.get("n") != n else rec.get("from")}
+    return store["lane"]["mode"], note
+
+def lane_sync(store, secrets, http, now, base=None):
+    """Keep the lane's login in line, as the watch does each minute: save to
+    the vault what its sessions refreshed, and put the lane's account back
+    if a session wrote the one the lane just left over it.
+    -> (events, ok): ok False when a refreshed login could not be saved."""
+    rec, d = store.get("lane") or {}, lane_dir(base)
+    if not rec.get("n") or not os.path.isdir(d):
+        return [], True
+    o = parse(secrets.read(run_service(d)))
+    if not is_full(o):
+        return [], True
+    n = lane_owner(o, store, http)
+    if n is None:
+        return [("log", "the reserved sessions hold a login of no reserved account:"
+                        " left alone")], True
+    acc, ev = store["accounts"][n - 1], []
+    m = acc.get("oauth") or {}
+    if alive(o, now) and (m.get("fp") != fp(o["refreshToken"])
+                          or m.get("fp_at") != fp(o["accessToken"])):
+        if not secrets.write(VAULT, dump(o), slot(acc)):
+            return [("log", f"could not save #{n}'s login to the vault")], False
+        note_login(acc, o, now)
+        ev.append(("log", f"saved #{n}'s login, refreshed by the reserved sessions"))
+    if n != rec["n"]:
+        if n == rec.get("from") and now - (rec.get("at") or 0) < RACE_WINDOW:
+            # a session refreshed the account just left and wrote it back
+            mode, note = lane_put(store, rec["n"], secrets, http, now, base)
+            ev.append(("log", f"#{n}'s login was written back over the reserved sessions'"
+                              f" #{rec['n']} right after the move: #{rec['n']} put back"
+                              + (f" ({note})" if note else "")))
+        else:
+            store["lane"] = {"n": n, "mode": "oauth", "at": int(now), "from": rec["n"]}
+            ev.append(("notify", f"#{n} logged in by hand in a reserved session:"
+                                 " the reserved sessions are on it now"))
+    return ev, True
+
+def lane_move(store, n, secrets, http, now, base=None):
+    """Move the lane to reserved account n, saving first what its sessions
+    refreshed. -> (mode, note, events); mode 'failed': nothing changed."""
+    ev, ok = lane_sync(store, secrets, http, now, base)
+    if not ok:
+        return "failed", "moving now would lose the login in use", ev
+    mode, note = lane_put(store, n, secrets, http, now, base)
+    return mode, note, ev
+
+def lane_prepare(store, n, secrets, http, now, base=None, home=None, home_json=None):
+    """The lane ready for a new session on reserved account n, moved to it
+    first if it is on another one (its open sessions move too).
+    -> (dir or None, mode, note, moved_from)"""
+    d = lane_dir(base)
+    ev, ok = lane_sync(store, secrets, http, now, base)
+    if not ok:
+        return None, "failed", ev[-1][1], None
+    acc = store["accounts"][n - 1]
+    m, on = acc.get("oauth") or {}, lane_of(store)
+    o = parse(secrets.read(run_service(d))) if os.path.isdir(d) else None
+    keep = False
+    if on == n and o:
+        if is_full(o):
+            # what its sessions refreshed is the live copy, unless a fresh
+            # `claude-swap auth` or a refusal says otherwise
+            refused = m.get("dead") and fp(o.get("refreshToken")) == m.get("fp")
+            keep = bool(alive(o, now) and m.get("fp") and same_chain(o, m) and not refused)
+        else:
+            keep = o.get("accessToken") == acc.get("token") and not usable(acc, now)
+    if keep:
+        mode, note = ("oauth" if is_full(o) else "setup"), None
+    else:
+        mode, note = lane_put(store, n, secrets, http, now, base)
+        if mode == "failed":
+            return None, mode, note, None
+    link_config(d, home or cc_dir())
+    run_config(d, home_json or cc_json(),
+               (acc.get("oauth") or {}).get("account") if mode == "oauth" else None)
+    return d, mode, note, (on if on and on != n else None)
+
+def lane_adopt(store, secrets, base=None):
+    """Up to 1.14 each reserved account's sessions had a config dir of their
+    own. With no lane yet and just one such dir, that dir becomes the lane
+    (through a link), with its open sessions in it. -> n or None"""
+    base = base or RUN_BASE
+    path = os.path.join(base, LANE)
+    if store.get("lane") or os.path.lexists(path):
+        return None
+    dirs = [(i, run_dir(a, base)) for i, a in enumerate(store.get("accounts", []), 1)
+            if a.get("reserved") and run_dir(a, base) and os.path.isdir(run_dir(a, base))]
+    if len(dirs) != 1:
+        return None
+    i, d = dirs[0]
+    os.symlink(os.path.basename(d), path)
+    o = parse(secrets.read(run_service(d)))
+    if is_full(o):
+        n = lane_owner(o, store)
+    else:  # a setup-token: whose
+        n = next((k for k, a in enumerate(store.get("accounts", []), 1)
+                  if o and a.get("reserved") and a.get("token") == o.get("accessToken")), None)
+    store["lane"] = {"n": n or i, "mode": "oauth" if is_full(o) else "setup",
+                     "at": int(time.time()), "from": None}
+    return n or i
+
+def reserved_sessions(base=None):
+    """The open sessions of `claude-swap run`: [(pid, name, follows)], follows
+    meaning they run on the lane and move with it; the others carry a
+    setup-token in their environment, which pins them until restarted."""
+    try:
+        out = subprocess.run(["ps", "eww", "-axo", "pid=,command="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return []
+    lane, found = lane_dir(base), []
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        words = cmd.split()
+        if not pid.isdigit() or not words or os.path.basename(words[0]) != "claude":
+            continue
+        env = dict(w.split("=", 1) for w in words[1:] if "=" in w)
+        if "CLAUDE_SWAP_PINNED" not in env:
+            continue
+        cfg = env.get("CLAUDE_CONFIG_DIR")
+        try:
+            with open(os.path.join(cc_dir(), "sessions", pid + ".json")) as f:
+                name = json.load(f).get("name")
+        except Exception:
+            name = None
+        found.append((int(pid), name, bool(cfg) and os.path.realpath(cfg) == lane))
+    return found
 PYEOF
 export CLAUDE_SWAP_OAUTH="$OAUTH_PY"
 
@@ -1416,8 +1583,8 @@ cmd_help() {
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's)"
   echo "  claude-swap unreserve <n>  Make it an ordinary account again"
   echo "  claude-swap run [n] [-- <claude args>]"
-  echo "                           Start claude on account N (no N: the only reserved account);"
-  echo "                           with its full login (auth <n>) it has Claude in Chrome"
+  echo "                           Start claude on reserved account N (no N: the one the reserved"
+  echo "                           sessions are on); claude-swap <n> moves them all, open ones too"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -1445,10 +1612,12 @@ cmd_help() {
   echo ""
   echo "  A reserved account (a Team plan for sensitive clients, say) never"
   echo "  becomes the shared login and auto and the watch never pick it, so"
-  echo "  no swap moves work onto it or off it. 'run' starts a session on it"
-  echo "  with CLAUDE_CODE_OAUTH_TOKEN, which Claude Code puts before the"
-  echo "  keychain: swaps leave that session where it is. It runs on the"
-  echo "  setup-token, so without Claude in Chrome. check still shows it."
+  echo "  no swap moves work onto it or off it. 'run' starts a session on the"
+  echo "  reserved accounts, in a config dir they share (macOS), and"
+  echo "  'claude-swap <n>' on a reserved account moves all those sessions to"
+  echo "  it, the open ones within 30 s: one Team seat at its limit hands them"
+  echo "  to another. On a full login (auth <n>) they have Claude in Chrome."
+  echo "  check still shows the reserved accounts, and which one they are on."
   echo ""
   echo "  Claude in Chrome refuses setup-tokens: it needs each account's full"
   echo "  login. 'auth' takes it once per account, in that account's Chrome"
@@ -1619,8 +1788,24 @@ if not accounts:
 
 if is_macos:
     found = session_token()
-    k_own = found and oauth.run_account(found[2], accounts)
-    if k_own:
+    on_lane = bool(found and found[2]) and os.path.realpath(found[2]) == oauth.lane_dir()
+    k_own = found and not on_lane and oauth.run_account(found[2], accounts)
+    if on_lane:
+        k = oauth.lane_of(store)
+        if k:
+            a = accounts[k - 1]
+            how = (("full login, " + ("Claude in Chrome ready" if oauth.chrome_ready(a) else
+                    f"no Chrome profile has the extension signed in to {a.get('email')}"))
+                   if (store.get("lane") or {}).get("mode") == "oauth"
+                   else "setup-token, no Claude in Chrome")
+            print(f"This session: {k} ({a.get('label', '?')} / {a.get('email') or '-'})"
+                  f" — a reserved session (claude-swap run), on its {how};"
+                  " claude-swap <n> moves the reserved sessions, the Active login below"
+                  " does not reach them")
+        else:
+            print("This session: a reserved session (claude-swap run), on no reserved account"
+                  " now: claude-swap <n> puts them on one")
+    elif k_own:
         a = accounts[k_own - 1]
         kind = "reserved, " if a.get("reserved") else ""
         chrome = ("Claude in Chrome ready" if oauth.chrome_ready(a)
@@ -2447,10 +2632,12 @@ print("  " + paint(BOLD, "Now: " + head) + paint(GREY, f" — {d['reason']}"))
 # reserved accounts sit out of that order: only `claude-swap run` opens them
 kept = [r for r in results if r["reserved"] and not r["disabled"]]
 if kept:
+    ln = (store.get("lane") or {}).get("n")
     print("  " + paint(CYAN, "Reserved: ")
-          + ", ".join(f"#{r['n']} {short(r['label'])}" for r in kept)
-          + paint(GREY, " — never the shared login; a session on them:"
-                        " claude-swap run [n] -- <claude args>"))
+          + ", ".join((paint(BOLD, f"#{r['n']} {short(r['label'])} ◂ sessions")
+                       if r["n"] == ln else f"#{r['n']} {short(r['label'])}") for r in kept)
+          + paint(GREY, " — never the shared login; their sessions: claude-swap run"
+                        " -- <claude args>, moved with claude-swap <n>"))
 PYEOF
 }
 
@@ -2764,11 +2951,49 @@ if not acc.get("token"):
     sys.exit(1)
 if acc.get("reserved"):
     # the shared login reaches every session and the watch would move them
-    # off it: a reserved account only runs sessions of its own
-    print(f"Account {n} is reserved: it never becomes the shared login.")
-    print(f"Open a session on it with:  claude-swap run {n} -- <claude args>")
-    print(f"(or make it an ordinary account first: claude-swap unreserve {n})")
-    sys.exit(1)
+    # off it: a reserved account moves the reserved sessions instead
+    if not macos:
+        print(f"Account {n} is reserved: it never becomes the shared login.")
+        print(f"Open a session on it with:  claude-swap run {n} -- <claude args>")
+        print(f"(or make it an ordinary account first: claude-swap unreserve {n})")
+        sys.exit(1)
+    secrets, _, http = oauth.default_io(True)
+    now = time.time()
+    oauth.lane_adopt(store, secrets)
+    prev = oauth.lane_of(store)
+    print()
+    print(f"Moving the reserved sessions (claude-swap run) to account {n}"
+          f" ({acc.get('label', '?')}); the shared login stays on #{store.get('active')}")
+    print()
+    mode, note, ev = oauth.lane_move(store, n, secrets, http, now)
+    for _, msg in ev:
+        print(f"  {msg[0].upper() + msg[1:]}")
+    if mode == "failed":
+        oauth.commit(store_path, store, top=())
+        print(f"  {note}")
+        print("\nStopped: the reserved sessions are still on " + (f"#{prev}." if prev else "no account."))
+        sys.exit(1)
+    oauth.commit(store_path, store, top=("lane",))
+    print("  " + (("Full login installed" + (": Claude in Chrome ready" if oauth.chrome_ready(acc)
+                                             else "")) if mode == "oauth" else
+                  f"Setup-token installed (Claude in Chrome needs a full login: claude-swap auth {n})"))
+    if note:
+        print(f"        {note}")
+    print()
+    open_ = oauth.reserved_sessions()
+    on = [x for x in open_ if x[2]]
+    print(f"Done. {len(on)} open reserved session{'s' if len(on) != 1 else ''} move"
+          f"{'s' if len(on) == 1 else ''} to #{n} within 30 s; new ones (claude-swap run)"
+          " start on it." if on else f"Done. New reserved sessions (claude-swap run) start on #{n}.")
+    pinned = [x for x in open_ if not x[2]]
+    if pinned:
+        print("Started on a token of their own, these stay where they are until restarted"
+              " (/exit, then claude-swap run -- --resume <id>): "
+              + ", ".join(x[1] or f"pid {x[0]}" for x in pinned))
+    if mode == "oauth" and not oauth.chrome_ready(acc):
+        print(f"Claude in Chrome: no Chrome profile has the extension signed in to"
+              f" {acc.get('email')} yet — sign it in, then claude-swap keys-sync.")
+    sys.exit(0)
 
 secrets, live, http = oauth.default_io(macos)
 now, prev = time.time(), store.get("active", 0)
@@ -3314,19 +3539,25 @@ def login(n):
             return False
         now = time.time()
         oauth.note_login(acc, o, now, account)
-        installed = False
+        installed = in_lane = False
         if store.get("active") == k:
             mode, _ = oauth.install(store, k, secrets, live, http, now)
             if mode == "oauth":
                 oauth.mark_live(store, k, mode, now, (store.get("live") or {}).get("from"))
                 installed = True
-        oauth.commit(store_path, store)
+        elif oauth.lane_of(store) == k:
+            # the reserved sessions are on it: they move to the new login
+            in_lane = oauth.lane_put(store, k, secrets, http, now)[0] == "oauth"
+        oauth.commit(store_path, store,
+                     top=("active", "live") + (("lane",) if in_lane else ()))
         until = f" until {day(o['refreshTokenExpiresAt'])}" if o.get("refreshTokenExpiresAt") else ""
         print(paint("32", f"  Saved: good{until}.")
               + (" Active account, so installed now: Claude in Chrome ready." if installed else ""))
         if store["accounts"][k - 1].get("reserved"):
-            print(f"  Reserved: its new sessions (claude-swap run {k}) start on this login, with"
-                  " Claude in Chrome. Open ones keep their setup-token until restarted.")
+            print("  Reserved: the reserved sessions (claude-swap run) are on it, so they moved"
+                  " to this login (Claude in Chrome)." if in_lane else
+                  f"  Reserved: the reserved sessions (claude-swap run) take this login when"
+                  f" they are on #{k}:  claude-swap {k}")
         acc = oauth.load_store(store_path)["accounts"][k - 1]
         cp = acc.get("chrome_profile")
         if oauth.chrome_ready(acc):
@@ -4476,12 +4707,13 @@ PYEOF
 }
 
 cmd_run() {
-  # A Claude Code session of its own on one account, whatever the shared
-  # login does, so no swap and no watch can move it. On the account's full
-  # login it gets the account's own CLAUDE_CONFIG_DIR (Claude in Chrome works,
-  # and Claude Code keeps the login fresh there); without one, the setup-token
-  # in CLAUDE_CODE_OAUTH_TOKEN, which Claude Code puts before the keychain.
-  # Without a number it takes the reserved account, when there is just one.
+  # A Claude Code session on a reserved account, whatever the shared login
+  # does: no swap of it and no watch moves it. The reserved sessions share a
+  # config dir, the lane, which `claude-swap <n>` moves from one reserved
+  # account to another, open sessions included (on its full login Claude in
+  # Chrome works). Without a number it starts on the account the lane is on.
+  # Another account's session gets its setup-token in CLAUDE_CODE_OAUTH_TOKEN,
+  # which Claude Code puts before the keychain, and stays on it.
   check_store
   command -v claude >/dev/null 2>&1 || { echo "Error: claude (Claude Code) is not in PATH"; exit 1; }
   # passed with -c, not on stdin: claude takes this process over (exec) and
@@ -4528,6 +4760,10 @@ def usage(n, acc):
         return c  # a 5h window not started yet reads None: 7d still counts
     return None
 
+macos = sys.platform == "darwin"
+if macos:
+    secrets, _, http = oauth.default_io(True)
+    oauth.lane_adopt(store, secrets)
 if head:
     n = int(head[0])
     if not 1 <= n <= len(accounts):
@@ -4536,28 +4772,36 @@ if head:
     if acc.get("disabled") or not acc.get("token"):
         sys.exit(f"Error: account {n} is disabled or has no token")
 else:
-    # Never a choice by usage: a Team seat belongs to one person, and
-    # alternating seats to stretch the limits is not what they are for.
+    # the account the reserved sessions are on; else the only reserved one
     pool = [(i, a) for i, a in enumerate(accounts, 1)
             if a.get("reserved") and a.get("token") and not a.get("disabled")]
-    if not pool:
+    n = oauth.lane_of(store) if macos else None
+    if n:
+        acc = accounts[n - 1]
+    elif not pool:
         sys.exit("No reserved account: mark one with  claude-swap reserve <n>")
-    if len(pool) > 1:
+    elif len(pool) > 1:
         sys.exit("Several reserved accounts ("
                  + ", ".join(f"#{i} {a.get('email') or a.get('label') or '?'}" for i, a in pool)
                  + "): say which one,  claude-swap run <n> -- <claude args>")
-    n, acc = pool[0]
+    else:
+        n, acc = pool[0]
 
-# the account's own config dir, on its full login (macOS: its keychain)
-own, note = None, None
-if sys.platform == "darwin":
-    secrets, _, http = oauth.default_io(True)
+# A reserved account's sessions run on the lane, a config dir they share,
+# which `claude-swap <n>` moves among the reserved accounts (macOS: the lane's
+# keychain item). Any other account's run on its setup-token: its full login
+# lives in Claude Code's own credential, and two copies of one would spend
+# each other's refresh token.
+own, mode, note, moved = None, "setup", None, None
+if macos and acc.get("reserved"):
     try:
-        own, note = oauth.run_prepare(store, n, secrets, http, time.time())
+        own, mode, note, moved = oauth.lane_prepare(store, n, secrets, http, time.time())
     except Exception as e:
-        own, note = None, f"its own config dir could not be set up ({type(e).__name__}: {e})"
+        own, note = None, f"the reserved sessions' config dir could not be set up ({type(e).__name__}: {e})"
     if json.dumps(store, sort_keys=True) != before:
-        oauth.commit(store_path, store, top=())  # its login only
+        oauth.commit(store_path, store, top=("lane",))
+    if not own:
+        mode = "setup"
 
 c = usage(n, acc)
 fig = (f"5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%" if c
@@ -4567,8 +4811,14 @@ if c and age > 600:
     fig += f" ({int(age // 60)} min old)"
 lane = "reserved" if acc.get("reserved") else "NOT reserved: the watch may also use it"
 sys.stderr.write(f"claude-swap run: #{n} {acc.get('label') or '?'} · {acc.get('email') or '-'}"
-                 f" · {fig} · {lane} · {'full login' if own else 'setup-token'}\n")
+                 f" · {fig} · {lane} · {'full login' if mode == 'oauth' else 'setup-token'}\n")
+if moved:
+    sys.stderr.write(f"claude-swap run: the reserved sessions moved from #{moved} to #{n}"
+                     " (the open ones follow within 30 s)\n")
 if own:
+    sys.stderr.write("claude-swap run: claude-swap <n> moves it, with the other reserved"
+                     " sessions, to reserved account n\n")
+if mode == "oauth":
     prof = acc.get("chrome_profile")
     if oauth.chrome_ready(acc):
         sys.stderr.write("claude-swap run: Claude in Chrome drives Chrome profile"
@@ -4600,7 +4850,8 @@ if own:
                    timeout=10)
 else:
     env["CLAUDE_CODE_OAUTH_TOKEN"] = acc["token"]
-env["CLAUDE_SWAP_PINNED"] = str(n)  # the statusline shows this account
+# the statusline shows this account: the lane's, whichever it is by then
+env["CLAUDE_SWAP_PINNED"] = "reserved" if own else str(n)
 os.execvpe("claude", ["claude"] + rest, env)
 PYEOF
   exec python3 -c "$run_py" "$STORE" "$@"
