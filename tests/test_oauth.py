@@ -738,6 +738,31 @@ class Lane(Base):
             got = O["reserved_sessions"](self.base)
         self.assertEqual(got, [(11, "REVIEW", True), (12, None, False)])
 
+    def test_status_says_where_the_reserved_sessions_are(self):
+        self.assertIsNone(O["lane_summary"](self.store, []))
+        self.store["lane"] = {"n": 3, "mode": "setup"}
+        open_ = [(11, "A", True), (12, "B", True), (13, None, False)]
+        n, line = O["lane_summary"](self.store, open_)
+        self.assertEqual(n, 3)
+        self.assertTrue(line.startswith("3 (acc3 / a3@x.io) — setup-token, no Claude in Chrome"))
+        self.assertIn("2 open sessions on it (1 more on a token of their own", line)
+        self.assertIn("the watch does not move them", line)
+        self.store["lane_rotate"] = ["a2@x.io", "A3@x.io"]
+        self.assertIn("the watch moves them among #2, #3", O["lane_summary"](self.store, [])[1])
+        self.store["lane"]["n"] = 2
+        self.store["lane_rotate"] = ["a1@x.io", "a3@x.io"]
+        self.store["accounts"][0]["reserved"] = True
+        line = O["lane_summary"](self.store, [(11, "A", True)])[1]
+        self.assertIn("1 open session on it ·", line)
+        self.assertIn("outside the watch's list (#1, #3): they stay here until claude-swap <n>", line)
+
+    def test_status_shows_no_lane_on_an_account_no_longer_reserved(self):
+        self.store["lane"] = {"n": 3, "mode": "oauth"}
+        self.acc["reserved"] = False
+        self.assertIsNone(O["lane_summary"](self.store, []))
+        self.acc["reserved"], self.acc["disabled"] = True, True
+        self.assertIsNone(O["lane_summary"](self.store, []))
+
 
 class Orgs(unittest.TestCase):
     """Which claude.ai org an account's plan and usage come from."""

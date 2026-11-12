@@ -432,6 +432,11 @@ such an account **reserved** (`claude-swap add --reserved`, or
   move by hand is kept until that account reaches its limit). Keep apart
   the seats of one Team that belong to one person: alternating them to
   stretch the limits is not what they are for. `off` stops it;
+- `claude-swap status` says where they are, from any terminal, in a
+  `Reserved sessions:` line under `Active:` (the account, how it is signed
+  in, how many open sessions follow it, and whether the watch moves them),
+  and the account lists mark that account with `▸`, as `*` marks the
+  shared login;
 - inside such a session, `claude-swap status` starts with a `This session:`
   line naming the account it is on and how it is signed in, and the status
   line shows that account with a lock.

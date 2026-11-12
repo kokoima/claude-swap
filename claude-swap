@@ -20,7 +20,7 @@
 
 set -e
 
-VERSION="1.16.1"
+VERSION="1.16.2"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -1537,6 +1537,36 @@ def reserved_sessions(base=None):
             name = None
         found.append((int(pid), name, bool(cfg) and os.path.realpath(cfg) == lane))
     return found
+
+def lane_summary(store, sessions=None):
+    """Where the reserved sessions are, for status: (n, line), or None while
+    the lane is on no reserved account."""
+    n = lane_of(store)
+    if not n:
+        return None
+    accounts = store.get("accounts", [])
+    a = accounts[n - 1]
+    if (store.get("lane") or {}).get("mode") == "oauth":
+        how = "full login, " + ("Claude in Chrome ready" if chrome_ready(a)
+                                else "no Chrome profile has its extension signed in")
+    else:
+        how = "setup-token, no Claude in Chrome"
+    found = reserved_sessions() if sessions is None else sessions
+    follow = sum(1 for s in found if s[2])
+    pinned = len(found) - follow
+    parts = [how, f"{follow} open session{'' if follow == 1 else 's'} on it"
+             + (f" ({pinned} more on a token of their own, which do not move)" if pinned else "")]
+    want = [e.lower() for e in store.get("lane_rotate") or []]
+    rot = [i for i, x in enumerate(accounts, 1)
+           if (x.get("email") or "").lower() in want and x.get("reserved")]
+    pool = ", ".join(f"#{i}" for i in rot)
+    if len(rot) < 2:
+        parts.append("the watch does not move them (claude-swap watch reserved <n...>)")
+    elif n in rot:
+        parts.append(f"the watch moves them among {pool}")
+    else:
+        parts.append(f"outside the watch's list ({pool}): they stay here until claude-swap <n>")
+    return n, f"{n} ({a.get('label', '?')} / {a.get('email') or '-'}) — " + " · ".join(parts)
 PYEOF
 export CLAUDE_SWAP_OAUTH="$OAUTH_PY"
 
@@ -1846,6 +1876,12 @@ if 1 <= active <= len(accounts):
 else:
     print(f"Active: none")
 
+# the reserved sessions (claude-swap run) are on an account of their own
+lane_sum = oauth.lane_summary(store) if is_macos else None
+lane_n = lane_sum[0] if lane_sum else None
+if lane_sum:
+    print(f"Reserved sessions: {lane_sum[1]}")
+
 # Watcher
 wpid_path = os.path.expanduser("~/.claude/claude-swap-watch.pid")
 wstate_path = os.path.expanduser("~/.claude/claude-swap-watch.state")
@@ -1925,7 +1961,7 @@ nw = len(str(len(accounts)))
 print(f"  {'#':>{nw + 1}}  {'Label':<20} {'Email':<30} {'Plan':<20} Token")
 for i, acc in enumerate(accounts):
     n = i + 1
-    marker = "*" if n == active else " "
+    marker = "*" if n == active else "▸" if n == lane_n else " "
     label = acc.get("label", "")[:20]
     email = (acc.get("email") or "-")[:30]
     exp_ms = acc.get("expires", 0)
@@ -1934,6 +1970,8 @@ for i, acc in enumerate(accounts):
     else:
         exp_dt = "EXPIRED"
     print(f"  {marker}{n:>{nw}}  {label:<20} {email:<30} {plan_next(acc):<20} {exp_dt}")
+if lane_n:
+    print(f"  * Active (the shared login, cl) · ▸ reserved sessions (clt)")
 PYEOF
 }
 
@@ -1961,6 +1999,7 @@ with open(store_path) as f:
 
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
+lane_n = oauth.lane_of(store)
 local_tz = datetime.now().astimezone().tzinfo
 store_dirty = [False]
 
@@ -2436,7 +2475,7 @@ print(paint(BOLD, header) + "│" + paint(BOLD, cal_header))
 print("─" * split + "┼" + "─" * (NCAL * CW))
 
 def render_row(row):
-    marker = "*" if row["n"] == active else " "
+    marker = "*" if row["n"] == active else "▸" if row["n"] == lane_n else " "
     num = pad(f"{marker}{row['n']}", W_N, right=True)
     name = trunc(row["label"], W_LB)
 
@@ -2476,7 +2515,8 @@ for row in results:
     print(render_row(row))
 
 print()
-print("  calendar: " + paint(YELLOW, "7d") + " reset time · "
+print("  " + ("* Active · ▸ reserved sessions   │   " if lane_n else "")
+      + "calendar: " + paint(YELLOW, "7d") + " reset time · "
       + paint(MAG, "Fable") + " when it falls on a different day · "
       + paint(CYAN, "↓") + " downgrade · " + paint(RED, "✕") + " plan ends"
       + paint(GREY, " ───") + " no plan (" + paint(GREY, "─22:00─")
