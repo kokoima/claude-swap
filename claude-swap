@@ -21,7 +21,7 @@
 
 set -e
 
-VERSION="1.16.2"
+VERSION="1.17.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself

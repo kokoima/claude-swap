@@ -178,16 +178,16 @@ See [watch mode](#watch-mode--automatic-switching) below.
 ```bash
 claude-swap            # interactive menu (see shortcuts below)
 claude-swap 2          # switch to account 2
-claude-swap auto       # switch to the best account (general strategy)
-claude-swap af         # switch to the best account for Fable
+claude-swap auto       # switch to the best account
+claude-swap model      # the model the sessions use (default fable): its weekly limit counts too
 claude-swap check      # dashboard without switching
-claude-swap reset 3    # spend account 3's free limit reset (asks first)
+claude-swap reset 3    # spend one of account 3's free resets (full or fable; asks first)
 claude-swap auth all   # full logins for Claude in Chrome (once per account, ~monthly)
 ```
 
 Interactive menu shortcuts: a number switches account, `a` = auto,
-`af` = auto fable, `wg` = start watcher, `wr` = start watcher with
-`--auto-reset`, `wf` = start watcher (fable), `wp` = stop watcher,
+`af` = auto with `model fable`, `wg` = start watcher, `wr` = start watcher
+with `--auto-reset`, `wf` = start watcher with `model fable`, `wp` = stop watcher,
 `ws` = watcher status, Enter = exit.
 
 ## Reading the dashboard
@@ -217,12 +217,16 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
   window. An account unused for five hours has no 5h window running and
   shows `0%` with no reset time.
 - **reset** — exact time the 5h window resets (`+HH:MM` = tomorrow).
-- **Rst** — free limit resets left on the account (green). `0` = all
-  spent, `-` = the plan is not offered any, `?` = unknown because the
-  account has no working sessionKey. When any account holds one, a
-  `Free limit resets:` line lists them and when they lapse (yellow under
-  72 h, red under 24 h) — the plan's end date when that comes first,
-  marked `— plan ends`. See [free limit resets](#free-limit-resets).
+- **Rst** — free resets left, `full·model` (`1·2` = one full reset and
+  two of a model, green when one is there). `-` = the plan is not offered
+  any, `?` = unknown because the account has no working sessionKey. When
+  any account holds one, a `Full resets:` line and one line per model
+  (`Fable resets:`) list them and when they lapse (yellow under 72 h,
+  red under 24 h) — the plan's end date when that comes first, marked
+  `— plan ends`. See [free limit resets](#free-limit-resets).
+- **Model column** — the weekly limit of a model, by the name claude.ai
+  gives it (`Fable`), marked `*` when it is the model the sessions use
+  (`claude-swap model`). `?` = no working sessionKey.
 - **Calendar** — 8 days starting today; each cell shows the time the
   **7d** limit renews (yellow), and the **Fable** renewal in magenta when
   it falls on a different day. A cancelled plan shows `✕HH:MM` in red on
@@ -233,8 +237,8 @@ Interactive menu shortcuts: a number switches account, `a` = auto,
   a downgrade, which beats a renewal.
 - **Watcher order** — the same rows in the order the watcher (and
   `auto`) consumes them, each with the reason: when its quota is lost
-  (`renews …` or `plan ends …`), `last day`, `holds a reset`, `little
-  room`, or `blocked until …` for accounts at their limit, which come
+  (`renews …` or `plan ends …`), `last day`, `holds a full reset`,
+  `holds a Fable reset`, `little room`, or `blocked until …` for accounts at their limit, which come
   last. The `Now:` line says what the general strategy would do right
   now. See [watch mode](#watch-mode--automatic-switching).
 
@@ -279,14 +283,17 @@ the same decision engine `auto` and `check` use:
   minute. Zero tokens: only an account without a working cookie falls
   back to a ~5-token Haiku call, and free-plan accounts are not probed.
 
-With `--auto-reset` it also spends **free limit resets** on its own: as
-soon as an account holding one reaches the leave level (98%) of its 7d
-window — unless that week renews within 24 h anyway, in which case it
-waits (and spends it only if the reset would lapse first). It re-reads
-the usage afterwards, spends at most one per account every 6 h, and
-stops trying on an account whose week did not empty until the next
-`watch start`. Every spend is logged and notified. Without the flag it
-only reminds you, 72 h and 24 h before an unspent reset lapses.
+With `--auto-reset` it also spends **free limit resets** on its own, each
+on what it empties (see [model limits and reset kinds](#model-limits-and-reset-kinds)):
+a full reset when an account's week reaches the leave level, a model
+reset when the model the sessions use runs out with at least 25% of the
+week left — and never when the window renews within 24 h anyway (unless
+the reset would lapse first). It spends one concrete grant, re-reads the
+usage afterwards (twice if claude.ai is slow to show it), tries a kind
+at most once per account every 6 h, and stops trying a kind that did
+not do what it should on that account until the next `watch start`.
+Every spend is logged, notified and shown by `watch status`. Without
+the flag it only reminds you, 72 h and 24 h before an unspent reset lapses.
 
 The leave level is a setting: write it to `~/.claude/claude-swap-leave`
 (or set `CLAUDE_SWAP_LEAVE`, which wins over the file) and restart the
@@ -304,8 +311,32 @@ claude-swap watch stop && claude-swap watch start --auto-reset
 The other thresholds are constants at the top of the script (`ROOM_5H`,
 `ROOM_7D`, `LAST_DAY`, `MIN_DWELL`…).
 
-`watch start fable` keeps the previous Fable strategy: leave at 99% of
-5h, 7d or Fable, pick the soonest Fable renewal, pre-warn at 95%.
+### Model limits and reset kinds
+
+Besides the 5h and the week, claude.ai has a weekly limit per model
+(today, **Fable**). It sits inside the week: what the model spends counts
+on both. `claude-swap model [name]` says which model the sessions use
+(default `fable`); its limit then counts like the 5h and the week: the
+watcher leaves an account when it runs out and only moves to accounts
+with room on it. `claude-swap model opus` makes no model limit count
+(Opus has none of its own). The watcher reads the setting on every look.
+
+Free resets come in two kinds, told apart by what they clear:
+
+- **full** — empties the week and every model's week (on Team seats,
+  the 5h too). Spent when the week runs out, or when the model runs out
+  and no model reset helps while the week is at least 75% used.
+- **model** (e.g. Fable) — empties that model's week and gives back the
+  part of the week it had spent. Spent when the model runs out with at
+  least 25% of the week left, or on a spent week if that model had used
+  at least 25% of it.
+
+Reserved seats spend theirs only when every seat the watcher moves the
+reserved sessions among is at its limit (and, for a 5h block, not when
+the first seat frees within 30 minutes).
+
+`watch start fable`, `auto fable`, `af` and `wf` now set `model fable`
+and use the general strategy; the old Fable-only strategy is gone.
 
 On Linux there are no notifications — everything still lands in the log.
 
@@ -317,12 +348,12 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap <n>` | Switch to account N |
 | `claude-swap status` | Current account + watcher state |
 | `claude-swap check` | Full dashboard (limits, calendar, watcher order) |
-| `claude-swap auto [fable\|general]` | Auto-switch to the best available account |
-| `claude-swap af` | Alias for `auto fable` |
-| `claude-swap watch start [general\|fable] [--auto-reset]` | Background auto-switcher (LaunchAgent on macOS) — see watch mode |
+| `claude-swap auto` | Auto-switch to the best available account |
+| `claude-swap model [name]` | The model the sessions use (default `fable`): its weekly limit counts like the 5h and the week |
+| `claude-swap watch start [--auto-reset]` | Background auto-switcher (LaunchAgent on macOS) — see watch mode |
 | `claude-swap watch stop` | Stop the watcher |
 | `claude-swap watch status` | Watcher state + last probe + log tail |
-| `claude-swap reset <n> [--yes]` | Spend account N's free limit reset (shows what it clears, asks for `yes` unless `--yes`) |
+| `claude-swap reset <n> [full\|fable] [--grant <id>] [--yes]` | Spend one of account N's free resets, by kind (default: what helps now); shows what it clears, asks for `yes` unless `--yes` |
 | `claude-swap add [--reserved]` | Add a new account (`--reserved`: see Reserved accounts) |
 | `claude-swap remove <n>` | Remove an account |
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
@@ -511,8 +542,9 @@ first. Anthropic's help page: [What is a limit reset?](https://support.claude.co
 
 - claude.ai only fills the `cedar_ember` block of the usage reply when
   asked with `cedar_ember=1`; that is how `check` and the watcher read it.
-- `claude-swap reset <n>` re-reads that block, shows the grant, what it
-  clears and when the 7d window would renew anyway, warns when a reset
+- `claude-swap reset <n> [full|fable]` re-reads that block, picks the
+  grant of that kind that lapses first (by default the kind that helps
+  now), shows it, what it clears and when the window would renew anyway, warns when a reset
   would buy little (7d renewing within 48 h, or the account far from its
   limits) and, after you type `yes`, posts
   `{"program": "cedar_ember", "grant_id": …, "request_id": …}` to
