@@ -707,6 +707,124 @@ def _grant_model(g, clears, models):
     used = [v for k, v in (g.get("percent_used") or {}).items() if k in own]
     hits = [name for name, m in models.items() if m.get("pct") in used]
     return hits[0] if len(hits) == 1 else None
+
+
+# --- What the Console (platform.claude.com) says about API credits ---
+# A Console login sees one or more API organizations. Each holds credit in
+# tranches: "scoped" ones are the plans' included monthly credit (API,
+# Agent SDK and `claude -p` with a key of that org — not interactive Claude
+# Code), "unscoped" ones are bought (or free) credit, good for everything.
+
+CREDIT_SOON = 7 * 86400     # included credit lapsing within this: a warning
+CREDIT_URGENT = 72 * 3600   # ...and within this, an urgent one
+
+
+def _usd(cents):
+    return None if cents is None else round(cents / 100, 2)
+
+
+def _pool(tranches, kind, now):
+    mine = [t for t in tranches
+            if ((t.get("scope") or {}).get("kind") or "unscoped") == kind]
+    live = [t for t in mine if (t.get("remaining_amount_minor_units") or 0) > 0
+            and (_iso(t.get("expires_at")) or INF) > now]
+    return mine, {
+        "left": _usd(sum(t.get("remaining_amount_minor_units") or 0 for t in live)),
+        "granted": _usd(sum(t.get("granted_amount_minor_units") or 0 for t in live)),
+        "expires": min((_iso(t.get("expires_at")) for t in live
+                        if _iso(t.get("expires_at"))), default=None),
+        "products": sorted({a.get("product") for t in live
+                            for a in (t.get("scope") or {}).get("applies_to") or []
+                            if a.get("product")})}
+
+
+def console_summary(account, orgs, per_org, now):
+    """One summary per API organization of a Console login.
+
+    account and orgs are the /api/account and /api/organizations replies;
+    per_org maps an org uuid to {"credits", "spend", "limits", "link",
+    "keys"}, each the reply, or the HTTP status when it failed (403 on
+    credits = no billing permission there). Amounts in USD, times epoch.
+    """
+    roles = {(m.get("organization") or {}).get("uuid"): m.get("role")
+             for m in (account or {}).get("memberships") or []}
+    out = []
+    for o in orgs or []:
+        if "api" not in (o.get("capabilities") or []):
+            continue
+        u = o.get("uuid")
+        got = per_org.get(u) or {}
+
+        def reply(key):
+            v = got.get(key)
+            return v if isinstance(v, (dict, list)) else None
+
+        s = {"uuid": u, "name": o.get("name") or "", "role": roles.get(u),
+             "tier": o.get("rate_limit_tier"), "disabled": o.get("api_disabled_reason"),
+             "no_permission": got.get("credits") == 403, "included": None,
+             "purchased": None, "link": None, "spend": None, "cap": None, "keys": None}
+        c = reply("credits")
+        if isinstance(c, dict):
+            tranches = (c.get("tranches") or []) + (c.get("promo_tranches") or [])
+            _, s["included"] = _pool(tranches, "scoped", now)
+            bought, s["purchased"] = _pool(tranches, "unscoped", now)
+            if not bought:
+                s["purchased"]["left"] = _usd(c.get("amount_without_scoped_credits")) or 0.0
+        if isinstance(reply("spend"), dict):
+            s["spend"] = _usd(reply("spend").get("amount"))
+        if isinstance(reply("limits"), dict):
+            s["cap"] = _usd(reply("limits").get("enforced_limit_usd"))
+        ln = reply("link")
+        if isinstance(ln, dict):
+            s["link"] = {"status": ln.get("status"), "plan": ln.get("plan"),
+                         "monthly": _usd(ln.get("monthly_credit_usd_cents")),
+                         "linked_at": _iso((ln.get("link") or {}).get("linked_at")),
+                         "linkable": [p.get("plan") for p in ln.get("linkable_plans") or []
+                                      if p.get("plan")],
+                         "held": ln.get("grants_held_reason")}
+        k = reply("keys")
+        if k is not None:
+            items = k if isinstance(k, list) else (k.get("data") or [])
+            counts = {}
+            for item in items:
+                st = item.get("status") or "?"
+                counts[st] = counts.get(st, 0) + 1
+            s["keys"] = counts
+        out.append(s)
+    return out
+
+
+def credit_warnings(by_tag, now):
+    """[(level, text)] for summaries grouped by a tag such as "#9": included
+    credit about to lapse (red under CREDIT_URGENT, yellow under
+    CREDIT_SOON), most urgent first; then links that wait for something."""
+    import time as _t
+    found = []
+    for tag, summaries in by_tag.items():
+        many = len(summaries) > 1
+        for s in summaries:
+            who = f"{tag} {s.get('name')}" if many and s.get("name") else tag
+            inc, link = s.get("included"), s.get("link") or {}
+            if inc and inc.get("left") and inc.get("expires"):
+                left = inc["expires"] - now
+                if left < CREDIT_SOON:
+                    urgent = left < CREDIT_URGENT
+                    span = f"{int(left // 3600)}h" if left < 86400 else f"{int(left // 86400)}d"
+                    when = _t.strftime("%a %d %b", _t.localtime(inc["expires"]))
+                    found.append((0 if urgent else 1, inc["expires"], "red" if urgent else "yellow",
+                                  f"{who}: {inc['left']:.0f} $ of included API credit lapse"
+                                  f" {when} (in {span})"))
+            if link.get("status") == "linked" and not (inc and inc.get("left")):
+                found.append((2, INF, "yellow",
+                              f"{who}: linked ({link.get('plan') or '?'}), no included credit yet"))
+            if link.get("status") == "eligible":
+                plans = ", ".join(link.get("linkable") or []) or "?"
+                found.append((2, INF, "yellow", f"{who}: can be linked ({plans})"
+                              + (f", +{link['monthly']:.0f} $/month" if link.get("monthly") else "")))
+            if s.get("disabled") and link.get("status") == "linked":
+                found.append((3, INF, "grey", f"{who}: API disabled ({s['disabled']})"))
+    found.sort(key=lambda x: (x[0], x[1], x[3]))
+    return [(level, text) for _, _, level, text in found]
 PYEOF
 export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
