@@ -5012,8 +5012,11 @@ def spend_reset(n, store, rows, grant, mem, model):
     cmd = [self_bin, "reset", str(n), kind]
     if grant.get("id"):
         cmd += ["--grant", str(grant["id"])]
-    ok = run_logged(cmd + ["--yes"])
+    # the retry mark goes to disk BEFORE the irreversible spend: a kill
+    # during the spend or the 60 s check must not allow a second reset
     mem.setdefault("reset_tried", {})[key] = time.time()
+    save_state()
+    ok = run_logged(cmd + ["--yes"])
     worked, after = False, None
 
     def verify():
