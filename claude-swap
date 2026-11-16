@@ -746,8 +746,10 @@ def console_summary(account, orgs, per_org, now):
 
     account and orgs are the /api/account and /api/organizations replies;
     per_org maps an org uuid to {"credits", "spend", "limits", "link",
-    "keys"}, each the reply, or the HTTP status when it failed (403 on
-    credits = no billing permission there). Amounts in USD, times epoch.
+    "keys"}, each the reply, or the HTTP status when it failed (the API's
+    403 on credits = no billing permission there; Console.read_org keeps a
+    failure without JSON, the edge's, as 0: unknown). Amounts in USD, times
+    epoch. included["any"]: a scoped tranche still in date, even if spent.
     """
     roles = {(m.get("organization") or {}).get("uuid"): m.get("role")
              for m in (account or {}).get("memberships") or []}
@@ -944,6 +946,10 @@ def slot(acc):
     """An account's vault entry, by email so that removing one shifts none."""
     return "oauth:" + (acc.get("email") or "").strip().lower()
 
+def console_slot(email):
+    """The vault entry of an account's Console session (keys-sync saves it)."""
+    return "console:" + (email or "").lower()
+
 def setup_login(acc):
     return {"accessToken": acc["token"], "refreshToken": "",
             "expiresAt": acc.get("expires", 0), "scopes": SETUP_SCOPES,
@@ -1056,10 +1062,25 @@ CONSOLE = "https://platform.claude.com"
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
+def console_failure(st, body):
+    """What a failed GET /api/account says, from its status and its body
+    (None when it was not JSON): "rejected" — the API's own answer (a JSON
+    401/403, or a 200 with no email): that session is dead, log it back in;
+    "refused" — a 429, or a 403 the edge sent without JSON: the client is
+    being turned away, and two in a row stop a run; "silent" — no answer, or
+    the server is down."""
+    if st == 429 or (st == 403 and body is None):
+        return "refused"
+    if not st or st >= 500:
+        return "silent"
+    return "rejected"
+
 class Console:
     """GET-only client for the Console (platform.claude.com) on a session
     cookie. Requests are spaced across every instance (claude.com throttles
-    bursts), and a Cloudflare challenge blocks it: later gets answer (0, None)."""
+    bursts), and a Cloudflare challenge (an HTML page, even with a 200)
+    blocks it: later gets answer (0, None). A failed get's body is None
+    when the reply was not JSON (the edge, not the API, answered)."""
     GAP = 1.6
     _last = [0.0]
 
@@ -1086,7 +1107,14 @@ class Console:
         try:
             with self._open(req, timeout=20) as r:
                 raw = r.read()
-                return r.status, (json.loads(raw) if raw else None)
+                try:
+                    return r.status, (json.loads(raw) if raw else None)
+                except ValueError:
+                    # an HTML page is never the API's answer, even with a 200
+                    if b"Just a moment" in raw or raw.lstrip()[:1] == b"<":
+                        self.blocked = True
+                        return r.status, None
+                    raise
         except urllib.error.HTTPError as e:
             try:
                 raw = e.read() or b""
@@ -1104,7 +1132,9 @@ class Console:
 
     def read_org(self, uuid):
         """The billing replies of one API org, {key: reply or HTTP status};
-        it stops after a 403 on credits (no billing permission there)."""
+        it stops after the API's 403 on credits (no billing permission
+        there). A failure that did not come with JSON is the edge, not the
+        API: it is kept as 0 (unknown), so a 403 always means the API's."""
         out = {}
         for key, path in (("credits", f"/api/organizations/{uuid}/prepaid/credits"),
                           ("spend", f"/api/organizations/{uuid}/current_spend"),
@@ -1113,8 +1143,8 @@ class Console:
                                    "/link-state?include_linkable_plans=true"),
                           ("keys", f"/api/console/organizations/{uuid}/api_keys")):
             st, body = self.get(path, uuid)
-            out[key] = body if st == 200 and body is not None else st
-            if self.blocked or (key == "credits" and st == 403):
+            out[key] = body if st == 200 and body is not None else (st if body is not None else 0)
+            if self.blocked or (key == "credits" and out[key] == 403):
                 break
         return out
 
@@ -3939,7 +3969,7 @@ for i, acc in enumerate(accounts):
     if acc.get("disabled") or em not in console_seen:
         continue
     ck, prof = console_seen[em]
-    slot = f"console:{em}"
+    slot = oauth.console_slot(em)
     wrote = False
     if secrets.read(oauth.VAULT, slot) != ck:
         if not secrets.write(oauth.VAULT, ck, slot):
@@ -4010,7 +4040,7 @@ else:
     no_console, console_stale = [], []
     for i, acc in live:
         em = (acc.get("email") or "").lower()
-        if not secrets.read(oauth.VAULT, f"console:{em}"):
+        if not secrets.read(oauth.VAULT, oauth.console_slot(em)):
             no_console.append(f"{i+1}{_console_where(acc)}")
         elif em not in console_ok:
             # like a claude.ai key nobody re-confirmed: kept, perhaps dead
@@ -5610,47 +5640,6 @@ def http(st):
 
 secrets = oauth.default_io()[0]
 now = time.time()
-results, missing, rejected, silent = {}, [], [], []
-stop, refused = None, []  # refused: the latest accounts in a row turned away with 403/429
-for i, acc in enumerate(accounts, 1):
-    # a disabled account only when asked for by number (it is a read)
-    if (only and i != int(only)) or (not only and acc.get("disabled")):
-        continue
-    em = (acc.get("email") or "").lower()
-    ck = secrets.read(oauth.VAULT, f"console:{em}") if em else None
-    if not ck:
-        missing.append(i)
-        continue
-    c = oauth.Console(ck)
-    st, acct = c.get("/api/account")
-    if c.blocked:
-        stop = f"Cloudflare is challenging the Console: stopped at #{i}."
-        break
-    if st != 200 or not (acct or {}).get("email_address"):
-        # no answer, throttled or down is not a dead session
-        (silent if st in (0, 429) or st >= 500 else rejected).append((i, st))
-        refused = refused + [(i, st)] if st in (403, 429) else []
-        if len(refused) >= 2:
-            (a, sa), (b, sb) = refused[-2:]
-            stop = f"The Console turned away #{a} and #{b} in a row ({http(sa)}, {http(sb)}): stopped."
-            break
-        continue
-    refused = []
-    st, orgs = c.get("/api/organizations")
-    org_err = None if st == 200 and isinstance(orgs, list) else st
-    orgs = orgs if org_err is None else []
-    per = {o["uuid"]: c.read_org(o["uuid"]) for o in orgs
-           if "api" in (o.get("capabilities") or []) and o.get("uuid")}
-    if c.blocked:
-        # this account was read only in part (a blocked reply would even pass
-        # for "no billing permission"): it is left out, and so are the rest
-        stop = f"Cloudflare is challenging the Console: stopped at #{i}."
-        break
-    results[em] = (i, acc.get("label") or em, engine.console_summary(acct, orgs, per, now), org_err)
-    sys.stderr.write(f"  read {i} {acc.get('label') or em}\n")
-
-if stop:
-    print(paint(RED, stop + " Try again later (the cache keeps its last full read)."))
 
 # Widths fit the cells, measured without ANSI, so every row lines up whatever
 # the amounts; a row cut short (no permission, no API org) ends in a message
@@ -5661,15 +5650,15 @@ TIER = {"auto_trust_tier_a": "a", "auto_trust_tier_b": "b", "auto_trust_tier_c":
 head = ["#", "Account", "Org", "Link", "Included", "Purchased", "Month", "Tier", "Keys"]
 RIGHT = (0, 8)
 UNKNOWN = paint(GREY, "?")
-rows = []
-for em, (i, label, summaries, org_err) in sorted(results.items(), key=lambda kv: kv[1][0]):
+
+def account_rows(i, label, summaries, org_err):
+    """The table rows of one account."""
     lead = [str(i), trunc(label, 22)]
     if org_err is not None:
-        rows.append(lead + [paint(GREY, f"could not read organizations ({http(org_err)})")])
-        continue
+        return [lead + [paint(GREY, f"could not read organizations ({http(org_err)})")]]
     if not summaries:
-        rows.append(lead + [paint(GREY, "no API organization")])
-        continue
+        return [lead + [paint(GREY, "no API organization")]]
+    rows = []
     for s in summaries:
         name = trunc(s["name"] or "", 24)
         if s["no_permission"]:
@@ -5680,7 +5669,7 @@ for em, (i, label, summaries, org_err) in sorted(results.items(), key=lambda kv:
                 "eligible": paint(YELLOW, "eligible"), "ineligible": "ineligible"}.get(
                     ln.get("status"), "—")
         inc = s["included"]
-        if inc is None:  # the credits read failed (a 403 is no_permission, above)
+        if inc is None:  # the credits read failed (the API's 403 is no_permission, above)
             inc_txt = pur_txt = UNKNOWN
         else:
             if not inc.get("left"):
@@ -5701,6 +5690,67 @@ for em, (i, label, summaries, org_err) in sorted(results.items(), key=lambda kv:
         t = s["tier"] or ""
         tier = TIER.get(t) or t.rsplit("_", 1)[-1] or "?"
         rows.append(lead + [name, link, inc_txt, pur_txt, month, tier, keys])
+    return rows
+
+# results: email -> (n, its table rows, its summaries, why its organizations
+# are unknown, or None); turned: the accounts the Console turned away
+results, missing, rejected, silent, turned = {}, [], [], [], []
+stop, refused = None, []  # refused: the latest accounts in a row turned away
+for i, acc in enumerate(accounts, 1):
+    # a disabled account only when asked for by number (it is a read)
+    if (only and i != int(only)) or (not only and acc.get("disabled")):
+        continue
+    em = (acc.get("email") or "").lower()
+    ck = secrets.read(oauth.VAULT, oauth.console_slot(em)) if em else None
+    if not ck:
+        missing.append(i)
+        continue
+    label = acc.get("label") or em
+    c = oauth.Console(ck)
+    try:
+        st, acct = c.get("/api/account")
+        if c.blocked:
+            stop = f"Cloudflare is challenging the Console: stopped at #{i}."
+            break
+        if st == 200 and not isinstance(acct, dict):
+            raise ValueError("/api/account: not an object")
+        if st != 200 or not acct.get("email_address"):
+            # the API rejecting this session is not the edge turning the
+            # client away: only the latter, twice in a row, stops the run
+            kind = oauth.console_failure(st, acct)
+            {"rejected": rejected, "refused": turned, "silent": silent}[kind].append((i, st))
+            refused = refused + [(i, st)] if kind == "refused" else []
+            if len(refused) >= 2:
+                (a, sa), (b, sb) = refused[-2:]
+                stop = f"The Console turned away #{a} and #{b} in a row ({http(sa)}, {http(sb)}): stopped."
+                break
+            continue
+        refused = []
+        st, orgs = c.get("/api/organizations")
+        org_err = None if st == 200 and isinstance(orgs, list) else st
+        orgs = orgs if org_err is None else []
+        per = {o["uuid"]: c.read_org(o["uuid"]) for o in orgs
+               if "api" in (o.get("capabilities") or []) and o.get("uuid")}
+        summ = engine.console_summary(acct, orgs, per, now)
+        # a shape the table or the warnings would choke on fails here, for
+        # this account alone, and never reaches the cache check reads
+        rows_i = account_rows(i, label, summ, org_err)
+        engine.credit_warnings({f"#{i}": summ}, now)
+    except Exception:
+        summ, org_err = [], "unexpected"
+        rows_i = [[str(i), trunc(label, 22), paint(GREY, "unexpected reply")]]
+    if c.blocked:
+        # this account was read only in part (a blocked reply would even pass
+        # for "no billing permission"): it is left out, and so are the rest
+        stop = f"Cloudflare is challenging the Console: stopped at #{i}."
+        break
+    results[em] = (i, rows_i, summ, org_err)
+    sys.stderr.write(f"  read {i} {label}\n")
+
+if stop:
+    print(paint(RED, stop + " Try again later (the cache keeps its last full read)."))
+
+rows = [r for _, rows_i, _, _ in sorted(results.values(), key=lambda v: v[0]) for r in rows_i]
 
 def vlen(s):
     return len(_ANSI.sub("", s))
@@ -5744,13 +5794,17 @@ if rejected:
     print(paint(GREY, "  Console session rejected: "
                 + ", ".join(f"#{i} ({http(st)})" for i, st in rejected)
                 + " — log it back in, then claude-swap keys-sync"))
+if turned:
+    print(paint(GREY, "  Console turned the request away: "
+                + ", ".join(f"#{i} ({http(st)})" for i, st in turned) + " — try again later"))
 if silent:
     print(paint(GREY, "  Console did not answer: "
                 + ", ".join(f"#{i} ({http(st)})" for i, st in silent) + " — try again later"))
 
 # Only a full run rewrites the cache: one account (credits <n>) or a run cut
 # short would leave check without the others' warnings. An account whose
-# organizations could not be read is unknown, not empty: it stays out.
+# organizations could not be read, or that answered in a shape not expected,
+# is unknown, not empty: it stays out.
 if results and not only and not stop:
     path = os.path.expanduser("~/.claude/claude-swap-credits.json")
     tmp = path + ".tmp"
@@ -6026,10 +6080,13 @@ for k in ('n', 'from'):  # account numbers after the removed one move down
         live[k] = None
     elif (live.get(k) or 0) > target:
         live[k] -= 1
-if gone.get('oauth') and gone.get('email'):  # its saved full login goes too
+if gone.get('email'):  # its saved full login and its Console session go too
     oauth = types.ModuleType('oauth')
     exec(os.environ['CLAUDE_SWAP_OAUTH'], oauth.__dict__)
-    oauth.default_io()[0].delete(oauth.VAULT, oauth.slot(gone))
+    secrets = oauth.default_io()[0]
+    if gone.get('oauth'):
+        secrets.delete(oauth.VAULT, oauth.slot(gone))
+    secrets.delete(oauth.VAULT, oauth.console_slot(gone['email']))
 active = d.get('active', 0)
 if active == target:
     d['active'] = 1 if d['accounts'] else 0

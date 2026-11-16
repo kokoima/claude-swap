@@ -181,7 +181,7 @@ class Warnings(unittest.TestCase):
 
 class FakeResp(io.BytesIO):
     def __init__(self, status, body):
-        super().__init__(json.dumps(body).encode())
+        super().__init__(body if isinstance(body, bytes) else json.dumps(body).encode())
         self.status = status
     def __enter__(self):
         return self
@@ -224,6 +224,38 @@ class Client(unittest.TestCase):
         self.assertEqual(c.get("/api/organizations"), (0, None))
         self.assertEqual(len(calls), 1)
 
+    def test_html_with_200_blocks_every_later_call(self):
+        for page in (b"<!DOCTYPE html><html><title>Just a moment...</title></html>",
+                     b"  <html><body>Checking your browser</body></html>",
+                     b"Just a moment..."):
+            c, calls = self.client([(200, page)])
+            self.assertEqual(c.get("/api/account"), (200, None))
+            self.assertTrue(c.blocked, page)
+            self.assertEqual(c.get("/api/organizations"), (0, None))
+            self.assertEqual(len(calls), 1)
+
+    def test_json_that_mentions_the_challenge_text_is_not_a_block(self):
+        c, calls = self.client([(200, [{"name": "Just a moment", "status": "active"}])])
+        self.assertEqual(c.get("/api/x"), (200, [{"name": "Just a moment", "status": "active"}]))
+        self.assertFalse(c.blocked)
+
+    def test_unreadable_200_is_no_answer_not_a_block(self):
+        c, calls = self.client([(200, b"not json")])
+        self.assertEqual(c.get("/api/account"), (0, None))
+        self.assertFalse(c.blocked)
+
+    def test_read_org_non_json_403_on_credits_is_unknown_not_no_permission(self):
+        waf = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b"<html>Access denied</html>"))
+        c, calls = self.client([waf, (200, {"amount": 2}), (200, {"enforced_limit_usd": 3}),
+                                (200, {"status": "linked"}), (200, [{"status": "active"}])])
+        got = c.read_org("o1")
+        self.assertFalse(c.blocked)
+        self.assertEqual(len(calls), 5)  # it does not stop there
+        self.assertNotEqual(got["credits"], 403)
+        s = E["console_summary"](ACCOUNT, ORGS, {"api-org": got}, NOW)[0]
+        self.assertFalse(s["no_permission"])
+        self.assertIsNone(s["included"])  # shown as ?, never as 0
+
     def test_read_org_stops_at_no_billing_permission(self):
         denied = urllib.error.HTTPError("u", 403, "Forbidden", {},
                                         io.BytesIO(b'{"error": {"type": "permission_error"}}'))
@@ -237,3 +269,34 @@ class Client(unittest.TestCase):
         got = c.read_org("o1")
         self.assertEqual(sorted(got), ["credits", "keys", "limits", "link", "spend"])
         self.assertTrue(all(cl[0] == "GET" for cl in calls))
+
+
+class AccountFailure(unittest.TestCase):
+    """A failed /api/account: the API rejecting one session (its JSON 401/403),
+    the edge turning the client away (a 429, or a 403 without JSON: two in a
+    row stop a run), or no answer at all."""
+    def kind(self, st, body):
+        return O["console_failure"](st, body)
+
+    def test_json_401_403_is_that_session_rejected(self):
+        err = {"type": "error", "error": {"type": "permission_error"}}
+        self.assertEqual(self.kind(403, err), "rejected")
+        self.assertEqual(self.kind(401, err), "rejected")
+        self.assertEqual(self.kind(401, None), "rejected")
+        self.assertEqual(self.kind(200, {}), "rejected")  # anonymous: no email
+
+    def test_429_or_403_without_json_is_the_client_turned_away(self):
+        self.assertEqual(self.kind(429, None), "refused")
+        self.assertEqual(self.kind(429, {"error": {}}), "refused")
+        self.assertEqual(self.kind(403, None), "refused")
+
+    def test_no_answer_or_down_is_silent(self):
+        self.assertEqual(self.kind(0, None), "silent")
+        self.assertEqual(self.kind(502, None), "silent")
+        self.assertEqual(self.kind(500, {"error": {}}), "silent")
+
+
+class Slot(unittest.TestCase):
+    def test_console_session_entry_is_by_lowercase_email(self):
+        # keys-sync writes it, credits reads it and remove deletes it: one name
+        self.assertEqual(O["console_slot"]("Someone@Example.COM"), "console:someone@example.com")
