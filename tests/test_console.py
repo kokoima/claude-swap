@@ -106,6 +106,15 @@ class Warnings(unittest.TestCase):
         self.assertIn("#9", warn({"#9": [self.inc(200.0, 2 * D)]})[0][1])
         self.assertIn("200", warn({"#9": [self.inc(200.0, 2 * D)]})[0][1])
 
+    def test_amount_with_thousands_separator(self):
+        self.assertIn("1,600,000 $", warn({"#9": [self.inc(1600000.0, 2 * D)]})[0][1])
+
+    def test_unread_credits_are_not_no_credit(self):
+        # included None: the credits read failed, so nothing is known about them
+        s = {"included": None, "link": {"status": "linked", "plan": "max_20x", "monthly": 200.0},
+             "name": "P", "disabled": None}
+        self.assertEqual(warn({"#7": [s]}), [])
+
     def test_most_urgent_first(self):
         w = warn({"#2": [self.inc(200.0, 5 * D)], "#9": [self.inc(200.0, 2 * D)]})
         self.assertEqual([x[0] for x in w], ["red", "yellow"])
