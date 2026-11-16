@@ -1900,17 +1900,20 @@ cmd_help() {
   echo "  claude-swap status       Show current account state"
   echo "  claude-swap check        Status + usage dashboard (all accounts, 0 tokens)"
   echo "  claude-swap auto         Auto-rotate to best available account"
-  echo "  claude-swap af           Alias for 'auto fable'"
+  echo "  claude-swap af           'model fable', then auto (what 'auto fable' was)"
   echo "  claude-swap watch start [--auto-reset]"
-  echo "                           Background auto-switch (general: see below)"
+  echo "                           Background auto-switch (see below)"
   echo "  claude-swap watch stop   Stop the watcher"
   echo "  claude-swap watch status Watcher status + log"
-  echo "  claude-swap reset <n> [full|fable]  Spend one of account N's free resets (asks first; cannot be undone)"
-  echo "  claude-swap model [name]  Model the sessions use (fable, opus…): its weekly limit counts"
-  echo "  claude-swap model fable         (what 'auto fable' and 'watch start fable' did)"
+  echo "  claude-swap reset <n> [full|fable]"
+  echo "                           Spend one of account N's free resets, of that kind (default:"
+  echo "                           the one that helps now); asks first, cannot be undone"
+  echo "  claude-swap model [name] Show or set the model the sessions use (fable, opus...):"
+  echo "                           its own weekly limit counts like the 5h and the week"
+  echo "                           ('model fable' is what 'auto fable' and 'watch start fable' did)"
   echo "  claude-swap add [--reserved]  Add a new account (--reserved: see below)"
   echo "  claude-swap remove <n>   Remove an account"
-  echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/Fable for that account)"
+  echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/model limits for that account)"
   echo "  claude-swap keys-sync    Auto-import sessionKeys from Chrome profiles (by email)"
   echo "  claude-swap auth [n|all] Full login per account, which Claude in Chrome needs"
   echo "  claude-swap chrome [n|all]  Open the Chrome profile of account N (default: active)"
@@ -1933,17 +1936,23 @@ cmd_help() {
   echo "  Accounts with no valid cookie fall back to a billed probe that"
   echo "  reports 5h/7d only, so keep the cookies fresh with keys-sync."
   echo ""
-  echo "  The same request reports free limit resets (the Rst column), which"
-  echo "  Anthropic grants now and then and which empty the 5h and 7d windows."
+  echo "  The same request reports the free limit resets Anthropic grants now"
+  echo "  and then (the Rst column, full·model). A full one empties the week and"
+  echo "  every model's week (the 5h too on Team seats); a model one (Fable's)"
+  echo "  empties that model's week and gives back what it spent of the week."
   echo ""
   echo "  General strategy (auto, watch): consume first the quota that is lost"
   echo "  first — each account's weekly renewal, or its plan end if sooner."
   echo "  Quota dying within a day goes first, then accounts holding a free"
-  echo "  reset, then the rest. The watch leaves an account at 98% of its 5h"
-  echo "  or 7d and goes back to a higher one once it has room again. With"
-  echo "  --auto-reset it spends a free reset as soon as an account's week is"
-  echo "  spent (unless the week renews within a day). On macOS the watch runs"
-  echo "  as a LaunchAgent, so it survives reboots."
+  echo "  reset, then the rest. The watch leaves an account at 98% of its 5h,"
+  echo "  its 7d or the week of the model set with 'claude-swap model', and goes"
+  echo "  back to a higher one once it has room again. With --auto-reset it"
+  echo "  spends a free reset on what blocks an account: a spent week takes the"
+  echo "  full one (unless the week renews within a day), or else a model one"
+  echo "  that gives back at least a quarter of it; a spent model takes its own"
+  echo "  reset while a quarter of the week is left, else the full one. It then"
+  echo "  checks the reset did what its kind does ('watch status' shows the last"
+  echo "  one). On macOS the watch runs as a LaunchAgent, so it survives reboots."
   echo ""
   echo "  To leave at another level, write it to ~/.claude/claude-swap-leave"
   echo "  (or set CLAUDE_SWAP_LEAVE) and restart the watch. 100 uses every"
@@ -4397,7 +4406,8 @@ _fable_alias() {
 }
 
 _watch_args() {
-  # parse [general|fable] [--auto-reset] into WATCH_STRATEGY / WATCH_AUTO_RESET;
+  # parse [--auto-reset] into WATCH_STRATEGY / WATCH_AUTO_RESET (the old
+  # general and fable are still taken: fable sets 'model fable');
   # the first argument is 1 when called from cmd_watch_start, 0 from the daemon
   local from_start="$1"; shift
   WATCH_STRATEGY="general"
@@ -4412,7 +4422,7 @@ _watch_args() {
              # 'claude-swap model <x>'
              if [ "$from_start" = 1 ]; then _fable_alias; fi ;;
       --auto-reset) WATCH_AUTO_RESET=1 ;;
-      *) echo "Usage: claude-swap watch start [general|fable] [--auto-reset]"; exit 1 ;;
+      *) echo "Usage: claude-swap watch start [--auto-reset]   (the model: claude-swap model [name])"; exit 1 ;;
     esac
   done
 }
@@ -5570,7 +5580,7 @@ case "${1:-}" in
       stop) cmd_watch_stop ;;
       status) cmd_watch_status ;;
       reserved) shift 2; cmd_watch_reserved "$@" ;;
-      *) echo "Usage: claude-swap watch [start [general|fable] [--auto-reset]|stop|status|reserved [n ...|off]]"; exit 1 ;;
+      *) echo "Usage: claude-swap watch [start [--auto-reset]|stop|status|reserved [n ...|off]]"; exit 1 ;;
     esac
     ;;
   add)
