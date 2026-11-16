@@ -3715,6 +3715,23 @@ def read_session_key(db):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+def read_console_key(db):
+    """The Console's sessionKey (platform.claude.com) from a Chrome Cookies DB,
+    read like the claude.ai one; sessionKeyV3 only when it is the only one."""
+    tmp = tempfile.mkdtemp()
+    try:
+        shutil.copy(db, os.path.join(tmp, "Cookies"))
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(db + ext):
+                shutil.copy(db + ext, os.path.join(tmp, "Cookies") + ext)
+        cj = browser_cookie3.chrome(domain_name="platform.claude.com",
+                                    cookie_file=os.path.join(tmp, "Cookies"))
+        found = {c.name: c.value for c in cj
+                 if c.domain in (".platform.claude.com", "platform.claude.com")}
+        return found.get("sessionKey") or found.get("sessionKeyV3")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 store_path = sys.argv[1]
 with open(store_path) as f:
     store = json.load(f)
@@ -3757,12 +3774,30 @@ bases = [
 
 print("Scanning Chrome profiles...")
 seen = {}  # email -> (session_key, profile)
+console_seen = {}  # email -> (Console session key, profile)
 profiles = {}  # email -> every profile logged in to it, for Claude in Chrome
 uuids = {}     # email -> account uuid, to find the extension signed in to it
 for base in bases:
     for db in sorted(glob.glob(os.path.join(base, "*", "Cookies"))):
         prof = os.path.basename(os.path.dirname(db))
         try:
+            # the Console first: a profile logged in there but not on claude.ai
+            # still counts, and the claude.ai checks below end in `continue`
+            try:
+                ck = read_console_key(db)
+            except Exception as e:
+                ck = None
+                print(f"  {prof}: Console cookie unreadable ({type(e).__name__})")
+            if ck:
+                st, acct = oauth.Console(ck).get("/api/account")
+                acct = acct if isinstance(acct, dict) else {}
+                cem = (acct.get("email_address") or "").lower() if st == 200 else ""
+                if cem:
+                    console_seen[cem] = (ck, prof)
+                elif st == 200:
+                    print(f"  {prof}: Console session EXPIRED (anonymous) — log platform.claude.com back in there")
+                else:
+                    print(f"  {prof}: Console session not usable (HTTP {st or 'no answer'})")
             sk = read_session_key(db)
             if not sk:
                 continue
@@ -3839,6 +3874,29 @@ for i, acc in enumerate(accounts):
         notes.extend(sync_chrome(acc, profiles[em]))
         print(f"  Account {i+1} ({em}): " + (", ".join(notes) or "up to date"))
 
+# The Console session goes to the keychain only; the store just says where it
+# came from and when. A failed write (over SSH the keychain is locked) leaves
+# that account as it was.
+secrets = oauth.default_io()[0]
+known = {(a.get("email") or "").lower() for a in accounts}
+for i, acc in enumerate(accounts):
+    em = (acc.get("email") or "").lower()
+    if acc.get("disabled") or em not in console_seen:
+        continue
+    ck, prof = console_seen[em]
+    slot = f"console:{em}"
+    if secrets.read(oauth.VAULT, slot) != ck:
+        if not secrets.write(oauth.VAULT, ck, slot):
+            print(f"  Account {i+1} ({em}): could not save the Console session to the"
+                  " keychain (over SSH the keychain is locked: run it on the Mac or in tmux)")
+            continue
+        print(f"  Account {i+1} ({em}): Console session saved (from {prof})")
+    acc["console_profile"], acc["console_checked"] = prof, int(time.time())
+    updated += 1
+for em, (_, prof) in sorted(console_seen.items()):
+    if em not in known:
+        print(f"  {prof}: Console login for an email that is not a claude-swap account (ignored)")
+
 if updated:
     with open(store_path, "w") as f:
         json.dump(store, f, indent=2)
@@ -3879,6 +3937,18 @@ if stale:
     print("Stored sessionKey NOT confirmed (no logged-in Chrome profile for it — it may be expired):")
     for m in stale:
         print(f"  - {m}")
+
+def _console_where(acc):
+    # the profile it came from before, else the one logged in to claude.ai
+    p = acc.get("console_profile") or acc.get("login_profile") or acc.get("chrome_profile")
+    return f" ({p})" if p else ""
+
+no_console = [f"{i+1}{_console_where(acc)}" for i, acc in live
+              if not secrets.read(oauth.VAULT, f"console:{(acc.get('email') or '').lower()}")]
+if no_console:
+    print()
+    print("No Console session (log platform.claude.com in on the account's Chrome profile"
+          " and re-run, to see its API credits): #" + ", #".join(no_console))
 
 if sys.platform == "darwin":
     names = oauth.profile_names()
