@@ -764,6 +764,37 @@ class Lane(Base):
         self.assertIsNone(O["lane_summary"](self.store, []))
 
 
+class KeychainWrite(unittest.TestCase):
+    """`security -i` exits 0 even when the command inside it failed, so a
+    write counts only if reading the item back gives the new value."""
+
+    def run_with(self, stored):
+        """subprocess.run as `security` would answer: `-i` writes nothing,
+        the read gives `stored`."""
+        def run(cmd, **kw):
+            if cmd[:2] == ["security", "-i"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if cmd[:2] == ["security", "find-generic-password"]:
+                return mock.Mock(returncode=0, stdout=stored + "\n", stderr="")
+            raise AssertionError(cmd)
+        return mock.patch.object(O["subprocess"], "run", side_effect=run)
+
+    def test_a_cookie_left_unchanged_is_not_a_save(self):
+        with self.run_with("old-cookie"):
+            self.assertFalse(O["Keychain"]("me").write(O["VAULT"], "new-cookie", "console:a@x.io"))
+
+    def test_a_cookie_read_back_as_written_is_a_save(self):
+        with self.run_with("new-cookie"):
+            self.assertTrue(O["Keychain"]("me").write(O["VAULT"], "new-cookie", "console:a@x.io"))
+
+    def test_a_login_read_back_in_hex_is_still_a_save(self):
+        text = O["dump"](login("a"))
+        with self.run_with(text.encode().hex()):
+            self.assertTrue(O["Keychain"]("me").write(O["VAULT"], text, "a@x.io"))
+        with self.run_with(O["dump"](login("old")).encode().hex()):
+            self.assertFalse(O["Keychain"]("me").write(O["VAULT"], text, "a@x.io"))
+
+
 class Orgs(unittest.TestCase):
     """Which claude.ai org an account's plan and usage come from."""
     MAX = {"uuid": "max", "rate_limit_tier": "default_claude_max_20x",

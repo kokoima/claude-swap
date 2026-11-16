@@ -1125,9 +1125,11 @@ class Keychain:
                            text=True, timeout=10)
         except Exception:
             return False
-        # `security -i` exits 0 even when the command inside it failed
+        # `security -i` exits 0 even when the command inside it failed. A login
+        # may read back in hex; anything else (a cookie) must match exactly,
+        # or an old value left in place would pass for the new one
         got = self.read(service, acct)
-        return got == text or (got is not None and parse(got) == parse(text))
+        return got == text or (parse(text) is not None and parse(got) == parse(text))
 
     def delete(self, service, account=None):
         try:
@@ -3775,6 +3777,7 @@ bases = [
 print("Scanning Chrome profiles...")
 seen = {}  # email -> (session_key, profile)
 console_seen = {}  # email -> (Console session key, profile)
+console_blocked = False  # Cloudflare challenged the Console: no more checks
 profiles = {}  # email -> every profile logged in to it, for Claude in Chrome
 uuids = {}     # email -> account uuid, to find the extension signed in to it
 for base in bases:
@@ -3783,16 +3786,22 @@ for base in bases:
         try:
             # the Console first: a profile logged in there but not on claude.ai
             # still counts, and the claude.ai checks below end in `continue`
-            try:
-                ck = read_console_key(db)
-            except Exception as e:
-                ck = None
-                print(f"  {prof}: Console cookie unreadable ({type(e).__name__})")
+            ck = None
+            if not console_blocked:
+                try:
+                    ck = read_console_key(db)
+                except Exception as e:
+                    print(f"  {prof}: Console cookie unreadable ({type(e).__name__})")
             if ck:
-                st, acct = oauth.Console(ck).get("/api/account")
+                console = oauth.Console(ck)
+                st, acct = console.get("/api/account")
                 acct = acct if isinstance(acct, dict) else {}
                 cem = (acct.get("email_address") or "").lower() if st == 200 else ""
-                if cem:
+                if console.blocked:
+                    console_blocked = True
+                    print(f"  {prof}: Cloudflare is challenging the Console (platform.claude.com):"
+                          " no more Console checks this run — try again later")
+                elif cem:
                     console_seen[cem] = (ck, prof)
                 elif st == 200:
                     print(f"  {prof}: Console session EXPIRED (anonymous) — log platform.claude.com back in there")
@@ -3875,24 +3884,31 @@ for i, acc in enumerate(accounts):
         print(f"  Account {i+1} ({em}): " + (", ".join(notes) or "up to date"))
 
 # The Console session goes to the keychain only; the store just says where it
-# came from and when. A failed write (over SSH the keychain is locked) leaves
-# that account as it was.
+# came from and when it was saved. A failed write (over SSH the keychain is
+# locked) leaves that account as it was, and so does a session already saved
+# from the same profile: rewriting the store for nothing could undo a change
+# the watcher made meanwhile.
 secrets = oauth.default_io()[0]
 known = {(a.get("email") or "").lower() for a in accounts}
+console_ok = set()  # emails whose Console session this run confirmed
 for i, acc in enumerate(accounts):
     em = (acc.get("email") or "").lower()
     if acc.get("disabled") or em not in console_seen:
         continue
     ck, prof = console_seen[em]
     slot = f"console:{em}"
+    wrote = False
     if secrets.read(oauth.VAULT, slot) != ck:
         if not secrets.write(oauth.VAULT, ck, slot):
             print(f"  Account {i+1} ({em}): could not save the Console session to the"
                   " keychain (over SSH the keychain is locked: run it on the Mac or in tmux)")
             continue
+        wrote = True
         print(f"  Account {i+1} ({em}): Console session saved (from {prof})")
-    acc["console_profile"], acc["console_checked"] = prof, int(time.time())
-    updated += 1
+    console_ok.add(em)
+    if wrote or acc.get("console_profile") != prof:
+        acc["console_profile"], acc["console_checked"] = prof, int(time.time())
+        updated += 1
 for em, (_, prof) in sorted(console_seen.items()):
     if em not in known:
         print(f"  {prof}: Console login for an email that is not a claude-swap account (ignored)")
@@ -3943,12 +3959,27 @@ def _console_where(acc):
     p = acc.get("console_profile") or acc.get("login_profile") or acc.get("chrome_profile")
     return f" ({p})" if p else ""
 
-no_console = [f"{i+1}{_console_where(acc)}" for i, acc in live
-              if not secrets.read(oauth.VAULT, f"console:{(acc.get('email') or '').lower()}")]
-if no_console:
+if console_blocked:
     print()
-    print("No Console session (log platform.claude.com in on the account's Chrome profile"
-          " and re-run, to see its API credits): #" + ", #".join(no_console))
+    print("Console not checked (Cloudflare is challenging platform.claude.com):"
+          " run 'claude-swap keys-sync' again later")
+else:
+    no_console, console_stale = [], []
+    for i, acc in live:
+        em = (acc.get("email") or "").lower()
+        if not secrets.read(oauth.VAULT, f"console:{em}"):
+            no_console.append(f"{i+1}{_console_where(acc)}")
+        elif em not in console_ok:
+            # like a claude.ai key nobody re-confirmed: kept, perhaps dead
+            console_stale.append(f"{i+1}{_console_where(acc)}")
+    if no_console:
+        print()
+        print("No Console session (log platform.claude.com in on the account's Chrome profile"
+              " and re-run, to see its API credits): #" + ", #".join(no_console))
+    if console_stale:
+        print()
+        print("Console session NOT confirmed (may be expired — log platform.claude.com back in"
+              " on its Chrome profile and re-run): #" + ", #".join(console_stale))
 
 if sys.platform == "darwin":
     names = oauth.profile_names()
