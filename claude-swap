@@ -2250,6 +2250,7 @@ with open(store_path) as f:
 
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
+PREF = engine.model_setting(store)  # the preferred model: its column and limit
 lane_n = oauth.lane_of(store)
 local_tz = datetime.now().astimezone().tzinfo
 store_dirty = [False]
@@ -2260,9 +2261,9 @@ BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 def fetch_web_usage(acc):
     """Full usage snapshot from claude.ai (sessionKey cookie).
 
-    Primary source for every window: one request, zero tokens. Returns a
-    dict with u5/u7/fable percentages, their reset times and the free
-    limit resets, or None when the account has no cookie or the call fails
+    Primary source for every window: one request, zero tokens. Returns
+    engine.parse_usage's fields (r5/r7 as local times, the rest epochs),
+    or None when the account has no cookie or the call fails
     (caller falls back to the ratelimit headers). /api/oauth/usage is not
     an option: it demands the user:profile scope that `claude setup-token`
     does not mint, and it rate-limits an hour at a time. claude.ai
@@ -2338,22 +2339,9 @@ def fetch_web_usage(acc):
                 refresh_org()
             if time.time() - acc.get("sub_checked", 0) > PLAN_TTL:
                 refresh_sub(org)
-            out = {"u5": None, "r5": None, "u7": None, "r7": None,
-                   "fable": None, "rf": None,
-                   "resets": parse_resets(d.get("cedar_ember"))}
-            for key, pk, rk in (("five_hour", "u5", "r5"),
-                                ("seven_day", "u7", "r7")):
-                w = d.get(key) or {}
-                out[pk] = w.get("utilization")
-                out[rk] = parse_iso(w.get("resets_at"))
-            out["u5"] = engine.five_hour(out["u5"], out["u7"])
-            # Model-scoped weekly windows come as a list tagged by display
-            # name, so a new model with its own quota appears on its own.
-            for l in d.get("limits", []):
-                m = (l.get("scope") or {}).get("model") or {}
-                if (m.get("display_name") or "").lower() == "fable":
-                    out["fable"] = l.get("percent")
-                    out["rf"] = parse_iso(l.get("resets_at"))
+            out = engine.parse_usage(d, time.time())
+            for k in ("r5", "r7"):
+                out[k] = local_dt(out[k])
             return out
         except Exception:
             if attempt == 0:
@@ -2382,26 +2370,18 @@ def plan_end(acc):
     dates = [d for d in dates if d and d > datetime.now()]
     return min(dates) if dates else None
 
-def parse_resets(ce):
-    """Free limit resets from the cedar_ember block; None if it was absent.
-
-    left counts the unspent resets across live grants and ends is the
-    earliest expiry among them. Paused or expired grants do not count.
-    """
-    if not isinstance(ce, dict):
+def resets_summary(eligible, grants):
+    """Per kind, what is left and the soonest lapse (a local time), for the
+    Rst cell and the resets lines. None when claude.ai said nothing."""
+    if eligible is None:
         return None
-    out = {"eligible": ce.get("eligible") is True,
-           "reason": ce.get("ineligible_reason"), "left": 0, "ends": None}
-    now = datetime.now()
-    for g in ce.get("grants") or []:
-        if not isinstance(g, dict) or g.get("paused"):
-            continue
-        left, ends = g.get("resets_left"), parse_iso(g.get("ends_at"))
-        if not isinstance(left, int) or left <= 0 or (ends and ends <= now):
-            continue
-        out["left"] += left
-        if ends and (out["ends"] is None or ends < out["ends"]):
-            out["ends"] = ends
+    out = {"eligible": eligible}
+    for kind in (engine.FULL, engine.MODEL):
+        gs = [g for g in grants if g["kind"] == kind]
+        ends = min((g["ends"] for g in gs if g["ends"]), default=None)
+        out[kind] = {"left": sum(g["left"] for g in gs), "ends": local_dt(ends),
+                     "by_plan": any(g.get("by_plan") for g in gs if g["ends"] == ends),
+                     "models": sorted({g["model"] or "?" for g in gs})}
     return out
 
 def parse_epoch(ts):
@@ -2424,6 +2404,16 @@ def parse_iso(s):
         return dt.replace(second=0, microsecond=0)
     except (ValueError, TypeError):
         return None
+
+def local_dt(epoch):
+    """An epoch as parse_iso gives a time: local, naive, to the minute."""
+    if not epoch:
+        return None
+    return (datetime.fromtimestamp(epoch) + timedelta(seconds=30)).replace(
+        second=0, microsecond=0)
+
+def ep(dt):
+    return dt.timestamp() if dt else None
 
 # ---------- rendering: widths measured ANSI-free so columns align ----------
 
@@ -2489,7 +2479,8 @@ for i, acc in enumerate(accounts):
            "u5": None, "u7": None, "fable": None, "plan": acc.get("plan"),
            "r5": None, "r7": None, "rf": None, "disabled": False,
            "reserved": bool(acc.get("reserved")),
-           "src": None, "resets": None, "plan_end": None}
+           "src": None, "resets": None, "plan_end": None,
+           "models": {}, "shares": {}, "grants": None}
 
     if acc.get("disabled"):
         row["disabled"] = True
@@ -2504,13 +2495,17 @@ for i, acc in enumerate(accounts):
     row["plan"] = acc.get("plan")  # fetch_web_usage may have just cached it
     row["plan_end"] = plan_end(acc)
     if web:
-        row["fable"], row["rf"] = web["fable"], web["rf"]
-        row["resets"] = res = web["resets"]
+        row["models"], row["shares"], row["grants"] = web["models"], web["shares"], web["grants"]
+        row["fable"] = engine.model_pct(web, PREF)
+        row["rf"] = local_dt(engine.model_reset_at(web, PREF))
         # An unspent reset is lost with the plan it came with, so the plan
         # ending first is its real deadline.
-        if res and res["left"] and row["plan_end"] and (
-                res["ends"] is None or row["plan_end"] < res["ends"]):
-            res["ends"], res["by_plan"] = row["plan_end"], True
+        pe = ep(row["plan_end"])
+        if pe:
+            for g in row["grants"]:
+                if g["ends"] is None or pe < g["ends"]:
+                    g["ends"], g["by_plan"] = pe, True
+        row["resets"] = resets_summary(web["eligible"], row["grants"])
 
     # The cookie carries every window in one free request, so the billed
     # probe below only runs when it came back empty (no cookie, expired,
@@ -2587,11 +2582,12 @@ if store_dirty[0]:
 # Written atomically so a half-written file never reaches a reader that
 # runs on every prompt. A failure here must never break the dashboard.
 def cache_row(r):
-    c = {k: r.get(k) for k in ("n", "label", "u5", "u7", "fable",
-                               "plan", "error", "disabled", "reserved", "src")}
+    c = {k: r.get(k) for k in ("n", "label", "u5", "u7", "fable", "plan", "error",
+                               "disabled", "reserved", "src", "models", "shares")}
     res = r.get("resets")
-    c["resets"] = res["left"] if res else None
-    c["resets_ends"] = res["ends"].timestamp() if res and res["ends"] else None
+    c["resets"] = res[engine.FULL]["left"] if res else None
+    c["resets_ends"] = ep(res[engine.FULL]["ends"]) if res else None
+    c["resets_model"] = res[engine.MODEL]["left"] if res else None
     return c
 
 try:
@@ -2599,6 +2595,7 @@ try:
     snapshot = {
         "updated": time.time(),
         "active": active,
+        "model": PREF,
         "accounts": [cache_row(r) for r in results],
     }
     with open(cache_path + ".tmp", "w") as f:
@@ -2616,7 +2613,7 @@ W_PL = 6            # plan: MAX20X / MAX5X / PRO / FREE
 W_RN = 7            # what the plan does next: 21 Nov · ✕22 Nov · ↓22 Nov
 W_BAR = BAR_W + 5   # bar + space + "100%"
 W_RST = 6
-W_RS = 3            # free limit resets left
+W_RS = 4            # free limit resets left, full·model
 W_CH = 3            # Claude in Chrome login
 NCAL, CW = 8, 7     # today..+7: the 7d reset can fall exactly 7 days out
 DAY_NAMES = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
@@ -2659,15 +2656,15 @@ def renews_cell(acc, tier):
     return pad(txt, W_RN)
 
 def resets_cell(res):
-    """Green count = resets waiting; 0 = all spent; - = none offered;
-    ? = unknown, because only a working cookie can read them."""
+    """full·model resets: green when one waits; 0 = all spent; - = none
+    offered; ? = unknown, because only a working cookie can read them."""
     if res is None:
         return paint(GREY, pad("?", W_RS, right=True))
     if not res["eligible"]:
         return paint(GREY, pad("-", W_RS, right=True))
-    if res["left"] <= 0:
-        return paint(GREY, pad("0", W_RS, right=True))
-    return paint(GREEN, pad(str(res["left"]), W_RS, right=True))
+    f, m = res[engine.FULL]["left"], res[engine.MODEL]["left"]
+    txt = pad(f"{f}·{m}", W_RS, right=True)
+    return paint(GREEN if f or m else GREY, txt)
 
 today = datetime.now().date()
 cal_days = [today + timedelta(days=k) for k in range(NCAL)]
@@ -2688,13 +2685,10 @@ def chrome_cell(acc):
         return paint(RED if left < 86400 else YELLOW, pad(txt, W_CH, right=True))
     return paint(GREEN, pad("✓", W_CH, right=True))
 
-def ep(dt):
-    return dt.timestamp() if dt else None
-
 def trunc(s, w):
     return s if len(s) <= w else s[:w - 1] + "…"
 
-# yellow = 7d renewal · magenta = Fable renewal on another day ·
+# yellow = 7d renewal · magenta = the preferred model's renewal on another day ·
 # cyan ↓ = downgrade · red ✕ = plan ends, and a line on the days without one,
 # carrying in grey the renewal that only comes if the plan is renewed
 CAL_MARKS = {"renew": (YELLOW, ""), "fable": (MAG, ""),
@@ -2717,7 +2711,8 @@ def left_part(*cells):
 header = left_part(
     pad(" #", W_N), pad("Account", W_LB), pad("Plan", W_PL), pad("Renews", W_RN),
     pad("5h", W_BAR), pad("reset", W_RST),
-    pad("7d", W_BAR), pad("Fable", W_BAR), pad("Rst", W_RS, right=True),
+    pad("7d", W_BAR), pad(trunc(PREF.capitalize(), W_BAR - 1) + "*", W_BAR),
+    pad("Rst", W_RS, right=True),
     pad("Chr", W_CH, right=True))
 cal_header = "".join(center(f"{DAY_NAMES[d.weekday()]}{d.day}", CW) for d in cal_days)
 split = vlen(header)
@@ -2768,12 +2763,13 @@ for row in results:
 print()
 print("  " + ("* Active · ▸ reserved sessions   │   " if lane_n else "")
       + "calendar: " + paint(YELLOW, "7d") + " reset time · "
-      + paint(MAG, "Fable") + " when it falls on a different day · "
+      + paint(MAG, PREF.capitalize()) + " when it falls on a different day · "
       + paint(CYAN, "↓") + " downgrade · " + paint(RED, "✕") + " plan ends"
       + paint(GREY, " ───") + " no plan (" + paint(GREY, "─22:00─")
       + " renews if resubscribed)"
       + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
-                    "   │   Rst: free limit resets left (? = no valid cookie)"
+                    " · * the model the watch counts (claude-swap model)"
+                    "   │   Rst: free resets left, full·model (? = no valid cookie)"
                     "   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)"
                     "   │   Renews: next charge (✕ plan ends · ↓ downgrade · ? not read yet)"))
 
@@ -2847,35 +2843,48 @@ for r in results:
 # ---------- free limit resets: who holds one and when it lapses ----------
 # The weekly renewal never moves, so a reset is worth most on an account at
 # its limit with days still to go; the line only says what is there.
-held = [r for r in results if r["resets"] and r["resets"]["left"] > 0
-        and not r["disabled"]]
-if held:
-    def lapse(res):
-        if res["ends"] is None:
+def resets_line(kind, title):
+    held = [r for r in results if r["resets"] and r["resets"][kind]["left"] > 0
+            and not r["disabled"]]
+    if not held:
+        return
+
+    def lapse(k):
+        if k["ends"] is None:
             return "no expiry"
-        return (deadline(res["ends"], "until")
-                + (paint(YELLOW, " — plan ends") if res.get("by_plan") else ""))
-    ends = {(r["resets"]["ends"], r["resets"].get("by_plan")) for r in held}
+        return (deadline(k["ends"], "until")
+                + (paint(YELLOW, " — plan ends") if k.get("by_plan") else ""))
+
+    ends = {(r["resets"][kind]["ends"], r["resets"][kind]["by_plan"]) for r in held}
     shared = len(ends) == 1
     who = ", ".join(
-        f"#{r['n']} {short(r['label'])} ×{r['resets']['left']}"
-        + ("" if shared else " " + lapse(r["resets"]))
+        f"#{r['n']} {short(r['label'])} ×{r['resets'][kind]['left']}"
+        + ("" if shared else " " + lapse(r["resets"][kind]))
         for r in held)
-    print("  " + paint(GREEN, "Free limit resets: ") + who
-          + (" · " + lapse(held[0]["resets"]) if shared else "")
-          + paint(GREY, " · spend one: claude-swap reset <n>"))
+    # a model reset whose model cannot be told has no name to give: the
+    # bare command picks what helps by default
+    known = [m for m in held[0]["resets"][kind]["models"] if m != "?"]
+    hint = "full" if kind == engine.FULL else (known[0].lower() if known else "")
+    print("  " + paint(GREEN, title + ": ") + who
+          + (" · " + lapse(held[0]["resets"][kind]) if shared else "")
+          + paint(GREY, " · spend one: claude-swap reset <n>"
+                        + (f" {hint}" if hint else "")))
+
+resets_line(engine.FULL, "Full resets")
+resets_line(engine.MODEL, "Model resets")
 
 # ---------- watcher order: the general strategy, same table reordered ----------
 # The decision engine the watch and `auto` use: consume first the quota that
 # is lost first. Blocked accounts follow, by when they free up.
 
 def when(ts):
-    return datetime.fromtimestamp(ts).strftime("%a %d %H:%M")
+    # to the minute, as the table shows it: a model's renewal comes as
+    # ...:59.99 and would print a minute early
+    return local_dt(ts).strftime("%a %d %H:%M")
 
 now_ts = time.time()
 eng_rows = []
 for r in results:
-    res = r["resets"]
     cancel = parse_iso(accounts[r["n"] - 1].get("plan_ends"))
     limited = r["error"] == "RATE LIMITED"
     eng_rows.append({
@@ -2887,19 +2896,20 @@ for r in results:
         "disabled": r["disabled"], "reserved": r["reserved"],
         "error": None if limited else r["error"],
         "rate_limited": limited,
-        "resets": (res["left"] if res["eligible"] else 0) if res else None,
-        "resets_ends": ep(res["ends"]) if res else None,
+        "models": r["models"], "shares": r["shares"], "grants": r["grants"],
+        "resets": (r["resets"][engine.FULL]["left"] if r["resets"] else None),
+        "resets_ends": (ep(r["resets"][engine.FULL]["ends"]) if r["resets"] else None),
         "reset_cooldown": None})
 
-order = engine.rank(eng_rows, now_ts)
-blocked = sorted((e for e in order if engine.blocked(e)),
-                 key=lambda e: engine.unblock_at(e) or float("inf"))
+order = engine.rank(eng_rows, now_ts, PREF)
+blocked = sorted((e for e in order if engine.blocked(e, PREF)),
+                 key=lambda e: engine.unblock_at(e, PREF) or float("inf"))
 by_n = {r["n"]: r for r in results}
 
 def note(e):
     """Why the account sits there: when its quota is lost, or frees up."""
-    if engine.blocked(e):
-        t, cancel = engine.unblock_at(e), e.get("cancel_at")
+    if engine.blocked(e, PREF):
+        t, cancel = engine.unblock_at(e, PREF), e.get("cancel_at")
         if t:
             return paint(RED, f"blocked until {when(t)}")
         if cancel and cancel > now_ts:
@@ -2910,22 +2920,25 @@ def note(e):
         txt = "no week running"
     else:
         txt = ("plan ends " if d == e["plan_end"] else "renews ") + when(d)
-    tags = {0: [paint(YELLOW, "last day")], 1: [paint(GREEN, "holds a reset")]}.get(
+    tags = {0: [paint(YELLOW, "last day")], 1: [paint(GREEN, "holds a full reset")]}.get(
         engine.tier(e, now_ts), [])
-    if not engine.roomy(e, now_ts):
+    if engine.grants_of(e, now_ts, engine.MODEL, PREF):
+        tags.append(paint(GREEN, f"holds a {PREF} reset"))
+    if not engine.roomy(e, now_ts, PREF):
         tags.append(paint(GREY, "little room"))
     return paint(GREY, txt) + ("  " + " · ".join(tags) if tags else "")
 
 print()
 print(paint(BOLD, "  Watcher order")
-      + paint(GREY, f" — what is lost first goes first · leaves at {engine.LEAVE}%"
-                    " of 5h or 7d, comes back once there is room"))
+      + paint(GREY, f" — what is lost first goes first · model {PREF}: leaves at"
+                    f" {engine.LEAVE}% of 5h, 7d or {PREF.capitalize()}, comes back"
+                    " once there is room"))
 if not order:
     print(paint(GREY, "    no accounts available"))
-for e in [e for e in order if not engine.blocked(e)] + blocked:
+for e in [e for e in order if not engine.blocked(e, PREF)] + blocked:
     print(render_row(by_n[e["n"]]) + "  " + note(e))
 
-d = engine.decide(eng_rows, active, now_ts, {}, False)
+d = engine.decide(eng_rows, active, now_ts, {}, False, PREF)
 if d["action"] == "stay":
     head = f"stay on #{active}"
 elif d["action"] == "switch":
@@ -2960,7 +2973,7 @@ cmd_auto() {
     *) echo "Invalid strategy: $strategy (use general, or fable for 'model fable')"; exit 1 ;;
   esac
   local result
-  result=$(python3 - "$STORE" "$strategy" <<'PYEOF'
+  result=$(python3 - "$STORE" <<'PYEOF'
 import json, os, sys, time, types
 import urllib.request, urllib.error
 from datetime import datetime
@@ -2969,12 +2982,12 @@ engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 
 store_path = sys.argv[1]
-strategy = sys.argv[2]
 with open(store_path) as f:
     store = json.load(f)
 
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
+PREF = engine.model_setting(store)  # the preferred model: its limit counts too
 
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
@@ -2982,9 +2995,9 @@ BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 def fetch_web_usage(acc):
     """Full usage snapshot via claude.ai; None without cookie/org or on error.
 
-    Percentages are 0-100 and resets are epoch seconds, which is what the
-    rest of this rotation pass expects. One request replaces both the
-    billed ratelimit probe and the old Fable-only call.
+    engine.parse_usage's fields: percentages 0-100 and times as epoch
+    seconds, which is what the rest of this rotation pass expects. One
+    request replaces the billed ratelimit probe.
     """
     sk, org = acc.get("session_key"), acc.get("org_id")
     if not sk or not org:
@@ -2994,45 +3007,13 @@ def fetch_web_usage(acc):
         f"https://claude.ai/api/organizations/{org}/usage?cedar_ember=1&skip_spend=1",
         headers={"Cookie": f"sessionKey={sk}", "User-Agent": BROWSER_UA,
                  "Accept": "application/json"})
-
-    def epoch(v):
-        if not v:
-            return None
-        try:
-            return datetime.fromisoformat(
-                str(v).replace("Z", "+00:00")).timestamp()
-        except (ValueError, TypeError):
-            return None
-
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.load(r)
+        # an odd reply is no reply: the billed probe below covers it
+        return engine.parse_usage(d, time.time())
     except Exception:
         return None
-    ce = d.get("cedar_ember") or {}
-    out = {"u5": None, "r5": None, "u7": None, "r7": None,
-           "fable": None, "rf": None, "resets": 0, "resets_ends": None,
-           "reset_cooldown": epoch(ce.get("cooldown_until"))}
-    for g in (ce.get("grants") or []) if ce.get("eligible") else []:
-        left, ends = g.get("resets_left"), epoch(g.get("ends_at"))
-        if g.get("paused") or not isinstance(left, int) or left <= 0 \
-                or (ends and ends <= time.time()):
-            continue
-        out["resets"] += left
-        if ends and (out["resets_ends"] is None or ends < out["resets_ends"]):
-            out["resets_ends"] = ends
-    for key, pk, rk in (("five_hour", "u5", "r5"),
-                        ("seven_day", "u7", "r7")):
-        w = d.get(key) or {}
-        out[pk] = w.get("utilization")
-        out[rk] = epoch(w.get("resets_at"))
-    out["u5"] = engine.five_hour(out["u5"], out["u7"])
-    for l in d.get("limits", []):
-        m = (l.get("scope") or {}).get("model") or {}
-        if (m.get("display_name") or "").lower() == "fable":
-            out["fable"] = l.get("percent")
-            out["rf"] = epoch(l.get("resets_at"))
-    return out
 
 def iso_epoch(v):
     try:
@@ -3067,15 +3048,20 @@ for i, acc in enumerate(accounts):
              "disabled": False, "error": None, "resets": None,
              "resets_ends": None, "reset_cooldown": None}
 
-    # Cookie first: one free request carries 5h, 7d and Fable at once.
+    # Cookie first: one free request carries 5h, 7d and every model's week.
     web = fetch_web_usage(acc)
     if web and web["u5"] is not None:
         entry["util_5h"] = web["u5"] / 100.0
         entry["util_7d"] = (web["u7"] or 0) / 100.0
-        entry["fable"], entry["rf"] = web["fable"], web["rf"]
-        for k in ("u5", "u7", "r5", "r7", "resets", "resets_ends", "reset_cooldown"):
+        for k in ("u5", "u7", "r5", "r7", "resets", "resets_ends", "reset_cooldown",
+                  "models", "shares", "grants"):
             entry[k] = web[k]
+        entry["fable"] = engine.model_pct(web, PREF)
         # An unspent reset is lost with its plan
+        if entry["plan_end"]:
+            for g in entry["grants"]:
+                if g["ends"] is None or entry["plan_end"] < g["ends"]:
+                    g["ends"] = entry["plan_end"]
         if entry["resets"] and entry["plan_end"] and (
                 entry["resets_ends"] is None or entry["plan_end"] < entry["resets_ends"]):
             entry["resets_ends"] = entry["plan_end"]
@@ -3091,7 +3077,7 @@ for i, acc in enumerate(accounts):
             f"  Checked {n}: {entry['label']:<20} "
             f"{'SPENT' if entry['rate_limited'] else 'OK'} "
             f"(5h={entry['util_5h']*100:.0f}%"
-            + (f", fable={entry['fable']:.0f}%" if entry.get("fable") is not None else "")
+            + (f", {PREF}={entry['fable']:.0f}%" if entry.get("fable") is not None else "")
             + ")\n")
         time.sleep(1.2)  # claude.ai throttles bursts
         continue
@@ -3158,73 +3144,30 @@ for i, acc in enumerate(accounts):
         entry["rate_limited"] = True
         entry["error"] = type(e).__name__
 
-    if strategy == "fable" and not entry["rate_limited"]:
-        w = fetch_web_usage(acc)
-        if w:
-            entry["fable"], entry["rf"] = w["fable"], w["rf"]
-        time.sleep(1.5)  # claude.ai throttles bursts
     results.append(entry)
-    extra = ""
-    if strategy == "fable" and entry.get("fable") is not None:
-        extra = f", fable={entry['fable']:.0f}%"
-    sys.stderr.write(f"  Checked {n}: {entry['label']:<20} {'RATE LIMITED' if entry['rate_limited'] else 'OK'} (5h={entry['util_5h']*100:.0f}%{extra})\n")
+    sys.stderr.write(f"  Checked {n}: {entry['label']:<20} {'RATE LIMITED' if entry['rate_limited'] else 'OK'} (5h={entry['util_5h']*100:.0f}%)\n")
 
-if strategy == "general":
-    # the same decision the watch makes (minus its memory of past switches)
-    d = engine.decide(results, active, time.time(), {}, False)
-    names = {r["n"]: r["label"] for r in results}
-    if d["action"] == "stay":
-        sys.stderr.write(f"\n  Already on the right account: {d['reason']}\n")
-        print("STAY")
-    elif d["action"] == "switch":
-        sys.stderr.write(f"\n  Best account: {d['target']} ({names.get(d['target'], '?')})"
-                         f" — {d['reason']}\n")
-        print(f"ROTATE {d['target']}")
-    else:
-        sys.stderr.write(f"\n  All accounts at their limit.\n")
-        if d["wake"]:
-            when = datetime.fromtimestamp(d["wake"]).strftime("%a %H:%M")
-            sys.stderr.write(f"  The first one frees up {when}.\n")
-        for r in results:
-            if r.get("resets"):
-                sys.stderr.write(f"  Account {r['n']} ({r['label']}) holds a free limit reset: "
-                                 f"claude-swap reset {r['n']}\n")
-        print("BLOCKED")
-    sys.exit(0)
-
-available = [r for r in results if not r["rate_limited"]]
-if strategy == "fable":
-    available = [r for r in available
-                 if r.get("fable") is None or r["fable"] < 99]
-
-def eta(ts):
-    return ts if ts else float("inf")
-
-if available:
-    if strategy == "fable":
-        # soonest Fable renewal first; % is only the tiebreaker
-        available.sort(key=lambda r: (eta(r.get("rf")),
-                                      r["fable"] if r.get("fable") is not None else 101))
-    else:
-        available.sort(key=lambda r: (r["util_5h"], r["util_7d"]))
-    best = available[0]
-    if best["n"] == active:
-        sys.stderr.write(f"\n  Already on best account: {best['n']} ({best['label']}, 5h={best['util_5h']*100:.0f}%)\n")
-        print("STAY")
-    else:
-        sys.stderr.write(f"\n  Best account: {best['n']} ({best['label']}, 5h={best['util_5h']*100:.0f}%)\n")
-        print(f"ROTATE {best['n']}")
+# the same decision the watch makes (minus its memory of past switches)
+d = engine.decide(results, active, time.time(), {}, False, PREF)
+names = {r["n"]: r["label"] for r in results}
+if d["action"] == "stay":
+    sys.stderr.write(f"\n  Already on the right account: {d['reason']}\n")
+    print("STAY")
+elif d["action"] == "switch":
+    sys.stderr.write(f"\n  Best account: {d['target']} ({names.get(d['target'], '?')})"
+                     f" — {d['reason']}\n")
+    print(f"ROTATE {d['target']}")
 else:
-    results.sort(key=lambda r: r["retry_after"])
-    soonest = results[0]
-    mins = soonest["retry_after"] // 60
-    sys.stderr.write(f"\n  All accounts rate limited.\n")
-    sys.stderr.write(f"  Account {soonest['n']} ({soonest['label']}) unblocks soonest (retry in {mins}m)\n")
+    sys.stderr.write(f"\n  All accounts at their limit.\n")
+    if d["wake"]:
+        when = datetime.fromtimestamp(d["wake"]).strftime("%a %H:%M")
+        sys.stderr.write(f"  The first one frees up {when}.\n")
     for r in results:
         if r.get("resets"):
             sys.stderr.write(f"  Account {r['n']} ({r['label']}) holds a free limit reset: "
                              f"claude-swap reset {r['n']}\n")
     print("BLOCKED")
+sys.exit(0)
 PYEOF
   )
 
