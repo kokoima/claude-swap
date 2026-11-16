@@ -85,6 +85,8 @@ def _leave_setting(default=98):
 LEAVE = _leave_setting()    # leave an account once its 5h or 7d reaches this %
 ROOM_5H = 80                # worth switching to: 5h at or below this...
 ROOM_7D = 95                # ...and 7d at or below this
+ROOM_MODEL = 95             # ...and the preferred model at or below this
+MODEL_RESET_MIN_WEEK = 25   # a model reset only if it leaves this much week
 LAST_DAY = 24 * 3600        # quota expiring within this goes first
 MIN_DWELL = 15 * 60         # no voluntary switch sooner than this after the last
 RESET_MIN_LEFT = 24 * 3600  # a week renewing sooner than this refills for free
@@ -108,24 +110,68 @@ def eligible(r):
             and r.get("u5") is not None)
 
 
-def blocked(r):
+def _model_item(r, model):
+    """(name, {"pct", "resets_at"}) of r's own weekly limit for `model`,
+    matched without case, or (None, None): no such model, or not known."""
+    if model:
+        for name, m in (r.get("models") or {}).items():
+            if name.lower() == model.lower():
+                return name, m
+    return None, None
+
+
+def model_pct(r, model):
+    return (_model_item(r, model)[1] or {}).get("pct")
+
+
+def model_reset_at(r, model):
+    return (_model_item(r, model)[1] or {}).get("resets_at")
+
+
+def grants_of(r, now, kind, model=None):
+    """r's live resets of one kind, soonest lapse first: FULL, or MODEL for
+    the model named. A row without grants (callers that only count them)
+    holds its `resets` as full ones."""
+    gs = r.get("grants")
+    if gs is None:
+        ends = r.get("resets_ends")
+        if kind == FULL and (r.get("resets") or 0) > 0 and (ends is None or ends > now):
+            return [{"id": None, "left": r["resets"], "ends": ends,
+                     "clears": ["seven_day"], "kind": FULL, "model": None,
+                     "five_hour": False, "usable_now": True}]
+        return []
+    live = [g for g in gs
+            if g["kind"] == kind and g["left"] > 0
+            and (g["ends"] is None or g["ends"] > now)
+            and (kind == FULL
+                 or (model and (g.get("model") or "").lower() == model.lower()))]
+    return sorted(live, key=lambda g: g["ends"] or INF)
+
+
+def blocked(r, model=None):
     return (bool(r.get("rate_limited")) or (r.get("u5") or 0) >= LEAVE
-            or (r.get("u7") or 0) >= LEAVE)
+            or (r.get("u7") or 0) >= LEAVE or (model_pct(r, model) or 0) >= LEAVE)
 
 
 def holds_reset(r, now):
-    ends = r.get("resets_ends")
-    return (r.get("resets") or 0) > 0 and (ends is None or ends > now)
+    """A full reset, the one that refills the week (and orders accounts)."""
+    return bool(grants_of(r, now, FULL))
 
 
-def roomy(r, now):
-    # A reset holder needs no 7d room: its reset refills it at the limit.
-    return (r.get("u5") or 0) <= ROOM_5H and (
-        (r.get("u7") or 0) <= ROOM_7D or holds_reset(r, now))
+def roomy(r, now, model=None):
+    # A reset holder needs no room on what its reset refills at the limit:
+    # a full one the week, a model one the model, while the week has a
+    # quarter left for it.
+    mp = model_pct(r, model)
+    model_ok = (mp is None or mp <= ROOM_MODEL
+                or (grants_of(r, now, MODEL, model)
+                    and (r.get("u7") or 0) <= 100 - MODEL_RESET_MIN_WEEK))
+    return bool((r.get("u5") or 0) <= ROOM_5H and model_ok and (
+        (r.get("u7") or 0) <= ROOM_7D or holds_reset(r, now)))
 
 
-def load(r):
-    return max(r.get("u5") or 0, r.get("u7") or 0)
+def load(r, model=None):
+    return max(r.get("u5") or 0, r.get("u7") or 0, model_pct(r, model) or 0)
 
 
 def tier(r, now):
@@ -138,13 +184,13 @@ def priority(r, now):
     return (tier(r, now), deadline(r, now))
 
 
-def rank(rows, now):
+def rank(rows, now, model=None):
     """Eligible accounts in consumption order, blocked ones included."""
     return sorted((r for r in rows if eligible(r)),
-                  key=lambda r: (priority(r, now), load(r), r["n"]))
+                  key=lambda r: (priority(r, now), load(r, model), r["n"]))
 
 
-def unblock_at(r):
+def unblock_at(r, model=None):
     """When a blocked account is usable again; None if unknown or never,
     which is the case when its cancelled plan ends first."""
     times = []
@@ -152,6 +198,8 @@ def unblock_at(r):
         times.append(r.get("r5"))
     if (r.get("u7") or 0) >= LEAVE:
         times.append(r.get("r7"))
+    if (model_pct(r, model) or 0) >= LEAVE:
+        times.append(model_reset_at(r, model))
     if not times or None in times:
         return None
     cancel = r.get("cancel_at")
@@ -179,7 +227,7 @@ def reset_due(r, now, state):
     return True
 
 
-def next_event(rows, now):
+def next_event(rows, now, model=None):
     """Soonest instant at which a block lifts or the order can change."""
     times = []
     for r in rows:
@@ -187,66 +235,72 @@ def next_event(rows, now):
             continue
         d = deadline(r, now)
         times += [r.get("r5"), r.get("r7"), r.get("plan_end"),
-                  r.get("reset_cooldown"), d - LAST_DAY if d < INF else None]
+                  r.get("reset_cooldown"), model_reset_at(r, model),
+                  d - LAST_DAY if d < INF else None]
     times = [t for t in times if t and t > now]
     return min(times) if times else None
 
 
-def usage(r):
+def usage(r, model=None):
     if r.get("u5") is None:
         return "no data"
-    return f"5h {r['u5']:.0f}% · 7d {(r.get('u7') or 0):.0f}%"
+    out = f"5h {r['u5']:.0f}% · 7d {(r.get('u7') or 0):.0f}%"
+    name, m = _model_item(r, model)
+    if m and m.get("pct") is not None:
+        out += f" · {name} {m['pct']:.0f}%"
+    return out
 
 
-def decide(rows, active, now, state, auto_reset=False):
+def decide(rows, active, now, state, auto_reset=False, model=None):
     """What to do now: stay, switch, spend a reset, or wait at the wall.
 
     state carries last_switch (epoch), manual (the active account was picked
     by hand), reset_tried ({"n": epoch}) and reset_failed ([n]). Returns
     {"action", "target", "reason", "wake"}; wake is the next instant worth
-    looking again, or None.
+    looking again, or None. model: the preferred model, whose own weekly
+    limit counts like the 5h and the week (None: none counts).
     """
     def out(action, target, reason, wake=None):
-        ev = next_event(rows, now)
+        ev = next_event(rows, now, model)
         if wake is None or (ev is not None and ev < wake):
             wake = ev
         return {"action": action, "target": target, "reason": reason,
                 "wake": wake}
 
     cur = next((r for r in rows if r["n"] == active), None)
-    ranked = rank(rows, now)
+    ranked = rank(rows, now, model)
 
     if auto_reset:
         for r in ranked:
             if reset_due(r, now, state):
                 return out("reset", r["n"],
-                           f"#{r['n']} spent its week ({usage(r)}) and holds a reset")
+                           f"#{r['n']} spent its week ({usage(r, model)}) and holds a reset")
 
     if (cur is not None and cur.get("error")
             and not (cur.get("disabled") or cur.get("free") or cur.get("reserved"))):
         return out("stay", active, f"#{active} probe failed ({cur['error']})",
                    now + ERROR_RETRY)
 
-    usable = [r for r in ranked if not blocked(r)]
-    best = next((r for r in usable if roomy(r, now)), None)
+    usable = [r for r in ranked if not blocked(r, model)]
+    best = next((r for r in usable if roomy(r, now, model)), None)
 
-    if cur is None or not eligible(cur) or blocked(cur):
+    if cur is None or not eligible(cur) or blocked(cur, model):
         if cur is None:
             why = "no active account"
         elif not eligible(cur):
             why = f"#{active} is no longer usable"
         else:
-            why = f"#{active} at its limit ({usage(cur)})"
-        target = best or min(usable, key=lambda r: (load(r), priority(r, now)),
+            why = f"#{active} at its limit ({usage(cur, model)})"
+        target = best or min(usable, key=lambda r: (load(r, model), priority(r, now)),
                              default=None)
         if target is None:
-            waits = [t for t in (unblock_at(r) for r in ranked) if t and t > now]
+            waits = [t for t in (unblock_at(r, model) for r in ranked) if t and t > now]
             return out("wall", None, why + " and every account is at its limit",
                        min(waits) if waits else None)
         return out("switch", target["n"], why)
 
     if best and best["n"] != active and priority(best, now) < priority(cur, now):
-        ahead = f"#{best['n']} goes first ({usage(best)})"
+        ahead = f"#{best['n']} goes first ({usage(best, model)})"
         if state.get("manual"):
             return out("stay", active, f"#{active} picked by hand; {ahead}")
         last = state.get("last_switch") or 0
@@ -258,7 +312,7 @@ def decide(rows, active, now, state, auto_reset=False):
     return out("stay", active, f"#{active} goes first")
 
 
-def lane_decide(rows, lane, pool, now, state):
+def lane_decide(rows, lane, pool, now, state, auto_reset=False, model=None):
     """The reserved sessions (claude-swap run), moved like the shared login
     but only among pool, the reserved accounts the watch may put them on.
     None when they are not the watch's to move: no pool, or on an account
@@ -266,7 +320,7 @@ def lane_decide(rows, lane, pool, now, state):
     if len(pool) < 2 or lane not in pool:
         return None
     sub = [dict(r, reserved=False) for r in rows if r["n"] in pool]
-    return decide(sub, lane, now, state, auto_reset=False)
+    return decide(sub, lane, now, state, False, model)
 
 
 # --- Plan timeline: what check draws, and when the watch re-reads it ---

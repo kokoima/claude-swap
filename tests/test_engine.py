@@ -63,8 +63,8 @@ def today(over=None):
     return list(rows.values())
 
 
-def decide(rows, active, state=None, auto_reset=False, now=NOW):
-    return E["decide"](rows, active, now, state or {}, auto_reset)
+def decide(rows, active, state=None, auto_reset=False, now=NOW, model=None):
+    return E["decide"](rows, active, now, state or {}, auto_reset, model)
 
 
 LONG_AGO = {"last_switch": NOW - 10 * H}
@@ -267,6 +267,72 @@ class Lane(unittest.TestCase):
     def test_the_shared_logins_decision_still_ignores_them(self):
         d = decide(self.rows({3: {"u5": 100}}), 3, LONG_AGO)
         self.assertNotIn(d["target"], (11, 12, 13))
+
+
+def fab(pct, at=None):
+    """A row's Fable limit."""
+    return {"Fable": {"pct": pct, "resets_at": at}}
+
+
+def mgrant(model="Fable", left=1, ends=NOW + 500 * H, gid="m1"):
+    return {"id": gid, "left": left, "ends": ends,
+            "clears": ["seven_day_overage_included"], "kind": "model",
+            "model": model, "five_hour": False, "usable_now": True}
+
+
+def fgrant(left=1, ends=NOW + 500 * H, gid="f1", five_hour=False):
+    clears = ["seven_day", "seven_day_overage_included"] + (["five_hour"] if five_hour else [])
+    return {"id": gid, "left": left, "ends": ends, "clears": clears, "kind": "full",
+            "model": None, "five_hour": five_hour, "usable_now": True}
+
+
+class Models(unittest.TestCase):
+    """The preferred model's own weekly limit counts like the 5h and the week."""
+
+    def test_a_spent_model_blocks_only_when_it_is_the_preferred_one(self):
+        r = acct(2, u7=60, models=fab(100))
+        self.assertTrue(E["blocked"](r, "fable"))
+        self.assertFalse(E["blocked"](r, "opus"))
+        self.assertFalse(E["blocked"](r))
+
+    def test_leaves_an_account_whose_model_is_spent(self):
+        d = decide(today({3: {"models": fab(100, NOW + 50 * H)}}), 3, LONG_AGO, model="Fable")
+        self.assertEqual((d["action"], d["target"]), ("switch", 5))
+
+    def test_with_opus_preferred_a_spent_fable_does_not_move_it(self):
+        d = decide(today({3: {"models": fab(100)}}), 3, LONG_AGO, model="opus")
+        self.assertEqual(d["action"], "stay")
+
+    def test_the_target_needs_room_on_the_model(self):
+        rows = today({3: {"u5": 99}, 5: {"models": fab(97)}})
+        d = decide(rows, 3, LONG_AGO, model="Fable")
+        self.assertEqual((d["action"], d["target"]), ("switch", 2))
+
+    def test_a_model_reset_with_a_quarter_of_the_week_free_counts_as_room(self):
+        r = acct(5, u7=60, models=fab(97), grants=[mgrant()])
+        self.assertTrue(E["roomy"](r, NOW, "Fable"))
+        r["u7"] = 80
+        self.assertFalse(E["roomy"](r, NOW, "Fable"))
+
+    def test_an_account_without_model_figures_is_not_held_back_by_it(self):
+        self.assertFalse(E["blocked"](acct(2, u7=60), "Fable"))
+        self.assertTrue(E["roomy"](acct(2, u7=60), NOW, "Fable"))
+
+    def test_unblocks_when_the_model_renews(self):
+        r = acct(2, u7=60, models=fab(100, NOW + 30 * H))
+        self.assertEqual(E["unblock_at"](r, "Fable"), NOW + 30 * H)
+
+    def test_the_lane_leaves_a_seat_whose_model_is_spent(self):
+        rows = today({5: {"u7": 10}}) + [
+            acct(11, reserved=True, u7=30, r7=NOW + 100 * H, models=fab(100, NOW + 9 * H)),
+            acct(13, reserved=True, u7=5, r7=NOW + 140 * H)]
+        d = E["lane_decide"](rows, 11, [11, 13], NOW, {}, False, "Fable")
+        self.assertEqual((d["action"], d["target"]), ("switch", 13))
+
+    def test_only_a_full_reset_is_held_for_the_order(self):
+        self.assertTrue(E["holds_reset"](acct(2, grants=[fgrant()]), NOW))
+        self.assertFalse(E["holds_reset"](acct(2, grants=[mgrant()]), NOW))
+        self.assertTrue(E["holds_reset"](acct(2, resets=1), NOW))  # rows without grants
 
 
 class Wall(unittest.TestCase):
