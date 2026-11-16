@@ -2149,7 +2149,7 @@ except Exception:
     ws = {}
 if walive:
     extra = " + auto-reset" if ws.get("auto_reset") else ""
-    parts = [f"RUNNING ({ws.get('strategy', '?')}{extra}, PID {wpid})"]
+    parts = [f"RUNNING (model {ws.get('model', '?')}{extra}, PID {wpid})"]
     if ws.get("active"):
         parts.append(f"watching #{ws['active']}"
                      + (" (picked by hand)" if ws.get("manual") else ""))
@@ -4399,7 +4399,7 @@ try:
         s = json.load(f)
 except Exception:
     sys.exit(0)
-bits = [f"strategy {s.get('strategy', '?')}"]
+bits = [f"model {s.get('model', '?')}"]
 if s.get("auto_reset"):
     bits.append("spends free resets")
 bits.append(f"watching #{s.get('active', '?')}"
@@ -4520,12 +4520,8 @@ def is_free(tier):
     return "free" in t or t in ("", "default_claude_ai")
 
 def web_usage(acc):
-    """5h/7d/Fable and free limit resets via claude.ai in one free request.
-
-    None on failure. resets is the unspent count across live grants and
-    resets_ends the earliest expiry among them (epoch), both None when the
-    reply carried no cedar_ember block.
-    """
+    """5h/7d, each model's weekly limit and the free resets via claude.ai in
+    one free request: engine.parse_usage's fields, or None on failure."""
     sk, org = acc.get("session_key"), acc.get("org_id")
     if not sk or not org:
         return None
@@ -4539,44 +4535,19 @@ def web_usage(acc):
             d = json.load(r)
     except Exception:
         return None
-    out = {"u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
-           "rf": None, "resets": None, "resets_ends": None,
-           "reset_cooldown": None}
-    five, seven = d.get("five_hour") or {}, d.get("seven_day") or {}
-    out["u5"], out["u7"] = five.get("utilization"), seven.get("utilization")
-    out["r5"] = iso_epoch(five.get("resets_at"))
-    out["r7"] = iso_epoch(seven.get("resets_at"))
-    out["u5"] = engine.five_hour(out["u5"], out["u7"])
-    for l in d.get("limits", []):
-        m = (l.get("scope") or {}).get("model") or {}
-        if (m.get("display_name") or "").lower() == "fable":
-            out["fable"] = l.get("percent")
-            out["rf"] = iso_epoch(l.get("resets_at"))
-    ce = d.get("cedar_ember")
-    if isinstance(ce, dict):
-        out["resets"] = 0
-        out["reset_cooldown"] = iso_epoch(ce.get("cooldown_until"))
-        for g in (ce.get("grants") or []) if ce.get("eligible") else []:
-            left, ends = g.get("resets_left"), iso_epoch(g.get("ends_at"))
-            if g.get("paused") or not isinstance(left, int) or left <= 0 \
-                    or (ends and ends <= time.time()):
-                continue
-            out["resets"] += left
-            if ends and (out["resets_ends"] is None or ends < out["resets_ends"]):
-                out["resets_ends"] = ends
-    return out
+    return engine.parse_usage(d, time.time())
 
 def probe(acc):
     """Every window of one account, plus its rate_limited flag.
 
     Reads claude.ai with the stored cookie, which costs nothing and brings
     every window back at once. Only when that is unavailable does it fall
-    back to the billed Haiku call, which yields no Fable figure.
+    back to the billed Haiku call, which yields no model figure.
     """
-    out = {"u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
-           "rf": None, "resets": None, "resets_ends": None,
-           "reset_cooldown": None, "rate_limited": False, "error": None,
-           "src": None}
+    out = {"u5": None, "r5": None, "u7": None, "r7": None, "models": {},
+           "shares": {}, "grants": [], "eligible": None, "resets": None,
+           "resets_ends": None, "reset_cooldown": None, "rate_limited": False,
+           "error": None, "src": None}
     if not acc.get("token"):
         out["error"] = "NO TOKEN"
         return out
@@ -4584,8 +4555,9 @@ def probe(acc):
     w = web_usage(acc)
     if w:
         # kept even when the windows fall back to the billed probe below
-        out["resets"], out["resets_ends"] = w["resets"], w["resets_ends"]
-        out["reset_cooldown"] = w["reset_cooldown"]
+        for k in ("models", "shares", "grants", "eligible", "resets",
+                  "resets_ends", "reset_cooldown"):
+            out[k] = w[k]
     if w and w["u5"] is not None:
         out.update(w)
         out["src"] = "web"
@@ -4649,6 +4621,7 @@ def plan_dates(acc):
 
 def probe_all(store):
     """Probe every usable account and publish the snapshot for the statusline."""
+    model = engine.model_setting(store)
     rows = []
     for i, acc in enumerate(store.get("accounts", [])):
         plan_end, ended, cancel = plan_dates(acc)
@@ -4657,10 +4630,10 @@ def probe_all(store):
                "disabled": bool(acc.get("disabled")),
                "reserved": bool(acc.get("reserved")),
                "free": is_free(acc.get("plan")) or ended,
-               "u5": None, "r5": None, "u7": None, "r7": None, "fable": None,
-               "rf": None, "resets": None, "resets_ends": None,
-               "reset_cooldown": None, "rate_limited": False, "error": None,
-               "src": None}
+               "u5": None, "r5": None, "u7": None, "r7": None, "models": {},
+               "shares": {}, "grants": [], "eligible": None, "resets": None,
+               "resets_ends": None, "reset_cooldown": None,
+               "rate_limited": False, "error": None, "src": None}
         # free plans only answer permission_error: nothing to read there
         if row["disabled"] or row["free"] or not acc.get("token"):
             rows.append(row)
@@ -4668,17 +4641,25 @@ def probe_all(store):
         row.update(probe(acc))
         # An unspent reset is lost with its plan: a cancellation or booked
         # downgrade (cached by `check`) that comes first is its deadline.
-        if row["resets"] and plan_end and (
-                row["resets_ends"] is None or plan_end < row["resets_ends"]):
-            row["resets_ends"] = plan_end
+        if plan_end:
+            for g in row["grants"]:
+                if g["ends"] is None or plan_end < g["ends"]:
+                    g["ends"] = plan_end
+            if row["resets"] and (row["resets_ends"] is None or plan_end < row["resets_ends"]):
+                row["resets_ends"] = plan_end
         rows.append(row)
         time.sleep(1.2)  # claude.ai throttles bursts
     try:
+        # fable: the preferred model's % (the statusline reads that name)
         snapshot = {"updated": time.time(), "active": store.get("active", 0),
-                    "accounts": [{k: r.get(k) for k in
-                                  ("n", "label", "u5", "u7", "fable",
-                                   "plan", "error", "disabled", "reserved",
-                                   "src", "resets", "resets_ends")}
+                    "model": model,
+                    "accounts": [dict({k: r.get(k) for k in
+                                       ("n", "label", "u5", "u7", "plan", "error",
+                                        "disabled", "reserved", "src", "resets",
+                                        "resets_ends", "models", "shares")},
+                                      fable=engine.model_pct(r, model),
+                                      resets_model=sum(g["left"] for g in r.get("grants") or []
+                                                       if g["kind"] == engine.MODEL))
                                  for r in rows]}
         with open(CACHE_PATH + ".tmp", "w") as f:
             json.dump(snapshot, f)
@@ -4687,35 +4668,7 @@ def probe_all(store):
         pass  # the watch must never die because the cache could not be written
     return rows
 
-def eta(ts):
-    return ts if ts else float("inf")
-
-def fable_decide(rows, active):
-    """The Fable strategy, unchanged: leave at 99% of 5h, 7d or Fable."""
-    p = next((r for r in rows if r["n"] == active), None)
-    if p is None or p["error"]:
-        return {"action": "stay", "target": active, "wake": time.time() + 300,
-                "reason": f"#{active} probe error ({p['error'] if p else 'not found'})"}
-    peak = max([v for v in (p["u5"], p["u7"], p["fable"]) if v is not None],
-               default=None)
-    if not (p["rate_limited"] or (peak is not None and peak >= 99)):
-        return {"action": "stay", "target": active, "wake": None,
-                "reason": f"#{active} below 99%"}
-    cands = [r for r in rows
-             if r["n"] != active
-             and not (r["disabled"] or r["free"] or r["reserved"] or r["error"])
-             and not r["rate_limited"] and r["u5"] is not None
-             and not (r["fable"] is not None and r["fable"] >= 99)]
-    reason = f"#{active} at the limit"
-    if not cands:
-        return {"action": "wall", "target": None, "wake": time.time() + 600,
-                "reason": reason + " and every account is at its limit"}
-    cands.sort(key=lambda c: (eta(c["rf"]),
-                              c["fable"] if c["fable"] is not None else 101))
-    return {"action": "switch", "target": cands[0]["n"], "wake": None,
-            "reason": reason}
-
-state = {"strategy": strategy, "auto_reset": auto_reset, "prewarned": False,
+state = {"strategy": strategy, "auto_reset": auto_reset,
          "started": datetime.now().isoformat(timespec="seconds")}
 try:
     # carried over so a restart neither repeats reminders nor retries a
@@ -4739,22 +4692,24 @@ def save_state():
 RESET_REMIND_H = (72, 24)  # nudge twice before an unspent reset lapses
 
 def remind_expiring(rows):
-    """Notify once per account and threshold before a free limit reset lapses."""
+    """Notify once per reset and threshold before a free reset lapses."""
     now = time.time()
     warned = [k for k in state.get("reset_warned", [])
-              if float(k.split(":")[1]) > now]
+              if float(k.split(":")[-2]) > now]
     for r in rows:
-        ends = r.get("resets_ends")
-        if not r.get("resets") or not ends or ends <= now:
-            continue
-        keys = [f"{r['n']}:{int(ends)}:{h}" for h in RESET_REMIND_H
-                if ends - now <= h * 3600]
-        if keys and not set(keys) <= set(warned):
-            when = datetime.fromtimestamp(ends).strftime("%a %d %b %H:%M")
-            log(f"reset reminder: #{r['n']} {r['label']} — unspent reset lapses {when}")
-            notify(f"Free limit reset on #{r['n']} {r['label']} lapses {when}"
-                   f" — claude-swap reset {r['n']}")
-            warned.extend(k for k in keys if k not in warned)
+        for g in r.get("grants") or []:
+            ends = g["ends"]
+            if not ends or ends <= now:
+                continue
+            what = "full reset" if g["kind"] == engine.FULL else f"{g['model'] or 'model'} reset"
+            keys = [f"{r['n']}:{g['id']}:{int(ends)}:{h}" for h in RESET_REMIND_H
+                    if ends - now <= h * 3600]
+            if keys and not set(keys) <= set(warned):
+                when = datetime.fromtimestamp(ends).strftime("%a %d %b %H:%M")
+                log(f"reset reminder: #{r['n']} {r['label']} — unspent {what} lapses {when}")
+                notify(f"Free {what} on #{r['n']} {r['label']} lapses {when}"
+                       f" — claude-swap reset {r['n']} {'full' if g['kind'] == engine.FULL else g['model']}")
+                warned.extend(k for k in keys if k not in warned)
     if warned != state.get("reset_warned", []):
         state["reset_warned"] = warned
         save_state()
@@ -4839,13 +4794,13 @@ def lane_pool(store):
             if (a.get("email") or "").lower() in want and a.get("reserved")
             and a.get("token") and not a.get("disabled")]
 
-def lane_step(store, rows):
+def lane_step(store, rows, model):
     """Move the reserved sessions off a reserved account at its limit, as the
     shared login is moved. -> (decision or None, peak % of their account)"""
     ln, pool = oauth.lane_of(store), lane_pool(store)
     ls = state.setdefault("lane", {})
     p = next((r for r in rows if r["n"] == ln), None)
-    peak = engine.load(p) if p and p["u5"] is not None else 0
+    peak = engine.load(p, model) if p and p["u5"] is not None else 0
     if ln is None:
         return None, peak
     # a move the watch did not make is the user's pick, kept until its limit
@@ -4854,13 +4809,21 @@ def lane_step(store, rows):
     elif ln != ls["set_by_watch"]:
         ls.update({"set_by_watch": ln, "manual": True})
         log(f"reserved sessions on #{ln} by hand — kept until it reaches its limit")
-    d = engine.lane_decide(rows, ln, pool, time.time(), ls)
+    d = engine.lane_decide(rows, ln, pool, time.time(), ls, auto_reset, model)
     state["lane_decision"] = (f"reserved sessions: {d['reason']}" if d else
                               f"reserved sessions on #{ln}"
                               + (" (not among the ones the watch moves them on)"
                                  if len(pool) > 1 else " (the watch does not move them)"))
     if d is None:
         return None, peak
+    if d["action"] == "reset":
+        log(f"reserved sessions: {d['reason']}")
+        spend_reset(d["target"], store, rows, d["grant"], ls, model)
+        if d["target"] != ln and run_logged([self_bin, str(d["target"])]):
+            ls.update({"last_switch": time.time(), "set_by_watch": d["target"],
+                       "manual": False, "wall_noted": False})
+        save_state()
+        return d, peak
     if d["action"] == "switch":
         tgt = next((r for r in rows if r["n"] == d["target"]), {})
         log(f"reserved sessions #{ln} -> #{d['target']} {tgt.get('label', '')}: {d['reason']}")
@@ -4890,24 +4853,32 @@ def run_logged(args):
             log(f"  {line.strip()}")
     return r.returncode == 0
 
-def spend_reset(n, store, rows):
-    """Spend account n's free reset, then check the 7d really emptied."""
-    label = next((r["label"] for r in rows if r["n"] == n), "?")
-    log(f"spending the free reset on #{n} {label}")
-    ok = run_logged([self_bin, "reset", str(n), "--yes"])
-    state.setdefault("reset_tried", {})[str(n)] = time.time()
+def spend_reset(n, store, rows, grant, mem, model):
+    """Spend the reset the engine chose on account n, then check it did what
+    its kind does. mem keeps the try: the watch's state, or the reserved
+    sessions' own."""
+    before = next((r for r in rows if r["n"] == n), {"n": n})
+    label = before.get("label", "?")
+    kind = engine.FULL if grant["kind"] == engine.FULL else grant["model"]
+    key = f"{n}:{engine.reset_key(grant)}"
+    log(f"spending a {kind} reset on #{n} {label} ({engine.usage(before, model)})")
+    ok = run_logged([self_bin, "reset", str(n), kind, "--yes"])
+    mem.setdefault("reset_tried", {})[key] = time.time()
     if not ok:
-        notify(f"Free reset on #{n} {label} not spent — see the watch log")
+        notify(f"Reset on #{n} {label} not spent — see the watch log")
     else:
         after = probe(store["accounts"][n - 1])
-        if after.get("u7") is not None and after["u7"] < 50:
-            log(f"reset done: #{n} now {engine.usage(after)}")
-            notify(f"Free reset spent on #{n} {label} — now {engine.usage(after)}")
+        if engine.reset_worked(grant, before, after):
+            log(f"reset done: #{n} now {engine.usage(after, model)}")
+            notify(f"{kind.capitalize()} reset spent on #{n} {label} — now"
+                   f" {engine.usage(after, model)}")
         else:
-            state.setdefault("reset_failed", []).append(n)
-            log(f"reset on #{n} reported done but it reads {engine.usage(after)}"
-                " — no more resets there until the next 'watch start'")
-            notify(f"Reset on #{n} {label} did not empty the week — see the watch log")
+            mem.setdefault("reset_failed", []).append(key)
+            log(f"{kind} reset on #{n} reported done but it reads"
+                f" {engine.usage(after, model)} — no more {kind} resets there"
+                " until the next 'watch start'")
+            notify(f"{kind.capitalize()} reset on #{n} {label} did not do what it"
+                   " should — see the watch log")
     save_state()
 
 # ---------- full logins (Claude in Chrome) ----------
@@ -4977,9 +4948,14 @@ try:
 except Exception:
     pass
 
-log(f"watch started — strategy {strategy}"
+try:
+    with open(store_path) as f:
+        start_model = engine.model_setting(json.load(f))
+except Exception:
+    start_model = "?"
+log(f"watch started — model {start_model}"
     + (", spends free resets" if auto_reset else "") + f", PID {os.getpid()}")
-notify(f"Watch running (strategy {strategy})")
+notify(f"Watch running (model {start_model})")
 
 while True:
     try:
@@ -4998,24 +4974,19 @@ while True:
         refresh_subscriptions(store)
         rows = probe_all(store)
         remind_expiring(rows)
+        model = engine.model_setting(store)
         p = next((r for r in rows if r["n"] == active), None)
-        if strategy == "general":
-            d = engine.decide(rows, active, time.time(), state, auto_reset)
-            desc = engine.usage(p) if p else "no data"
-            peak = engine.load(p) if p and p["u5"] is not None else 0
-        else:
-            d = fable_decide(rows, active)
-            metrics = {k: v for k, v in (("5h", p and p["u5"]), ("7d", p and p["u7"]),
-                                         ("Fable", p and p["fable"])) if v is not None}
-            desc = " · ".join(f"{k} {v:.0f}%" for k, v in metrics.items()) or "no data"
-            peak = max(metrics.values()) if metrics else 0
-        state.update({"active": active, "last": desc, "decision": d["reason"],
+        d = engine.decide(rows, active, time.time(), state, auto_reset, model)
+        desc = engine.usage(p, model) if p else "no data"
+        peak = engine.load(p, model) if p and p["u5"] is not None else 0
+        state.update({"active": active, "model": model, "last": desc,
+                      "decision": d["reason"],
                       "last_time": datetime.now().strftime("%H:%M")})
         save_state()
-        ld, lane_peak = lane_step(store, rows)
+        ld, lane_peak = lane_step(store, rows, model)
 
         if d["action"] == "reset":
-            spend_reset(d["target"], store, rows)
+            spend_reset(d["target"], store, rows, d["grant"], state, model)
             time.sleep(5)
             continue
 
@@ -5026,7 +4997,7 @@ while True:
                 notify(f"Switched to #{d['target']} {tgt.get('label', '')} — {d['reason']}")
                 state.update({"last_switch": time.time(), "set_by_watch": d["target"],
                               "manual": False, "wall_noted": False,
-                              "prewarned": False, "active": d["target"]})
+                              "active": d["target"]})
                 save_state()
                 nap(60)
             else:
@@ -5041,7 +5012,7 @@ while True:
             cadence = 600  # nothing to switch to: no point probing every minute
             if not state.get("wall_noted"):
                 when = f" — first one free at {clock(d['wake'])}" if d["wake"] else ""
-                holders = [f"#{r['n']}" for r in rows if r.get("resets")]
+                holders = [f"#{r['n']}" for r in rows if r.get("grants")]
                 hint = (f" · free reset on {', '.join(holders)} (claude-swap reset <n>)"
                         if holders and not auto_reset else "")
                 log(f"{d['reason']}{when}{hint}")
@@ -5051,17 +5022,6 @@ while True:
         elif state.get("wall_noted"):
             state["wall_noted"] = False
             save_state()
-
-        if strategy == "fable":
-            # the old pre-warning, kept for the Fable strategy only
-            if peak >= 95 and not state.get("prewarned"):
-                notify(f"Account #{active} at {peak:.0f}% ({desc}) — will rotate at 99%")
-                log(f"pre-warning: #{active} {desc}")
-                state["prewarned"] = True
-                save_state()
-            elif peak < 90 and state.get("prewarned"):
-                state["prewarned"] = False
-                save_state()
 
         sleep_for = cadence
         wakes = [w for w in (d["wake"], ld and ld["wake"]) if w]
