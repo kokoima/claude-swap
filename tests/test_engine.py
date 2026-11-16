@@ -335,6 +335,125 @@ class Models(unittest.TestCase):
         self.assertTrue(E["holds_reset"](acct(2, resets=1), NOW))  # rows without grants
 
 
+class ResetKinds(unittest.TestCase):
+    """Each reset is spent on what it empties: a full one on a spent week, a
+    model one on the preferred model, or on a week that model filled."""
+
+    def rows(self, **kw):
+        fields = {"u7": 60, "r7": NOW + 100 * H, "grants": [],
+                  "models": fab(10), "shares": {"Fable": 5}}
+        fields.update(kw)
+        return today({2: fields})
+
+    def due(self, rows, state=None, model="Fable"):
+        return decide(rows, 2, {**LONG_AGO, **(state or {})}, auto_reset=True, model=model)
+
+    def test_a_spent_week_takes_the_full_reset_over_a_model_one(self):
+        d = self.due(self.rows(u7=98, grants=[mgrant(), fgrant()]))
+        self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 2, "full"))
+
+    def test_without_a_full_one_a_model_reset_only_if_it_gives_back_a_quarter(self):
+        d = self.due(self.rows(u7=98, grants=[mgrant()], shares={"Fable": 30}))
+        self.assertEqual((d["action"], d["grant"]["kind"]), ("reset", "model"))
+        d = self.due(self.rows(u7=98, grants=[mgrant()], shares={"Fable": 20}))
+        self.assertNotEqual(d["action"], "reset")
+
+    def test_a_week_filled_by_fable_takes_its_reset_with_opus_preferred_too(self):
+        d = self.due(self.rows(u7=98, grants=[mgrant()], shares={"Fable": 40}), model="opus")
+        self.assertEqual((d["action"], d["grant"]["model"]), ("reset", "Fable"))
+
+    def test_a_spent_model_takes_its_reset_and_stays(self):
+        d = self.due(self.rows(models=fab(100), grants=[mgrant()]))
+        self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 2, "model"))
+
+    def test_not_with_less_than_a_quarter_of_the_week_left(self):
+        d = self.due(self.rows(u7=80, models=fab(100), grants=[mgrant()]))
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+
+    def test_with_opus_preferred_a_spent_fable_is_no_reason_to_spend(self):
+        d = self.due(self.rows(models=fab(100), grants=[mgrant()]), model="opus")
+        self.assertNotEqual(d["action"], "reset")
+
+    def test_a_kind_tried_lately_or_failed_is_left_alone_but_not_the_other(self):
+        rows = self.rows(models=fab(100), grants=[mgrant()])
+        self.assertNotEqual(self.due(rows, {"reset_tried": {"2:model:Fable": NOW - H}})["action"], "reset")
+        self.assertNotEqual(self.due(rows, {"reset_failed": ["2:model:Fable"]})["action"], "reset")
+        self.assertEqual(self.due(rows, {"reset_failed": ["2:full"]})["action"], "reset")
+        self.assertEqual(self.due(rows, {"reset_failed": [2]})["action"], "reset")  # older states
+
+    def test_a_full_reset_tried_lately_does_not_fall_back_to_a_model_one(self):
+        rows = self.rows(u7=98, grants=[fgrant(), mgrant()], shares={"Fable": 40})
+        self.assertNotEqual(self.due(rows, {"reset_tried": {"2:full": NOW - H}})["action"], "reset")
+
+    def test_spends_the_one_that_lapses_first(self):
+        rows = self.rows(models=fab(100), grants=[mgrant(gid="late", ends=NOW + 900 * H),
+                                                  mgrant(gid="soon", ends=NOW + 200 * H)])
+        self.assertEqual(self.due(rows)["grant"]["id"], "soon")
+
+
+class LaneResets(unittest.TestCase):
+    """A seat's reset is spent only once every seat in the pool is spent."""
+
+    def rows(self, over=None):
+        seats = {11: dict(u5=100, u7=40, r5=NOW + 3 * H, r7=NOW + 100 * H,
+                          grants=[fgrant(five_hour=True)]),
+                 13: dict(u5=0, u7=10, r7=NOW + 140 * H)}
+        for n, kw in (over or {}).items():
+            seats[n].update(kw)
+        return today({5: {"u7": 10}}) + [acct(n, reserved=True, **kw) for n, kw in seats.items()]
+
+    def lane(self, rows, auto_reset=True):
+        return E["lane_decide"](rows, 11, [11, 13], NOW, {}, auto_reset, "Fable")
+
+    def test_no_reset_while_another_seat_has_room(self):
+        self.assertEqual(self.lane(self.rows())["action"], "switch")
+
+    def test_every_seat_spent_spends_the_first_ones_reset(self):
+        d = self.lane(self.rows({13: dict(u5=100, r5=NOW + 2 * H)}))
+        self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 11, "full"))
+
+    def test_without_the_flag_it_waits_at_the_wall(self):
+        d = self.lane(self.rows({13: dict(u5=100, r5=NOW + 2 * H)}), auto_reset=False)
+        self.assertEqual(d["action"], "wall")
+
+
+class ResetOutcome(unittest.TestCase):
+    """What a spent reset should leave, by its kind."""
+
+    def test_a_full_reset_empties_the_week(self):
+        self.assertTrue(E["reset_worked"](fgrant(), acct(2, u7=100), acct(2, u7=1)))
+        self.assertFalse(E["reset_worked"](fgrant(), acct(2, u7=100), acct(2, u7=60)))
+
+    def test_on_a_seat_it_empties_the_5h_too(self):
+        g, before = fgrant(five_hour=True), acct(11, u5=100, u7=40)
+        self.assertFalse(E["reset_worked"](g, before, acct(11, u5=100, u7=0)))
+        self.assertTrue(E["reset_worked"](g, before, acct(11, u5=0, u7=0)))
+
+    def test_a_model_reset_empties_the_model_and_gives_its_share_back(self):
+        before = acct(2, u7=100, models=fab(77), shares={"Fable": 39})
+        self.assertTrue(E["reset_worked"](mgrant(), before, acct(2, u7=61, models=fab(0))))
+        self.assertFalse(E["reset_worked"](mgrant(), before, acct(2, u7=95, models=fab(0))))
+        self.assertFalse(E["reset_worked"](mgrant(), before, acct(2, u7=61, models=fab(40))))
+
+
+def holder2(**kw):
+    return acct(2, **{"u7": 60, "grants": [fgrant(), mgrant()], **kw})
+
+
+class ResetFor(unittest.TestCase):
+    """What `claude-swap reset <n> [kind]` spends."""
+
+    def test_by_kind(self):
+        self.assertEqual(E["reset_for"](holder2(), NOW, "full")["kind"], "full")
+        self.assertEqual(E["reset_for"](holder2(), NOW, "fable")["kind"], "model")
+        self.assertIsNone(E["reset_for"](holder2(grants=[fgrant()]), NOW, "fable"))
+
+    def test_by_default_what_helps_now(self):
+        self.assertEqual(E["reset_for"](holder2(models=fab(100)), NOW, None, "Fable")["kind"], "model")
+        self.assertEqual(E["reset_for"](holder2(u7=100), NOW, None, "Fable")["kind"], "full")
+        self.assertEqual(E["reset_for"](holder2(), NOW, None, "Fable")["kind"], "full")
+
+
 class Wall(unittest.TestCase):
     def test_all_blocked_waits_for_the_soonest_unblock(self):
         rows = today({3: {"u5": 99}, 5: {"u7": 99}, 2: {"u5": 99}})

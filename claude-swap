@@ -91,6 +91,7 @@ LAST_DAY = 24 * 3600        # quota expiring within this goes first
 MIN_DWELL = 15 * 60         # no voluntary switch sooner than this after the last
 RESET_MIN_LEFT = 24 * 3600  # a week renewing sooner than this refills for free
 RESET_RETRY = 6 * 3600      # at most one reset per account in this span
+RESET_DONE = 5              # a spent reset leaves what it clears at or below this
 ERROR_RETRY = 300           # probe failed on the active account: look again
 
 INF = float("inf")
@@ -208,23 +209,112 @@ def unblock_at(r, model=None):
     return max(times)
 
 
-def reset_due(r, now, state):
-    """Aggressive policy: spend a free reset as soon as the week is spent."""
-    if (r.get("u7") or 0) < LEAVE or not holds_reset(r, now):
+def reset_key(g):
+    """How the watch remembers a kind of reset it tried on an account."""
+    return FULL if g["kind"] == FULL else f"{MODEL}:{g.get('model')}"
+
+
+def _reset_allowed(r, g, now, state):
+    n, key = r["n"], reset_key(g)
+    failed = state.get("reset_failed") or []
+    # older states hold bare account numbers, which were full resets
+    if f"{n}:{key}" in failed or (key == FULL and n in failed):
         return False
-    if (r.get("reset_cooldown") or 0) > now:
-        return False
-    if r["n"] in (state.get("reset_failed") or []):
-        return False
-    tried = (state.get("reset_tried") or {}).get(str(r["n"]))
-    if tried and now - tried < RESET_RETRY:
-        return False
-    r7 = r.get("r7")
-    if r7 and r7 - now < RESET_MIN_LEFT:
-        # the week refills for free soon: spend only if the reset lapses first
-        ends = r.get("resets_ends")
-        return bool(ends and ends <= r7)
+    tried = state.get("reset_tried") or {}
+    t = tried.get(f"{n}:{key}") or (tried.get(str(n)) if key == FULL else None)
+    return not (t and now - t < RESET_RETRY)
+
+
+def _worth_before(g, renews, now):
+    # the window refills for free soon: spend only if the reset lapses first
+    if renews and renews - now < RESET_MIN_LEFT:
+        return bool(g["ends"] and g["ends"] <= renews)
     return True
+
+
+def reset_due(r, now, state, model=None):
+    """The reset to spend on r now, or None (aggressive policy).
+
+    The week spent: its full reset; without one, a model reset whose model
+    spent at least MODEL_RESET_MIN_WEEK of the week, which it gives back.
+    The 5h spent on a seat whose full reset clears the 5h too: that one.
+    The preferred model spent, with at least MODEL_RESET_MIN_WEEK of the
+    week left: a reset of that model. Never in a cooldown, never twice
+    within RESET_RETRY, never a kind that did not work on that account.
+    """
+    if (r.get("reset_cooldown") or 0) > now:
+        return None
+
+    def first(gs):
+        return next((g for g in gs if _reset_allowed(r, g, now, state)), None)
+
+    u7 = r.get("u7") or 0
+    if u7 >= LEAVE:
+        full = grants_of(r, now, FULL)
+        if full:
+            g = first(full)
+            return g if g and _worth_before(g, r.get("r7"), now) else None
+        for name, share in sorted((r.get("shares") or {}).items(), key=lambda kv: -kv[1]):
+            if share < MODEL_RESET_MIN_WEEK:
+                break
+            g = first(grants_of(r, now, MODEL, name))
+            if g:
+                return g
+        return None
+    if (r.get("u5") or 0) >= LEAVE:
+        g = first(g for g in grants_of(r, now, FULL) if g["five_hour"])
+        if g:
+            return g
+    mp = model_pct(r, model)
+    if mp is not None and mp >= LEAVE and u7 <= 100 - MODEL_RESET_MIN_WEEK:
+        g = first(grants_of(r, now, MODEL, model))
+        if g and _worth_before(g, model_reset_at(r, model), now):
+            return g
+    return None
+
+
+def reset_reason(r, g, model=None):
+    n, now = r["n"], usage(r, model)
+    if g["kind"] == FULL:
+        what = "its week" if (r.get("u7") or 0) >= LEAVE else "its 5h"
+        return f"#{n} spent {what} ({now}) and holds a full reset"
+    name = g.get("model")
+    if (r.get("u7") or 0) >= LEAVE:
+        back = (r.get("shares") or {}).get(name) or 0
+        return f"#{n} spent its week ({now}); a {name} reset gives {back:.0f}% of it back"
+    return f"#{n} spent its {name} ({now}) and holds a {name} reset"
+
+
+def reset_worked(g, before, after):
+    """Whether a spent reset did what its kind does, read on fresh rows: a
+    full one empties the week (and the 5h if it clears it); a model one
+    empties that model and gives its share of the week back."""
+    if g["kind"] == FULL:
+        if (after.get("u7") or 0) > RESET_DONE:
+            return False
+        return not g.get("five_hour") or (after.get("u5") or 0) <= RESET_DONE
+    name = g.get("model")
+    pct = model_pct(after, name)
+    if pct is None or pct > RESET_DONE:
+        return False
+    back = (before.get("shares") or {}).get(name) or 0
+    return (before.get("u7") or 0) - (after.get("u7") or 0) >= back - RESET_DONE
+
+
+def reset_for(r, now, kind=None, model=None):
+    """The reset `claude-swap reset <n> [kind]` spends. kind "full" or a
+    model's name; by default what helps now (as the watch would pick it),
+    else the full one, else any model one. None if there is none."""
+    if kind and kind.lower() == FULL:
+        return next(iter(grants_of(r, now, FULL)), None)
+    if kind:
+        return next(iter(grants_of(r, now, MODEL, kind)), None)
+    g = reset_due(r, now, {}, model) or next(iter(grants_of(r, now, FULL)), None)
+    if g:
+        return g
+    names = {g.get("model") for g in r.get("grants") or [] if g["kind"] == MODEL}
+    return next((g for name in sorted(n for n in names if n)
+                 for g in grants_of(r, now, MODEL, name)), None)
 
 
 def next_event(rows, now, model=None):
@@ -255,7 +345,9 @@ def decide(rows, active, now, state, auto_reset=False, model=None):
     """What to do now: stay, switch, spend a reset, or wait at the wall.
 
     state carries last_switch (epoch), manual (the active account was picked
-    by hand), reset_tried ({"n": epoch}) and reset_failed ([n]). Returns
+    by hand), reset_tried ({"<n>:<reset_key>": epoch}) and reset_failed
+    (["<n>:<reset_key>"]; bare numbers in older states count as full resets).
+    A "reset" decision also carries the grant to spend. Returns
     {"action", "target", "reason", "wake"}; wake is the next instant worth
     looking again, or None. model: the preferred model, whose own weekly
     limit counts like the 5h and the week (None: none counts).
@@ -272,9 +364,11 @@ def decide(rows, active, now, state, auto_reset=False, model=None):
 
     if auto_reset:
         for r in ranked:
-            if reset_due(r, now, state):
-                return out("reset", r["n"],
-                           f"#{r['n']} spent its week ({usage(r, model)}) and holds a reset")
+            g = reset_due(r, now, state, model)
+            if g:
+                d = out("reset", r["n"], reset_reason(r, g, model))
+                d["grant"] = g
+                return d
 
     if (cur is not None and cur.get("error")
             and not (cur.get("disabled") or cur.get("free") or cur.get("reserved"))):
@@ -316,11 +410,19 @@ def lane_decide(rows, lane, pool, now, state, auto_reset=False, model=None):
     """The reserved sessions (claude-swap run), moved like the shared login
     but only among pool, the reserved accounts the watch may put them on.
     None when they are not the watch's to move: no pool, or on an account
-    outside it (a pick by hand there is left alone)."""
+    outside it (a pick by hand there is left alone). A seat's reset is only
+    spent once every seat in the pool is at its limit."""
     if len(pool) < 2 or lane not in pool:
         return None
     sub = [dict(r, reserved=False) for r in rows if r["n"] in pool]
-    return decide(sub, lane, now, state, False, model)
+    d = decide(sub, lane, now, state, False, model)
+    if auto_reset and d["action"] == "wall":
+        for r in rank(sub, now, model):
+            g = reset_due(r, now, state, model)
+            if g:
+                return dict(d, action="reset", target=r["n"], grant=g,
+                            reason="every seat at its limit; " + reset_reason(r, g, model))
+    return d
 
 
 # --- Plan timeline: what check draws, and when the watch re-reads it ---
