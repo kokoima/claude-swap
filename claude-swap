@@ -4312,7 +4312,7 @@ _watch_args() {
              # only the start path writes the model: the daemon (watch run) may
              # carry an old "fable" from a plist, and must not undo a later
              # 'claude-swap model <x>'
-             [ "$from_start" = 1 ] && _fable_alias ;;
+             if [ "$from_start" = 1 ]; then _fable_alias; fi ;;
       --auto-reset) WATCH_AUTO_RESET=1 ;;
       *) echo "Usage: claude-swap watch start [general|fable] [--auto-reset]"; exit 1 ;;
     esac
