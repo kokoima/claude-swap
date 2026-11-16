@@ -4275,7 +4275,8 @@ PYEOF
 }
 
 _watch_state_forget() {
-  # drop keys from the watch state, e.g. so a fresh start retries failed resets
+  # drop keys from the watch state, e.g. so a fresh start retries failed
+  # resets; a dotted key (lane.reset_failed) reaches into a nested one
   [ -f "$WATCH_STATE" ] || return 0
   python3 - "$WATCH_STATE" "$@" <<'PYEOF'
 import json, sys
@@ -4286,7 +4287,12 @@ try:
 except Exception:
     sys.exit(0)
 for k in keys:
-    s.pop(k, None)
+    *parents, last = k.split(".")
+    d = s
+    for p in parents:
+        d = d.get(p) if isinstance(d, dict) else None
+    if isinstance(d, dict):
+        d.pop(last, None)
 with open(path, "w") as f:
     json.dump(s, f)
 PYEOF
@@ -4327,8 +4333,9 @@ cmd_watch_start() {
     return
   fi
   rm -f "$WATCH_PID"
-  # a fresh start gives every account another chance at a reset that failed
-  _watch_state_forget reset_failed
+  # a fresh start gives every account another chance at a reset that failed,
+  # the reserved sessions' seats too
+  _watch_state_forget reset_failed lane.reset_failed
   local self
   self="$(command -v claude-swap || echo "$0")"
   self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
@@ -4535,7 +4542,10 @@ def web_usage(acc):
             d = json.load(r)
     except Exception:
         return None
-    return engine.parse_usage(d, time.time())
+    try:
+        return engine.parse_usage(d, time.time())
+    except Exception:
+        return None  # a reply of an unexpected shape: as if the read failed
 
 def probe(acc):
     """Every window of one account, plus its rate_limited flag.
@@ -4671,14 +4681,22 @@ def probe_all(store):
 state = {"strategy": strategy, "auto_reset": auto_reset,
          "started": datetime.now().isoformat(timespec="seconds")}
 try:
-    # carried over so a restart neither repeats reminders nor retries a
-    # reset too soon; the active account is adopted afresh below
+    # carried over, the reserved sessions' reset tries too, so a restart
+    # neither repeats reminders nor retries a reset too soon, nor a kind
+    # that did not work (only `watch start` forgets those); the active
+    # account and the reserved sessions' one are adopted afresh below
     with open(state_path) as f:
         prev = json.load(f)
     for k in ("reset_warned", "reset_tried", "reset_failed", "last_switch",
               "login_warned"):
         if k in prev:
             state[k] = prev[k]
+    prev_lane = prev.get("lane")
+    if isinstance(prev_lane, dict):
+        lane = {k: prev_lane[k] for k in ("reset_tried", "reset_failed")
+                if k in prev_lane}
+        if lane:
+            state["lane"] = lane
 except Exception:
     pass
 
@@ -4818,10 +4836,15 @@ def lane_step(store, rows, model):
         return None, peak
     if d["action"] == "reset":
         log(f"reserved sessions: {d['reason']}")
-        spend_reset(d["target"], store, rows, d["grant"], ls, model)
-        if d["target"] != ln and run_logged([self_bin, str(d["target"])]):
-            ls.update({"last_switch": time.time(), "set_by_watch": d["target"],
-                       "manual": False, "wall_noted": False})
+        # the sessions go to the seat only once its reset has freed it
+        if spend_reset(d["target"], store, rows, d["grant"], ls, model) \
+                and d["target"] != ln:
+            if run_logged([self_bin, str(d["target"])]):
+                ls.update({"last_switch": time.time(), "set_by_watch": d["target"],
+                           "manual": False, "wall_noted": False})
+            else:
+                log("moving the reserved sessions failed")
+                notify("Moving the reserved sessions failed — check the watch log")
         save_state()
         return d, peak
     if d["action"] == "switch":
@@ -4856,7 +4879,7 @@ def run_logged(args):
 def spend_reset(n, store, rows, grant, mem, model):
     """Spend the reset the engine chose on account n, then check it did what
     its kind does. mem keeps the try: the watch's state, or the reserved
-    sessions' own."""
+    sessions' own. True only if it was spent and did what it should."""
     before = next((r for r in rows if r["n"] == n), {"n": n})
     label = before.get("label", "?")
     kind = engine.FULL if grant["kind"] == engine.FULL else grant["model"]
@@ -4864,11 +4887,13 @@ def spend_reset(n, store, rows, grant, mem, model):
     log(f"spending a {kind} reset on #{n} {label} ({engine.usage(before, model)})")
     ok = run_logged([self_bin, "reset", str(n), kind, "--yes"])
     mem.setdefault("reset_tried", {})[key] = time.time()
+    worked = False
     if not ok:
         notify(f"Reset on #{n} {label} not spent — see the watch log")
     else:
         after = probe(store["accounts"][n - 1])
-        if engine.reset_worked(grant, before, after):
+        worked = engine.reset_worked(grant, before, after)
+        if worked:
             log(f"reset done: #{n} now {engine.usage(after, model)}")
             notify(f"{kind.capitalize()} reset spent on #{n} {label} — now"
                    f" {engine.usage(after, model)}")
@@ -4880,6 +4905,7 @@ def spend_reset(n, store, rows, grant, mem, model):
             notify(f"{kind.capitalize()} reset on #{n} {label} did not do what it"
                    " should — see the watch log")
     save_state()
+    return worked
 
 # ---------- full logins (Claude in Chrome) ----------
 # Claude Code refreshes the login in use every ~8 h; a minute later it is in
