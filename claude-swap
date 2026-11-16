@@ -2545,7 +2545,8 @@ for i, acc in enumerate(accounts):
     row["plan_end"] = plan_end(acc)
     if web:
         row["models"], row["shares"], row["grants"] = web["models"], web["shares"], web["grants"]
-        row["fable"] = engine.model_pct(web, PREF)  # the cache's name for it
+        # the cache's Fable figure (the statusline's ✨ bar), whatever PREF is
+        row["fable"] = engine.model_pct(web, "Fable")
         # An unspent reset is lost with the plan it came with, so the plan
         # ending first is its real deadline.
         pe = ep(row["plan_end"])
@@ -4012,20 +4013,29 @@ PYEOF
 
 cmd_reset() {
   check_store
-  local target="" kind="" assume_yes="" arg confirm=""
-  local usage="Usage: claude-swap reset <n> [full|fable] [--yes]"
-  for arg in "$@"; do
-    case "$arg" in
+  local target="" kind="" assume_yes="" want="" confirm=""
+  local usage="Usage: claude-swap reset <n> [full|fable] [--grant <id>] [--yes]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
       "") ;;
       --yes) assume_yes=--yes ;;
-      *[!0-9]*) if [ -z "$kind" ]; then kind="$arg"; else echo "$usage"; exit 1; fi ;;
-      *) if [ -z "$target" ]; then target="$arg"; else echo "$usage"; exit 1; fi ;;
+      # --grant: that very reset (the watcher names the one it chose)
+      --grant)
+        if [ $# -lt 2 ] || [ -z "$2" ]; then echo "$usage"; exit 1; fi
+        want="$2"; shift ;;
+      --grant=*)
+        want="${1#--grant=}"
+        if [ -z "$want" ]; then echo "$usage"; exit 1; fi ;;
+      -*) echo "$usage"; exit 1 ;;
+      *[!0-9]*) if [ -z "$kind" ]; then kind="$1"; else echo "$usage"; exit 1; fi ;;
+      *) if [ -z "$target" ]; then target="$1"; else echo "$usage"; exit 1; fi ;;
     esac
+    shift
   done
   [ -n "$target" ] || { echo "$usage"; exit 1; }
 
   local grant
-  grant=$(_reset_run inspect "$target" "$kind") || exit 1
+  grant=$(_reset_run inspect "$target" "$kind" "$want") || exit 1
   # --yes is how the watcher spends one (watch start --auto-reset)
   if [ "$assume_yes" != "--yes" ]; then
     echo ""
@@ -4039,8 +4049,9 @@ cmd_reset() {
 }
 
 _reset_run() {
-  # inspect: describe the reset the server would spend next and print its
-  #          grant id on stdout (everything else goes to stderr).
+  # inspect: describe the reset to spend (the grant given, else the one of
+  #          the kind given, else what helps now) and print its grant id on
+  #          stdout (everything else goes to stderr).
   # claim:   spend that grant, then re-read claude.ai to report the outcome.
   python3 - "$STORE" "$@" <<'PYEOF'
 import json, os, sys, time, types, uuid
@@ -4049,6 +4060,7 @@ from datetime import datetime
 
 store_path, mode, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
 extra = sys.argv[4] if len(sys.argv) > 4 else ""
+want = sys.argv[5] if len(sys.argv) > 5 else ""  # inspect: a grant id
 engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 
@@ -4133,20 +4145,50 @@ if mode == "inspect":
         fail(f"{who}: resets are cooling down until {fmt(cooldown)}.")
     now_ts = time.time()
     row = dict(engine.parse_usage(d, now_ts), n=target)
-    chosen = engine.reset_for(row, now_ts, extra or None, model)
-    if chosen is None:
-        if not row["grants"]:
-            fail(f"{who} has no free limit resets left.")
-        kinds = ", ".join(sorted({engine.reset_key(g) for g in row["grants"]}))
-        fail(f"{who} holds no {extra or 'usable'} reset (it holds: {kinds}).")
+    NOT_NOW = ("claude.ai says it cannot be spent right now (some only work"
+               " once the account is at a limit).")
+
+    def kind_of(g):
+        if g["kind"] == engine.FULL:
+            return engine.FULL
+        return g.get("model") or "model (of a model it cannot tell)"
+
+    if want:
+        # that very reset: the watcher names the one it chose
+        chosen = next((g for g in row["grants"] if g["id"] == want), None)
+        if chosen is None:
+            fail(f"{who} holds no live reset {want} (spent, lapsed, paused or never"
+                 " there) — 'claude-swap check' shows the ones it holds.")
+        if extra and extra.lower() != kind_of(chosen).lower():
+            fail(f"{who}: reset {want} is a {kind_of(chosen)} reset, not a {extra} one.")
+        if chosen.get("usable_now") is False:
+            fail(f"{who} holds reset {want}, but {NOT_NOW}")
+    else:
+        chosen = engine.reset_for(row, now_ts, extra or None, model)
+        if chosen is None:
+            if not row["grants"]:
+                fail(f"{who} has no free limit resets left.")
+            if extra:
+                held = (engine.grants_of(row, now_ts, engine.FULL)
+                        if extra.lower() == engine.FULL
+                        else engine.grants_of(row, now_ts, engine.MODEL, extra))
+            else:
+                held = [g for g in row["grants"]
+                        if g["kind"] == engine.FULL or g.get("model")]
+            if held:  # held, but none can be spent now
+                fail(f"{who} holds {'a ' + extra if extra else 'a'} reset, but {NOT_NOW}")
+            kinds = ", ".join(sorted({kind_of(g) for g in row["grants"]}))
+            fail(f"{who} holds no {extra or 'usable'} reset (it holds: {kinds}).")
     gid = chosen["id"]
     grant = next((g for g in ce.get("grants") or [] if g.get("id") == gid), None)
-    if grant is None or not chosen["usable_now"]:
-        fail(f"{who} holds that reset, but claude.ai says it cannot be spent right "
-             "now (some only work once the account is at a limit).")
+    if grant is None:
+        fail(f"{who}: claude.ai's reply does not name that reset — try again.")
+
+    def at(ts):
+        return datetime.fromtimestamp(ts).astimezone() if ts else None
 
     u5, u7 = row["u5"], row["u7"]
-    r7 = local((d.get("seven_day") or {}).get("resets_at"))
+    r7 = at(row["r7"])
     clears = [WINDOW_NAMES.get(c, c) for c in grant.get("clears") or []]
     say(f"Free limit reset — {who}")
     say(f"  {grant.get('label') or gid}")
@@ -4162,22 +4204,30 @@ if mode == "inspect":
         say(f"  ! The plan stops {fmt(min(stops))} (cancelled or downgraded):"
             " the reset is lost then if still unspent.")
     say(f"  Clears: {', '.join(clears) or '?'}")
+    name = chosen.get("model")
     if chosen["kind"] == engine.FULL:
         say("  Kind:   full — empties the week and every model's week"
             + (", and the 5h" if chosen["five_hour"] else ""))
+    elif name:
+        back = row["shares"].get(name) or 0
+        say(f"  Kind:   {name} — empties {name} and gives {back:.0f}% of the week back")
     else:
-        back = row["shares"].get(chosen["model"]) or 0
-        say(f"  Kind:   {chosen['model']} — empties {chosen['model']} and gives"
-            f" {back:.0f}% of the week back")
-    say(f"  Now:    {engine.usage(row, model)}"
+        say("  Kind:   a model's — which model it empties cannot be told")
+    say(f"  Now:    {engine.usage(row, name or model)}"
         + (f" (week renews {fmt(r7)}, in {until(r7)})" if r7 else ""))
     say("  The weekly renewal does not move: the reset only empties the windows now.")
-    if r7 and (r7 - datetime.now().astimezone()).total_seconds() < 48 * 3600:
-        say(f"  ! The 7d window renews anyway in {until(r7)} — little to gain here;"
+    # little to gain: what it empties renews soon anyway, or is far from spent
+    if chosen["kind"] == engine.FULL:
+        renews, spent = r7, max(u5 or 0, u7 or 0)
+        what, far = "The 7d window", "This account is still far from its limits"
+    else:
+        renews, spent = at(engine.model_reset_at(row, name)), engine.model_pct(row, name)
+        what, far = f"{name}'s weekly limit", f"{name} is still far from its limit on this account"
+    if renews and (renews - datetime.now().astimezone()).total_seconds() < 48 * 3600:
+        say(f"  ! {what} renews anyway in {until(renews)} — little to gain here;"
             " a reset is worth more on an account with days to go.")
-    elif max(u5 or 0, u7 or 0) < 80:
-        say("  ! This account is still far from its limits — a reset is worth"
-            " more once it is spent.")
+    elif spent is not None and spent < 80:
+        say(f"  ! {far} — a reset is worth more once it is spent.")
     print(gid)
     sys.exit(0)
 
@@ -4216,13 +4266,17 @@ try:
     after_d = read_usage()
 except Exception:
     after_d = None
-spent = after_d is not None and resets_left(after_d, grant_id) < before
+try:
+    spent = after_d is not None and resets_left(after_d, grant_id) < before
+except Exception:
+    spent = False  # a re-read of an unexpected shape tells nothing
 
-if result == "reset" or spent:
-    say(f"Done — limits reset on {who}.")
+def report():
+    """What the spent reset left, and the snapshot patched with it."""
     b_row = engine.parse_usage(before_d, time.time())
     a_row = engine.parse_usage(after_d, time.time()) if after_d else {}
-    say(f"  Now: {engine.usage(a_row, model)}" if a_row else "  Now: ?")
+    shown = (g or {}).get("model") or model
+    say(f"  Now: {engine.usage(a_row, shown)}" if a_row else "  Now: ?")
     if g and a_row and not engine.reset_worked(g, b_row, a_row):
         say("  ! It did not leave what this kind of reset should leave"
             " (claude.ai may take a minute to show it).")
@@ -4233,7 +4287,7 @@ if result == "reset" or spent:
         for row in snap.get("accounts", []):
             if row.get("n") == target and after_d:
                 row.update({"u5": a_row.get("u5"), "u7": a_row.get("u7"),
-                            "fable": engine.model_pct(a_row, model),
+                            "fable": engine.model_pct(a_row, "Fable"),
                             "resets": a_row.get("resets"),
                             "resets_model": sum(x["left"] for x in a_row.get("grants") or []
                                                 if x["kind"] == engine.MODEL)})
@@ -4242,6 +4296,14 @@ if result == "reset" or spent:
         os.replace(CACHE_PATH + ".tmp", CACHE_PATH)
     except Exception:
         pass
+
+if result == "reset" or spent:
+    # spent: whatever goes wrong while telling about it, the exit says so
+    try:
+        say(f"Done — limits reset on {who}.")
+        report()
+    except Exception as e:
+        say(f"  (spent, but showing what it left failed: {type(e).__name__})")
     sys.exit(0)
 
 reason = reply.get("reason") if isinstance(reply, dict) else None
@@ -4431,6 +4493,7 @@ cmd_watch_status() {
   if [ -f "$WATCH_STATE" ]; then
     python3 - "$WATCH_STATE" <<'PYEOF'
 import json, sys
+from datetime import datetime
 try:
     with open(sys.argv[1]) as f:
         s = json.load(f)
@@ -4447,6 +4510,19 @@ if s.get("decision"):
     print(f"  {s['decision']}")
 if s.get("lane_decision"):
     print(f"  {s['lane_decision']}")
+lr = s.get("last_reset")
+if isinstance(lr, dict):
+    # time, account, kind and outcome (worked / did not work / not spent /
+    # could not verify) of the last reset the watch spent or tried
+    try:
+        when = datetime.fromisoformat(lr["time"]).strftime("%a %d %b %H:%M")
+    except (KeyError, TypeError, ValueError):
+        when = "?"
+    what = f"{lr.get('kind', '?')} reset on #{lr.get('n', '?')} {lr.get('label') or ''}".rstrip()
+    if lr.get("lane"):
+        what += " (reserved sessions)"
+    print(f"  last reset: {when} · {what} · {lr.get('outcome', '?')}"
+          + (f" — now {lr['now']}" if lr.get("now") else ""))
 PYEOF
   fi
   if [ -f "$WATCH_LOG" ]; then
@@ -4690,14 +4766,15 @@ def probe_all(store):
         rows.append(row)
         time.sleep(1.2)  # claude.ai throttles bursts
     try:
-        # fable: the preferred model's % (the statusline reads that name)
+        # fable: the Fable figure, whatever the preferred model (the
+        # statusline's ✨ bar reads that name); models carries every one
         snapshot = {"updated": time.time(), "active": store.get("active", 0),
                     "model": model,
                     "accounts": [dict({k: r.get(k) for k in
                                        ("n", "label", "u5", "u7", "plan", "error",
                                         "disabled", "reserved", "src", "resets",
                                         "resets_ends", "models", "shares")},
-                                      fable=engine.model_pct(r, model),
+                                      fable=engine.model_pct(r, "Fable"),
                                       resets_model=sum(g["left"] for g in r.get("grants") or []
                                                        if g["kind"] == engine.MODEL))
                                  for r in rows]}
@@ -4718,7 +4795,7 @@ try:
     with open(state_path) as f:
         prev = json.load(f)
     for k in ("reset_warned", "reset_tried", "reset_failed", "last_switch",
-              "login_warned"):
+              "login_warned", "last_reset"):
         if k in prev:
             state[k] = prev[k]
     prev_lane = prev.get("lane")
@@ -4906,34 +4983,66 @@ def run_logged(args):
             log(f"  {line.strip()}")
     return r.returncode == 0
 
+VERIFY_WAIT = 60  # claude.ai can take a minute to show what a reset emptied
+
 def spend_reset(n, store, rows, grant, mem, model):
-    """Spend the reset the engine chose on account n, then check it did what
-    its kind does. mem keeps the try: the watch's state, or the reserved
-    sessions' own. True only if it was spent and did what it should."""
+    """Spend the reset the engine chose on account n (that very grant), then
+    check it did what its kind does. mem keeps the try: the watch's state,
+    or the reserved sessions' own. True only if it was spent and a fresh
+    cookie read shows it did what it should. A read that does not come, or
+    does not match yet, is looked at once more a minute later; only one that
+    comes and contradicts the kind stops that kind on the account until the
+    next 'watch start'. The outcome goes to the state's last_reset."""
     before = next((r for r in rows if r["n"] == n), {"n": n})
     label = before.get("label", "?")
     kind = engine.FULL if grant["kind"] == engine.FULL else grant["model"]
     key = f"{n}:{engine.reset_key(grant)}"
     log(f"spending a {kind} reset on #{n} {label} ({engine.usage(before, model)})")
-    ok = run_logged([self_bin, "reset", str(n), kind, "--yes"])
+    cmd = [self_bin, "reset", str(n), kind]
+    if grant.get("id"):
+        cmd += ["--grant", str(grant["id"])]
+    ok = run_logged(cmd + ["--yes"])
     mem.setdefault("reset_tried", {})[key] = time.time()
-    worked = False
+    worked, after = False, None
+
+    def verify():
+        # only a cookie read carries what a reset empties (a model's week)
+        a = probe(store["accounts"][n - 1])
+        readable = a.get("src") == "web"
+        return a, readable, readable and engine.reset_worked(grant, before, a)
+
     if not ok:
+        outcome = "not spent"
         notify(f"Reset on #{n} {label} not spent — see the watch log")
     else:
-        after = probe(store["accounts"][n - 1])
-        worked = engine.reset_worked(grant, before, after)
+        after, readable, worked = verify()
+        if not worked:
+            time.sleep(VERIFY_WAIT)
+            after, readable, worked = verify()
         if worked:
+            outcome = "worked"
             log(f"reset done: #{n} now {engine.usage(after, model)}")
             notify(f"{kind.capitalize()} reset spent on #{n} {label} — now"
                    f" {engine.usage(after, model)}")
+        elif not readable:
+            outcome = "could not verify"
+            log(f"{kind} reset on #{n} spent, but its usage could not be read"
+                " back from claude.ai — could not verify it (not counted as a failure)")
+            notify(f"{kind.capitalize()} reset spent on #{n} {label}, but it could"
+                   " not be verified — see the watch log")
         else:
+            outcome = "did not work"
             mem.setdefault("reset_failed", []).append(key)
             log(f"{kind} reset on #{n} reported done but it reads"
                 f" {engine.usage(after, model)} — no more {kind} resets there"
                 " until the next 'watch start'")
             notify(f"{kind.capitalize()} reset on #{n} {label} did not do what it"
                    " should — see the watch log")
+    state["last_reset"] = {
+        "time": datetime.now().isoformat(timespec="seconds"), "n": n,
+        "label": label, "kind": kind, "outcome": outcome,
+        "lane": mem is not state,
+        "now": engine.usage(after, model) if after and after.get("src") == "web" else None}
     save_state()
     return worked
 
