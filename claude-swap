@@ -5007,7 +5007,8 @@ def spend_reset(n, store, rows, grant, mem, model):
     label = before.get("label", "?")
     kind = engine.FULL if grant["kind"] == engine.FULL else grant["model"]
     key = f"{n}:{engine.reset_key(grant)}"
-    log(f"spending a {kind} reset on #{n} {label} ({engine.usage(before, model)})")
+    shown = grant.get("model") or model  # a model reset shows its model
+    log(f"spending a {kind} reset on #{n} {label} ({engine.usage(before, shown)})")
     cmd = [self_bin, "reset", str(n), kind]
     if grant.get("id"):
         cmd += ["--grant", str(grant["id"])]
@@ -5031,9 +5032,9 @@ def spend_reset(n, store, rows, grant, mem, model):
             after, readable, worked = verify()
         if worked:
             outcome = "worked"
-            log(f"reset done: #{n} now {engine.usage(after, model)}")
+            log(f"reset done: #{n} now {engine.usage(after, shown)}")
             notify(f"{kind.capitalize()} reset spent on #{n} {label} — now"
-                   f" {engine.usage(after, model)}")
+                   f" {engine.usage(after, shown)}")
         elif not readable:
             outcome = "could not verify"
             log(f"{kind} reset on #{n} spent, but its usage could not be read"
@@ -5044,7 +5045,7 @@ def spend_reset(n, store, rows, grant, mem, model):
             outcome = "did not work"
             mem.setdefault("reset_failed", []).append(key)
             log(f"{kind} reset on #{n} reported done but it reads"
-                f" {engine.usage(after, model)} — no more {kind} resets there"
+                f" {engine.usage(after, shown)} — no more {kind} resets there"
                 " until the next 'watch start'")
             notify(f"{kind.capitalize()} reset on #{n} {label} did not do what it"
                    " should — see the watch log")
@@ -5052,7 +5053,7 @@ def spend_reset(n, store, rows, grant, mem, model):
         "time": datetime.now().isoformat(timespec="seconds"), "n": n,
         "label": label, "kind": kind, "outcome": outcome,
         "lane": mem is not state,
-        "now": engine.usage(after, model) if after and after.get("src") == "web" else None}
+        "now": engine.usage(after, shown) if after and after.get("src") == "web" else None}
     save_state()
     return worked
 
