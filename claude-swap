@@ -2956,7 +2956,7 @@ cmd_auto() {
   local strategy="${1:-general}"
   case "$strategy" in
     general) ;;
-    fable) cmd_model fable >/dev/null; strategy=general ;;
+    fable) _fable_alias; strategy=general ;;
     *) echo "Invalid strategy: $strategy (use general, or fable for 'model fable')"; exit 1 ;;
   esac
   local result
@@ -4292,16 +4292,27 @@ with open(path, "w") as f:
 PYEOF
 }
 
+_fable_alias() {
+  # the old fable entry points (auto fable, af, wf, watch start fable)
+  cmd_model fable >/dev/null
+  echo "The fable strategy is now the general one with 'claude-swap model fable' (model set to fable)."
+}
+
 _watch_args() {
-  # parse [general|fable] [--auto-reset] into WATCH_STRATEGY / WATCH_AUTO_RESET
+  # parse [general|fable] [--auto-reset] into WATCH_STRATEGY / WATCH_AUTO_RESET;
+  # the first argument is 1 when called from cmd_watch_start, 0 from the daemon
+  local from_start="$1"; shift
   WATCH_STRATEGY="general"
   WATCH_AUTO_RESET=0
   local arg
   for arg in "$@"; do
     case "$arg" in
       general) WATCH_STRATEGY=general ;;
-      fable) WATCH_STRATEGY=general; cmd_model fable >/dev/null
-             echo "The fable strategy is now the general one with 'claude-swap model fable'." ;;
+      fable) WATCH_STRATEGY=general
+             # only the start path writes the model: the daemon (watch run) may
+             # carry an old "fable" from a plist, and must not undo a later
+             # 'claude-swap model <x>'
+             [ "$from_start" = 1 ] && _fable_alias ;;
       --auto-reset) WATCH_AUTO_RESET=1 ;;
       *) echo "Usage: claude-swap watch start [general|fable] [--auto-reset]"; exit 1 ;;
     esac
@@ -4310,7 +4321,7 @@ _watch_args() {
 
 cmd_watch_start() {
   check_store
-  _watch_args "$@"
+  _watch_args 1 "$@"
   if watch_alive; then
     echo "Watch already running (PID $(cat "$WATCH_PID")). Stop it first with 'claude-swap watch stop'."
     return
@@ -4463,7 +4474,7 @@ PYEOF
 
 cmd_watch_run() {
   check_store
-  _watch_args "$@"
+  _watch_args 0 "$@"
   # exec: python replaces this bash and keeps its PID, so launchd (or
   # nohup) tracks the real process
   exec python3 - "$STORE" "$(command -v claude-swap || echo "$0")" \
@@ -5390,8 +5401,8 @@ cmd_interactive() {
   case "$choice" in
     "") exit 0 ;;
     auto|a) cmd_auto general ;;
-    af) cmd_model fable >/dev/null; cmd_auto general ;;
-    wf) cmd_model fable >/dev/null; cmd_watch_start general ;;
+    af) _fable_alias; cmd_auto general ;;
+    wf) _fable_alias; cmd_watch_start general ;;
     wg) cmd_watch_start general ;;
     wr) cmd_watch_start general --auto-reset ;;
     wp) cmd_watch_stop ;;
