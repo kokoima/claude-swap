@@ -1,10 +1,14 @@
 """What the Console (platform.claude.com) says about API credits, as
 claude-swap summarizes it. Replies are real ones from 16-nov-2026, trimmed
 to the fields read and with no account or organization data."""
+import io
+import json
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 
 from test_engine import E
+from test_oauth import O
 
 NOW = datetime(2026, 11, 16, 19, tzinfo=timezone.utc).timestamp()
 H, D = 3600, 86400
@@ -116,3 +120,63 @@ class Warnings(unittest.TestCase):
         self.assertEqual({x[0] for x in w}, {"yellow"})
         self.assertTrue(any("#7" in t and "no included credit" in t for _, t in w))
         self.assertTrue(any("#4" in t and "can be linked" in t for _, t in w))
+
+
+class FakeResp(io.BytesIO):
+    def __init__(self, status, body):
+        super().__init__(json.dumps(body).encode())
+        self.status = status
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+class Client(unittest.TestCase):
+    def client(self, replies):
+        calls = []
+
+        def opener(req, timeout=20):
+            calls.append((req.get_method(), req.full_url, dict(req.header_items())))
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return FakeResp(*r)
+        O["Console"]._last = [0.0]
+        c = O["Console"]("SECRET", opener=opener, clock=lambda: 1000.0, sleep=lambda s: None)
+        return c, calls
+
+    def test_get_only_with_the_console_headers(self):
+        c, calls = self.client([(200, {"email_address": "x"})])
+        self.assertEqual(c.get("/api/account"), (200, {"email_address": "x"}))
+        method, url, h = calls[0]
+        self.assertEqual((method, url), ("GET", "https://platform.claude.com/api/account"))
+        self.assertEqual(h.get("Cookie"), "sessionKey=SECRET")
+        self.assertEqual(h.get("Anthropic-client-platform"), "web_console")
+
+    def test_org_header(self):
+        c, calls = self.client([(200, {})])
+        c.get("/api/organizations/o1/current_spend", "o1")
+        self.assertEqual(calls[0][2].get("X-organization-uuid"), "o1")
+
+    def test_cloudflare_blocks_every_later_call(self):
+        cf = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b"<html>Just a moment...</html>"))
+        c, calls = self.client([cf])
+        self.assertEqual(c.get("/api/account"), (403, None))
+        self.assertTrue(c.blocked)
+        self.assertEqual(c.get("/api/organizations"), (0, None))
+        self.assertEqual(len(calls), 1)
+
+    def test_read_org_stops_at_no_billing_permission(self):
+        denied = urllib.error.HTTPError("u", 403, "Forbidden", {},
+                                        io.BytesIO(b'{"error": {"type": "permission_error"}}'))
+        c, calls = self.client([denied])
+        self.assertEqual(c.read_org("o1"), {"credits": 403})
+        self.assertEqual(len(calls), 1)
+
+    def test_read_org_reads_all_five(self):
+        c, calls = self.client([(200, {"amount": 1}), (200, {"amount": 2}), (200, {"enforced_limit_usd": 3}),
+                                (200, {"status": "linked"}), (200, [{"status": "active"}])])
+        got = c.read_org("o1")
+        self.assertEqual(sorted(got), ["credits", "keys", "limits", "link", "spend"])
+        self.assertTrue(all(cl[0] == "GET" for cl in calls))

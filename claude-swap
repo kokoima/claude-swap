@@ -1033,6 +1033,72 @@ class Http:
         except Exception:
             return 0, None
 
+CONSOLE = "https://platform.claude.com"
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+
+class Console:
+    """GET-only client for the Console (platform.claude.com) on a session
+    cookie. Requests are spaced across every instance (claude.com throttles
+    bursts), and a Cloudflare challenge blocks it: later gets answer (0, None)."""
+    GAP = 1.6
+    _last = [0.0]
+
+    def __init__(self, session_key, opener=None, clock=None, sleep=None):
+        self._sk = session_key
+        self._open = opener or urllib.request.urlopen
+        self._clock = clock or time.time
+        self._sleep = sleep or time.sleep
+        self.blocked = False
+
+    def get(self, path, org=None):
+        if self.blocked:
+            return 0, None
+        wait = self.GAP - (self._clock() - Console._last[0])
+        if wait > 0:
+            self._sleep(wait)
+        h = {"Cookie": f"sessionKey={self._sk}", "User-Agent": BROWSER_UA,
+             "Accept": "application/json", "anthropic-client-platform": "web_console",
+             "Referer": CONSOLE + "/settings/billing"}
+        if org:
+            h["x-organization-uuid"] = org
+        req = urllib.request.Request(CONSOLE + path, headers=h, method="GET")
+        Console._last[0] = self._clock()
+        try:
+            with self._open(req, timeout=20) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read() or b""
+            except Exception:
+                raw = b""
+            if b"Just a moment" in raw:
+                self.blocked = True
+                return e.code, None
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, None
+        except Exception:
+            return 0, None
+
+    def read_org(self, uuid):
+        """The billing replies of one API org, {key: reply or HTTP status};
+        it stops after a 403 on credits (no billing permission there)."""
+        out = {}
+        for key, path in (("credits", f"/api/organizations/{uuid}/prepaid/credits"),
+                          ("spend", f"/api/organizations/{uuid}/current_spend"),
+                          ("limits", f"/api/organizations/{uuid}/spend_limits"),
+                          ("link", f"/api/quirky-lollipop/organizations/{uuid}"
+                                   "/link-state?include_linkable_plans=true"),
+                          ("keys", f"/api/console/organizations/{uuid}/api_keys")):
+            st, body = self.get(path, uuid)
+            out[key] = body if st == 200 and body is not None else st
+            if self.blocked or (key == "credits" and st == 403):
+                break
+        return out
+
 class Keychain:
     """macOS generic passwords, written the way Claude Code writes its own:
     the secret travels on stdin (`security -i`), never on a command line."""
