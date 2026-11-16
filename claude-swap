@@ -2235,7 +2235,7 @@ cmd_check() {
 
 _deep_check() {
   python3 - "$STORE" <<'PYEOF'
-import json, os, re, sys, time, types
+import json, os, re, shlex, sys, time, types
 import urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 
@@ -2250,7 +2250,7 @@ with open(store_path) as f:
 
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
-PREF = engine.model_setting(store)  # the preferred model: its column and limit
+PREF = engine.model_setting(store)  # the preferred model: the limit the watch counts
 lane_n = oauth.lane_of(store)
 local_tz = datetime.now().astimezone().tzinfo
 store_dirty = [False]
@@ -2371,18 +2371,23 @@ def plan_end(acc):
     return min(dates) if dates else None
 
 def resets_summary(eligible, grants):
-    """Per kind, what is left and the soonest lapse (a local time), for the
+    """What is left and the soonest lapse (a local time) per kind, and per
+    model for the model resets (None: a model that cannot be told), for the
     Rst cell and the resets lines. None when claude.ai said nothing."""
     if eligible is None:
         return None
-    out = {"eligible": eligible}
-    for kind in (engine.FULL, engine.MODEL):
-        gs = [g for g in grants if g["kind"] == kind]
+
+    def summary(gs):
         ends = min((g["ends"] for g in gs if g["ends"]), default=None)
-        out[kind] = {"left": sum(g["left"] for g in gs), "ends": local_dt(ends),
-                     "by_plan": any(g.get("by_plan") for g in gs if g["ends"] == ends),
-                     "models": sorted({g["model"] or "?" for g in gs})}
-    return out
+        return {"left": sum(g["left"] for g in gs), "ends": local_dt(ends),
+                "by_plan": any(g.get("by_plan") for g in gs if g["ends"] == ends)}
+
+    mine = [g for g in grants if g["kind"] == engine.MODEL]
+    return {"eligible": eligible,
+            engine.FULL: summary([g for g in grants if g["kind"] == engine.FULL]),
+            engine.MODEL: summary(mine),
+            "models": {m: summary([g for g in mine if g["model"] == m])
+                       for m in {g["model"] for g in mine}}}
 
 def parse_epoch(ts):
     try:
@@ -2448,10 +2453,10 @@ BAR_W = 6
 def threshold_color(p):
     return GREEN if p < 50 else (YELLOW if p < 80 else RED)
 
-def pct_cell(pct):
-    """6-cell bar (eighth blocks) + right-aligned %."""
+def pct_cell(pct, unknown=False):
+    """6-cell bar (eighth blocks) + right-aligned %; - none, ? not known."""
     if pct is None:
-        return paint(GREY, "·" * BAR_W + "    -")
+        return paint(GREY, "·" * BAR_W + ("    ?" if unknown else "    -"))
     p = max(0.0, min(100.0, float(pct)))
     e = round(p / 100 * BAR_W * 8)
     full, rem = divmod(e, 8)
@@ -2496,8 +2501,7 @@ for i, acc in enumerate(accounts):
     row["plan_end"] = plan_end(acc)
     if web:
         row["models"], row["shares"], row["grants"] = web["models"], web["shares"], web["grants"]
-        row["fable"] = engine.model_pct(web, PREF)
-        row["rf"] = local_dt(engine.model_reset_at(web, PREF))
+        row["fable"] = engine.model_pct(web, PREF)  # the cache's name for it
         # An unspent reset is lost with the plan it came with, so the plan
         # ending first is its real deadline.
         pe = ep(row["plan_end"])
@@ -2603,6 +2607,20 @@ try:
     os.replace(cache_path + ".tmp", cache_path)
 except Exception:
     pass
+
+# ---------- the model column: a model limit, by claude.ai's name for it ----------
+# The preferred model's own weekly limit when some account has one (marked
+# *: the watch counts it), else the first one any account shows, unmarked.
+_limits = [m for r in results for m in r["models"]]
+COL = next((m for m in _limits if m.lower() == PREF.lower()), None)
+COL_PREF = COL is not None  # the preferred model has a limit somewhere
+if COL is None:
+    COL = _limits[0] if _limits else None
+COL_NAME = COL or PREF.capitalize()
+COL_MARK = COL_PREF or COL is None
+for row in results:
+    row["col"] = engine.model_pct(row, COL)
+    row["rf"] = local_dt(engine.model_reset_at(row, COL))  # the calendar's mark
 
 # ---------- tabla ----------
 
@@ -2711,7 +2729,8 @@ def left_part(*cells):
 header = left_part(
     pad(" #", W_N), pad("Account", W_LB), pad("Plan", W_PL), pad("Renews", W_RN),
     pad("5h", W_BAR), pad("reset", W_RST),
-    pad("7d", W_BAR), pad(trunc(PREF.capitalize(), W_BAR - 1) + "*", W_BAR),
+    pad("7d", W_BAR),
+    pad(trunc(COL_NAME, W_BAR - 1) + "*" if COL_MARK else trunc(COL_NAME, W_BAR), W_BAR),
     pad("Rst", W_RS, right=True),
     pad("Chr", W_CH, right=True))
 cal_header = "".join(center(f"{DAY_NAMES[d.weekday()]}{d.day}", CW) for d in cal_days)
@@ -2748,7 +2767,7 @@ def render_row(row):
         num, name_cell, plan_cell(row["plan"], row["plan_end"] is not None),
         renews_cell(acc, row["plan"]),
         pct_cell(row["u5"]), reset5_cell(row["r5"]),
-        pct_cell(row["u7"]), pct_cell(row["fable"]),
+        pct_cell(row["u7"]), pct_cell(row["col"], unknown=row["grants"] is None),
         resets_cell(row["resets"]), chrome_cell(acc)) + "│" + cal
 
     if row["error"] and row["error"] != "RATE LIMITED":
@@ -2763,15 +2782,16 @@ for row in results:
 print()
 print("  " + ("* Active · ▸ reserved sessions   │   " if lane_n else "")
       + "calendar: " + paint(YELLOW, "7d") + " reset time · "
-      + paint(MAG, PREF.capitalize()) + " when it falls on a different day · "
+      + paint(MAG, COL_NAME) + " when it falls on a different day · "
       + paint(CYAN, "↓") + " downgrade · " + paint(RED, "✕") + " plan ends"
       + paint(GREY, " ───") + " no plan (" + paint(GREY, "─22:00─")
       + " renews if resubscribed)"
-      + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red"
-                    " · * the model the watch counts (claude-swap model)"
-                    "   │   Rst: free resets left, full·model (? = no valid cookie)"
-                    "   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)"
-                    "   │   Renews: next charge (✕ plan ends · ↓ downgrade · ? not read yet)"))
+      + paint(GREY, "   │   bars: <50% green · 50–80% yellow · ≥80% red · ? no valid cookie"
+                    + (" · * the model the watch counts (claude-swap model)" if COL_MARK
+                       else f" · {COL_NAME}: not counted by the watch (claude-swap model: {PREF})")
+                    + "   │   Rst: free resets left, full·model (? = no valid cookie)"
+                      "   │   Chr: login for Claude in Chrome (✓ · days left · ✕ redo)"
+                      "   │   Renews: next charge (✕ plan ends · ↓ downgrade · ? not read yet)"))
 
 # Claude in Chrome only works on an account with its own full login
 if 1 <= active <= len(accounts) and not accounts[active - 1].get("disabled"):
@@ -2843,9 +2863,12 @@ for r in results:
 # ---------- free limit resets: who holds one and when it lapses ----------
 # The weekly renewal never moves, so a reset is worth most on an account at
 # its limit with days still to go; the line only says what is there.
-def resets_line(kind, title):
-    held = [r for r in results if r["resets"] and r["resets"][kind]["left"] > 0
-            and not r["disabled"]]
+def resets_line(title, pick, hint):
+    """Who holds one kind of reset (pick: its summary in a row's resets) and
+    when it lapses; hint: the kind to name to `reset`, None for none."""
+    held = [(r, pick(r["resets"])) for r in results
+            if r["resets"] and not r["disabled"]]
+    held = [(r, k) for r, k in held if k and k["left"] > 0]
     if not held:
         return
 
@@ -2855,23 +2878,21 @@ def resets_line(kind, title):
         return (deadline(k["ends"], "until")
                 + (paint(YELLOW, " — plan ends") if k.get("by_plan") else ""))
 
-    ends = {(r["resets"][kind]["ends"], r["resets"][kind]["by_plan"]) for r in held}
-    shared = len(ends) == 1
+    shared = len({(k["ends"], k["by_plan"]) for _, k in held}) == 1
     who = ", ".join(
-        f"#{r['n']} {short(r['label'])} ×{r['resets'][kind]['left']}"
-        + ("" if shared else " " + lapse(r["resets"][kind]))
-        for r in held)
-    # a model reset whose model cannot be told has no name to give: the
-    # bare command picks what helps by default
-    known = [m for m in held[0]["resets"][kind]["models"] if m != "?"]
-    hint = "full" if kind == engine.FULL else (known[0].lower() if known else "")
+        f"#{r['n']} {short(r['label'])} ×{k['left']}" + ("" if shared else " " + lapse(k))
+        for r, k in held)
     print("  " + paint(GREEN, title + ": ") + who
-          + (" · " + lapse(held[0]["resets"][kind]) if shared else "")
+          + (" · " + lapse(held[0][1]) if shared else "")
           + paint(GREY, " · spend one: claude-swap reset <n>"
                         + (f" {hint}" if hint else "")))
 
-resets_line(engine.FULL, "Full resets")
-resets_line(engine.MODEL, "Model resets")
+resets_line("Full resets", lambda res: res[engine.FULL], "full")
+# model resets one line per model, by claude.ai's name for it; those whose
+# model cannot be told last, with no kind to name (the bare command picks)
+for m in sorted({m for r in results if r["resets"] for m in r["resets"]["models"] if m}):
+    resets_line(f"{m} resets", lambda res, m=m: res["models"].get(m), shlex.quote(m.lower()))
+resets_line("Model resets", lambda res: res["models"].get(None), None)
 
 # ---------- watcher order: the general strategy, same table reordered ----------
 # The decision engine the watch and `auto` use: consume first the quota that
@@ -2922,8 +2943,11 @@ def note(e):
         txt = ("plan ends " if d == e["plan_end"] else "renews ") + when(d)
     tags = {0: [paint(YELLOW, "last day")], 1: [paint(GREEN, "holds a full reset")]}.get(
         engine.tier(e, now_ts), [])
-    if engine.grants_of(e, now_ts, engine.MODEL, PREF):
-        tags.append(paint(GREEN, f"holds a {PREF} reset"))
+    mine = engine.grants_of(e, now_ts, engine.MODEL, PREF)
+    if mine:
+        name = mine[0]["model"]
+        tags.append(paint(GREEN, f"holds {'an' if name[:1].lower() in 'aeiou' else 'a'}"
+                                 f" {name} reset"))
     if not engine.roomy(e, now_ts, PREF):
         tags.append(paint(GREY, "little room"))
     return paint(GREY, txt) + ("  " + " · ".join(tags) if tags else "")
@@ -2931,8 +2955,8 @@ def note(e):
 print()
 print(paint(BOLD, "  Watcher order")
       + paint(GREY, f" — what is lost first goes first · model {PREF}: leaves at"
-                    f" {engine.LEAVE}% of 5h, 7d or {PREF.capitalize()}, comes back"
-                    " once there is room"))
+                    f" {engine.LEAVE}% of {f'5h, 7d or {COL}' if COL_PREF else '5h or 7d'},"
+                    " comes back once there is room"))
 if not order:
     print(paint(GREY, "    no accounts available"))
 for e in [e for e in order if not engine.blocked(e, PREF)] + blocked:
