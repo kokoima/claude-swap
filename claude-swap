@@ -92,6 +92,7 @@ RESET_RETRY = 6 * 3600      # at most one reset per account in this span
 ERROR_RETRY = 300           # probe failed on the active account: look again
 
 INF = float("inf")
+FULL, MODEL = "full", "model"  # the two kinds of free reset (see parse_usage)
 
 
 def deadline(r, now):
@@ -414,6 +415,82 @@ def five_hour(u5, u7):
     if u5 is None and u7 is not None:
         return 0.0
     return u5
+
+
+# --- What a claude.ai /usage reply holds (cedar_ember=1&skip_spend=1) ---
+# limits[] brings the 5h ("session"), the week ("weekly_all") and one weekly
+# limit per model ("weekly_scoped", named by scope.model.display_name). A
+# model's limit sits inside the week: what it spends counts on both, and
+# weekly_scoped_shares[] says how much of the week each model spent
+# (limit_index points into limits[]). cedar_ember.grants[] are the free
+# resets; what a grant clears tells its kind: with "seven_day" it is a full
+# one (the week, every model's week, the 5h too on Team seats), without it
+# one model's, which also gives that model's share of the week back.
+
+def parse_usage(d, now):
+    """The fields the engine reads, from one /usage reply.
+
+    u5/r5/u7/r7 as before (a 5h window that is not running is 0%); models
+    {name: {"pct", "resets_at"}}; shares {name: % of the week it spent};
+    grants: the live resets, soonest lapse first, each {"id", "left",
+    "ends", "clears", "kind" (FULL or MODEL), "model" (MODEL only; None
+    when it cannot be told), "five_hour", "usable_now"}; eligible (None
+    when the reply said nothing about resets); reset_cooldown; resets and
+    resets_ends: the full resets left and their soonest lapse.
+    """
+    five, seven = d.get("five_hour") or {}, d.get("seven_day") or {}
+    out = {"u5": five.get("utilization"), "r5": _iso(five.get("resets_at")),
+           "u7": seven.get("utilization"), "r7": _iso(seven.get("resets_at")),
+           "models": {}, "shares": {}, "grants": [], "eligible": None,
+           "reset_cooldown": None, "resets": None, "resets_ends": None}
+    out["u5"] = five_hour(out["u5"], out["u7"])
+    names = {}
+    for i, l in enumerate(d.get("limits") or []):
+        if not isinstance(l, dict) or l.get("kind") != "weekly_scoped":
+            continue
+        name = ((l.get("scope") or {}).get("model") or {}).get("display_name")
+        if name:
+            names[i] = name
+            out["models"][name] = {"pct": l.get("percent"),
+                                   "resets_at": _iso(l.get("resets_at"))}
+    for s in d.get("weekly_scoped_shares") or []:
+        name = names.get((s or {}).get("limit_index"))
+        if name and s.get("used_percent_of_weekly") is not None:
+            out["shares"][name] = s["used_percent_of_weekly"]
+    ce = d.get("cedar_ember")
+    if not isinstance(ce, dict):
+        return out
+    out["eligible"] = ce.get("eligible") is True
+    out["reset_cooldown"] = _iso(ce.get("cooldown_until"))
+    for g in (ce.get("grants") or []) if out["eligible"] else []:
+        left, ends = g.get("resets_left"), _iso(g.get("ends_at"))
+        if (g.get("paused") or not isinstance(left, int) or left <= 0
+                or (ends and ends <= now)):
+            continue
+        clears = list(g.get("clears") or [])
+        full = "seven_day" in clears
+        out["grants"].append({
+            "id": g.get("id"), "left": left, "ends": ends, "clears": clears,
+            "kind": FULL if full else MODEL,
+            "model": None if full else _grant_model(g, clears, out["models"]),
+            "five_hour": "five_hour" in clears,
+            "usable_now": g.get("usable_now") is not False})
+    out["grants"].sort(key=lambda g: g["ends"] or INF)
+    full = [g for g in out["grants"] if g["kind"] == FULL]
+    out["resets"] = sum(g["left"] for g in full)
+    out["resets_ends"] = min((g["ends"] for g in full if g["ends"]), default=None)
+    return out
+
+
+def _grant_model(g, clears, models):
+    """The model a model reset is for: the only model limit there is, else
+    the one whose % matches what the grant reports for what it clears."""
+    if len(models) == 1:
+        return next(iter(models))
+    used = [v for k, v in (g.get("percent_used") or {}).items()
+            if k in clears and k != "five_hour"]
+    hits = [name for name, m in models.items() if m.get("pct") in used]
+    return hits[0] if len(hits) == 1 else None
 PYEOF
 export CLAUDE_SWAP_ENGINE="$ENGINE_PY"
 
