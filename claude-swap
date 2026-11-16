@@ -93,6 +93,7 @@ MIN_DWELL = 15 * 60         # no voluntary switch sooner than this after the las
 RESET_MIN_LEFT = 24 * 3600  # a week renewing sooner than this refills for free
 RESET_RETRY = 6 * 3600      # at most one reset per account in this span
 RESET_DONE = 5              # a spent reset leaves what it clears at or below this
+WALL_SOON = 30 * 60         # a seat's reset is not spent on a 5h wall lifting sooner
 ERROR_RETRY = 300           # probe failed on the active account: look again
 
 INF = float("inf")
@@ -158,6 +159,12 @@ def grants_of(r, now, kind, model=None):
     return sorted(live, key=lambda g: g["ends"] or INF)
 
 
+def spendable(r, now, kind, model=None):
+    """grants_of, less the ones claude.ai says cannot be spent right now
+    (usable_now false): those still count as held, but are never picked."""
+    return [g for g in grants_of(r, now, kind, model) if g.get("usable_now") is not False]
+
+
 def blocked(r, model=None):
     return (bool(r.get("rate_limited")) or (r.get("u5") or 0) >= LEAVE
             or (r.get("u7") or 0) >= LEAVE or (model_pct(r, model) or 0) >= LEAVE)
@@ -218,6 +225,13 @@ def unblock_at(r, model=None):
     return max(times)
 
 
+def lifts_at(rows, now, model=None):
+    """When the first of rows, all at their limit, is usable again: None
+    if no unblock is known."""
+    waits = [t for t in (unblock_at(r, model) for r in rows) if t and t > now]
+    return min(waits) if waits else None
+
+
 def reset_key(g):
     """How the watch remembers a kind of reset it tried on an account."""
     return FULL if g["kind"] == FULL else f"{MODEL}:{g.get('model')}"
@@ -250,8 +264,11 @@ def reset_due(r, now, state, model=None, seat=False):
     tried lately blocks that fallback too. The 5h spent on a reserved seat
     (seat=True) whose full reset clears the 5h too: that one. The preferred
     model spent, with at least MODEL_RESET_MIN_WEEK of the week left: a
-    reset of that model. Never in a cooldown, never twice within
-    RESET_RETRY, never a kind that did not work on that account.
+    reset of that model; with less left, or none of that model to spend,
+    the full reset once the week is that far gone (a model reset would
+    leave too little). Only resets claude.ai says can be spent now; never
+    in a cooldown, never twice within RESET_RETRY, never a kind that did
+    not work on that account.
     """
     if (r.get("reset_cooldown") or 0) > now:
         return None
@@ -266,25 +283,31 @@ def reset_due(r, now, state, model=None, seat=False):
 
     u7 = r.get("u7") or 0
     if u7 >= LEAVE:
-        full = [g for g in grants_of(r, now, FULL) if not failed(g)]
+        full = [g for g in spendable(r, now, FULL) if not failed(g)]
         if full:
             g = first(full)
             return g if g and _worth_before(g, r.get("r7"), now) else None
         for name, share in sorted((r.get("shares") or {}).items(), key=lambda kv: -kv[1]):
             if share < MODEL_RESET_MIN_WEEK:
                 break
-            g = first(grants_of(r, now, MODEL, name))
+            g = first(spendable(r, now, MODEL, name))
             if g and _worth_before(g, r.get("r7"), now):
                 return g
         return None
     if seat and (r.get("u5") or 0) >= LEAVE:
-        g = first(g for g in grants_of(r, now, FULL) if g["five_hour"])
+        g = first(g for g in spendable(r, now, FULL) if g["five_hour"])
         if g:
             return g
     mp = model_pct(r, model)
-    if mp is not None and mp >= LEAVE and u7 <= 100 - MODEL_RESET_MIN_WEEK:
-        g = first(grants_of(r, now, MODEL, model))
+    if mp is None or mp < LEAVE:
+        return None
+    if u7 <= 100 - MODEL_RESET_MIN_WEEK:
+        g = first(spendable(r, now, MODEL, model))
         if g and _worth_before(g, model_reset_at(r, model), now):
+            return g
+    if u7 >= 100 - MODEL_RESET_MIN_WEEK:
+        g = first(spendable(r, now, FULL))
+        if g and _worth_before(g, r.get("r7"), now):
             return g
     return None
 
@@ -292,6 +315,11 @@ def reset_due(r, now, state, model=None, seat=False):
 def reset_reason(r, g, model=None):
     n, now = r["n"], usage(r, model)
     if g["kind"] == FULL:
+        if ((model_pct(r, model) or 0) >= LEAVE
+                and 100 - MODEL_RESET_MIN_WEEK <= (r.get("u7") or 0) < LEAVE):
+            name = _model_item(r, model)[0]
+            return (f"#{n} spent its {name} ({now}) and holds a full reset"
+                    f" (too little week left for a {name} one)")
         what = "its week" if (r.get("u7") or 0) >= LEAVE else "its 5h"
         return f"#{n} spent {what} ({now}) and holds a full reset"
     name = g.get("model")
@@ -320,17 +348,18 @@ def reset_worked(g, before, after):
 def reset_for(r, now, kind=None, model=None):
     """The reset `claude-swap reset <n> [kind]` spends. kind "full" or a
     model's name; by default what helps now (as the watch would pick it),
-    else the full one, else any model one. None if there is none."""
+    else the full one, else any model one. None if there is none that
+    claude.ai says can be spent now."""
     if kind and kind.lower() == FULL:
-        return next(iter(grants_of(r, now, FULL)), None)
+        return next(iter(spendable(r, now, FULL)), None)
     if kind:
-        return next(iter(grants_of(r, now, MODEL, kind)), None)
-    g = reset_due(r, now, {}, model) or next(iter(grants_of(r, now, FULL)), None)
+        return next(iter(spendable(r, now, MODEL, kind)), None)
+    g = reset_due(r, now, {}, model) or next(iter(spendable(r, now, FULL)), None)
     if g:
         return g
     names = {g.get("model") for g in r.get("grants") or [] if g["kind"] == MODEL}
     return next((g for name in sorted(n for n in names if n)
-                 for g in grants_of(r, now, MODEL, name)), None)
+                 for g in spendable(r, now, MODEL, name)), None)
 
 
 def next_event(rows, now, model=None):
@@ -404,9 +433,8 @@ def decide(rows, active, now, state, auto_reset=False, model=None):
         target = best or min(usable, key=lambda r: (load(r, model), priority(r, now)),
                              default=None)
         if target is None:
-            waits = [t for t in (unblock_at(r, model) for r in ranked) if t and t > now]
             return out("wall", None, why + " and every account is at its limit",
-                       min(waits) if waits else None)
+                       lifts_at(ranked, now, model))
         return out("switch", target["n"], why)
 
     if best and best["n"] != active and priority(best, now) < priority(cur, now):
@@ -427,14 +455,20 @@ def lane_decide(rows, lane, pool, now, state, auto_reset=False, model=None):
     but only among pool, the reserved accounts the watch may put them on.
     None when they are not the watch's to move: no pool, or on an account
     outside it (a pick by hand there is left alone). A seat's reset is only
-    spent once every seat in the pool is at its limit."""
+    spent once every seat in the pool is at its limit, and not on a seat
+    that only spent its 5h when the wall lifts by itself within WALL_SOON."""
     if len(pool) < 2 or lane not in pool:
         return None
     sub = [dict(r, reserved=False) for r in rows if r["n"] in pool]
     d = decide(sub, lane, now, state, False, model)
     if auto_reset and d["action"] == "wall":
-        for r in rank(sub, now, model):
-            g = reset_due(r, now, state, model, seat=True)
+        ranked = rank(sub, now, model)
+        lifts = lifts_at(ranked, now, model)
+        soon = lifts is not None and lifts - now < WALL_SOON
+        for r in ranked:
+            only_5h = ((r.get("u7") or 0) < LEAVE
+                       and (model_pct(r, model) or 0) < LEAVE)
+            g = reset_due(r, now, state, model, seat=not (soon and only_5h))
             if g:
                 return dict(d, action="reset", target=r["n"], grant=g,
                             reason="every seat at its limit; " + reset_reason(r, g, model))
@@ -602,19 +636,26 @@ def five_hour(u5, u7):
 def parse_usage(d, now):
     """The fields the engine reads, from one /usage reply.
 
-    u5/r5/u7/r7 as before (a 5h window that is not running is 0%); models
-    {name: {"pct", "resets_at"}}; shares {name: % of the week it spent};
-    grants: the live resets, soonest lapse first, each {"id", "left",
-    "ends", "clears", "kind" (FULL or MODEL), "model" (MODEL only; None
-    when it cannot be told), "five_hour", "usable_now"}; eligible (None
-    when the reply said nothing about resets); reset_cooldown; resets and
-    resets_ends: the full resets left and their soonest lapse.
+    u5/r5/u7/r7 from five_hour/seven_day, or from limits[] ("session",
+    "weekly_all") when those do not come (a 5h window that is not running
+    is 0%); models {name: {"pct", "resets_at"}}; shares {name: % of the
+    week it spent}; grants: the live resets, soonest lapse first, each
+    {"id", "left", "ends", "clears", "kind" (FULL or MODEL), "model" (MODEL
+    only; None when it cannot be told), "five_hour", "usable_now"};
+    eligible (None when the reply said nothing about resets);
+    reset_cooldown; resets and resets_ends: the full resets left and their
+    soonest lapse.
     """
     five, seven = d.get("five_hour") or {}, d.get("seven_day") or {}
     out = {"u5": five.get("utilization"), "r5": _iso(five.get("resets_at")),
            "u7": seven.get("utilization"), "r7": _iso(seven.get("resets_at")),
            "models": {}, "shares": {}, "grants": [], "eligible": None,
            "reset_cooldown": None, "resets": None, "resets_ends": None}
+    limits = [l for l in d.get("limits") or [] if isinstance(l, dict)]
+    for kind, u, r in (("session", "u5", "r5"), ("weekly_all", "u7", "r7")):
+        l = next((l for l in limits if l.get("kind") == kind), None)
+        if out[u] is None and l and l.get("percent") is not None:
+            out[u], out[r] = l["percent"], _iso(l.get("resets_at"))
     out["u5"] = five_hour(out["u5"], out["u7"])
     names = {}
     for i, l in enumerate(d.get("limits") or []):
@@ -656,11 +697,14 @@ def parse_usage(d, now):
 
 def _grant_model(g, clears, models):
     """The model a model reset is for: the only model limit there is, else
-    the one whose % matches what the grant reports for what it clears."""
+    the one whose % matches what the grant reports for what it clears.
+    None for one that clears no weekly limit at all (only the 5h, say)."""
+    own = [k for k in clears if k != "five_hour"]
+    if not own:
+        return None
     if len(models) == 1:
         return next(iter(models))
-    used = [v for k, v in (g.get("percent_used") or {}).items()
-            if k in clears and k != "five_hour"]
+    used = [v for k, v in (g.get("percent_used") or {}).items() if k in own]
     hits = [name for name, m in models.items() if m.get("pct") in used]
     return hits[0] if len(hits) == 1 else None
 PYEOF

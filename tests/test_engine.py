@@ -403,6 +403,35 @@ class ResetKinds(unittest.TestCase):
                                                   mgrant(gid="soon", ends=NOW + 200 * H)])
         self.assertEqual(self.due(rows)["grant"]["id"], "soon")
 
+    def test_a_spent_model_on_a_week_past_three_quarters_takes_the_full_reset(self):
+        # no room for a model reset (a quarter of the week is not left): the
+        # full one empties the model and the week alike
+        d = self.due(self.rows(u7=90, models=fab(100), grants=[mgrant(), fgrant()]))
+        self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 2, "full"))
+
+    def test_a_spent_model_with_most_of_the_week_left_keeps_the_full_reset(self):
+        rows = self.rows(models=fab(100), grants=[fgrant()])
+        self.assertIsNone(E["reset_due"](rows[1], NOW, {}, "Fable"))
+        self.assertEqual((self.due(rows)["action"], self.due(rows)["target"]), ("switch", 3))
+
+    def test_a_spent_model_does_not_take_the_full_reset_of_a_week_about_to_renew(self):
+        rows = self.rows(u7=90, r7=NOW + 2 * H, models=fab(100), grants=[fgrant()])
+        self.assertIsNone(E["reset_due"](rows[1], NOW, {}, "Fable"))
+        self.assertNotEqual(self.due(rows)["action"], "reset")
+
+    def test_a_reset_claude_ai_says_cannot_be_spent_now_is_passed_over(self):
+        held = dict(mgrant(gid="held", ends=NOW + 200 * H), usable_now=False)
+        rows = self.rows(models=fab(100), grants=[held, mgrant(gid="ok", ends=NOW + 900 * H)])
+        self.assertEqual(self.due(rows)["grant"]["id"], "ok")
+        self.assertNotEqual(self.due(self.rows(models=fab(100), grants=[held]))["action"], "reset")
+
+    def test_an_unusable_full_reset_still_counts_but_lets_the_model_one_go(self):
+        full = dict(fgrant(), usable_now=False)
+        rows = self.rows(u7=98, grants=[full, mgrant()], shares={"Fable": 40})
+        self.assertTrue(E["holds_reset"](rows[1], NOW))
+        d = self.due(rows)
+        self.assertEqual((d["action"], d["grant"]["kind"]), ("reset", "model"))
+
 
 class LaneResets(unittest.TestCase):
     """A seat's reset is spent only once every seat in the pool is spent."""
@@ -428,6 +457,17 @@ class LaneResets(unittest.TestCase):
     def test_without_the_flag_it_waits_at_the_wall(self):
         d = self.lane(self.rows({13: dict(u5=100, r5=NOW + 2 * H)}), auto_reset=False)
         self.assertEqual(d["action"], "wall")
+
+    def test_a_5h_wall_that_lifts_within_half_an_hour_is_waited_out(self):
+        d = self.lane(self.rows({13: dict(u5=100, r5=NOW + 5 * 60)}))
+        self.assertEqual((d["action"], d["wake"]), ("wall", NOW + 5 * 60))
+        d = self.lane(self.rows({13: dict(u5=100, r5=NOW + 3 * H)}))
+        self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 11, "full"))
+
+    def test_a_spent_week_is_no_5h_wall(self):
+        # what the seat's reset frees is the week: worth it however soon the 5h lifts
+        d = self.lane(self.rows({11: dict(u7=100), 13: dict(u5=100, r5=NOW + 5 * 60)}))
+        self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 11, "full"))
 
 
 class ResetOutcome(unittest.TestCase):
@@ -465,6 +505,13 @@ class ResetFor(unittest.TestCase):
         self.assertEqual(E["reset_for"](holder2(models=fab(100)), NOW, None, "Fable")["kind"], "model")
         self.assertEqual(E["reset_for"](holder2(u7=100), NOW, None, "Fable")["kind"], "full")
         self.assertEqual(E["reset_for"](holder2(), NOW, None, "Fable")["kind"], "full")
+
+    def test_never_one_claude_ai_says_cannot_be_spent_now(self):
+        held = dict(fgrant(gid="held", ends=NOW + 100 * H), usable_now=False)
+        r = holder2(grants=[held, fgrant(gid="ok"), mgrant()])
+        self.assertEqual(E["reset_for"](r, NOW, "full")["id"], "ok")
+        self.assertIsNone(E["reset_for"](holder2(grants=[held]), NOW, "full"))
+        self.assertIsNone(E["reset_for"](holder2(grants=[held]), NOW, None, "Fable"))
 
 
 class Wall(unittest.TestCase):

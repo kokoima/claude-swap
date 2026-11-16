@@ -84,6 +84,21 @@ class Limits(unittest.TestCase):
         u = parse({"five_hour": None, "seven_day": {"utilization": 10.0}})
         self.assertEqual((u["models"], u["shares"]), ({}, {}))
 
+    def test_without_the_old_fields_the_windows_come_from_limits(self):
+        d = {k: v for k, v in TEAM.items() if k not in ("five_hour", "seven_day")}
+        u = parse(d)
+        self.assertEqual((u["u5"], u["r5"]), (26, at("2026-11-13T21:00:00+00:00")))
+        self.assertEqual((u["u7"], u["r7"]), (53, at("2026-11-17T10:00:00+00:00")))
+
+    def test_from_limits_too_an_idle_5h_is_zero(self):
+        d = {k: v for k, v in MAX.items() if k not in ("five_hour", "seven_day")}
+        u = parse(d)
+        self.assertEqual((u["u5"], u["r5"], u["u7"]), (0.0, None, 50))
+
+    def test_the_old_fields_win_when_both_come(self):
+        d = dict(TEAM, five_hour={"utilization": 30.0, "resets_at": "2026-11-13T22:00:00+00:00"})
+        self.assertEqual(parse(d)["u5"], 30.0)
+
 
 class Grants(unittest.TestCase):
     def test_model_resets_are_told_by_what_they_clear(self):
@@ -125,3 +140,14 @@ class Grants(unittest.TestCase):
                   "percent_used": {"seven_day_overage_included": 50}}]}}
         models = {x["id"]: x["model"] for x in parse(d)["grants"]}
         self.assertEqual(models, {"a": "Fable", "b": None})
+
+    def test_a_grant_that_clears_only_the_5h_is_for_no_model(self):
+        d = {"limits": [fable_limit(100)],
+             "cedar_ember": {"eligible": True, "grants": [
+                 {"id": "h", "resets_left": 1, "clears": ["five_hour"]},
+                 {"id": "e", "resets_left": 1, "clears": []}]}}
+        g = {x["id"]: (x["kind"], x["model"]) for x in parse(d)["grants"]}
+        self.assertEqual(g, {"h": ("model", None), "e": ("model", None)})
+        # and so the watch never spends it, however spent Fable is
+        row = dict(parse(d), n=2)
+        self.assertIsNone(E["reset_due"](row, NOW, {}, "Fable"))
