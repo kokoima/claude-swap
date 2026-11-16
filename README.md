@@ -340,6 +340,31 @@ and use the general strategy; the old Fable-only strategy is gone.
 
 On Linux there are no notifications — everything still lands in the log.
 
+### API credits
+
+Max and Team plans can link a Console (platform.claude.com) organization
+and get monthly **included API credit** there. It only pays the API, the
+Agent SDK and `claude -p` run with a key of that organization — not
+interactive Claude Code — and it lapses after a few weeks without rolling
+over. Purchased (or free) credit in the same organization pays everything.
+
+- `claude-swap keys-sync` also reads each Chrome profile's Console session
+  (the `sessionKey` cookie of platform.claude.com), checks whose it is and
+  keeps it in the macOS keychain (`claude-swap` / `console:<email>`), never
+  in the store. It lists the accounts without a Console session, and the
+  ones whose stored session it could not confirm (likely expired).
+- `claude-swap credits [n]` reads the Console (GET only, spaced requests,
+  stopping on a Cloudflare challenge) and shows, per API organization:
+  the link to the plan, the included credit left and when it lapses (red
+  under 72 h, yellow under 7 days), purchased credit, the month's spend
+  against the tier's cap, the tier and the active API keys (counted only).
+  Unknown values show `?`. Then the warnings: included credit about to
+  lapse, a linked organization with no included credit yet, one that can
+  be linked. A full run leaves a cache without secrets
+  (`~/.claude/claude-swap-credits.json`).
+- `check` prints those warnings from the cache under `API credits:`
+  (and how old the cache is, past a day). It does not call the Console.
+
 ## Commands
 
 | Command | Description |
@@ -350,6 +375,7 @@ On Linux there are no notifications — everything still lands in the log.
 | `claude-swap check` | Full dashboard (limits, calendar, watcher order) |
 | `claude-swap auto` | Auto-switch to the best available account |
 | `claude-swap model [name]` | The model the sessions use (default `fable`): its weekly limit counts like the 5h and the week |
+| `claude-swap credits [n]` | API credits per account and Console organization: included credit and when it lapses, purchased credit, month spend against the cap, tier, active keys (read-only) |
 | `claude-swap watch start [--auto-reset]` | Background auto-switcher (LaunchAgent on macOS) — see watch mode |
 | `claude-swap watch stop` | Stop the watcher |
 | `claude-swap watch status` | Watcher state + last probe + log tail |
