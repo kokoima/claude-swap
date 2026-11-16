@@ -4001,24 +4001,27 @@ PYEOF
 
 cmd_reset() {
   check_store
-  local target="$1" assume_yes="${2:-}"
-  case "$target" in
-    ''|*[!0-9]*) echo "Usage: claude-swap reset <n> [--yes]"; exit 1 ;;
-  esac
-  case "$assume_yes" in
-    ''|--yes) ;;
-    *) echo "Usage: claude-swap reset <n> [--yes]"; exit 1 ;;
-  esac
+  local target="" kind="" assume_yes="" arg confirm=""
+  local usage="Usage: claude-swap reset <n> [full|fable] [--yes]"
+  for arg in "$@"; do
+    case "$arg" in
+      "") ;;
+      --yes) assume_yes=--yes ;;
+      *[!0-9]*) if [ -z "$kind" ]; then kind="$arg"; else echo "$usage"; exit 1; fi ;;
+      *) if [ -z "$target" ]; then target="$arg"; else echo "$usage"; exit 1; fi ;;
+    esac
+  done
+  [ -n "$target" ] || { echo "$usage"; exit 1; }
 
   local grant
-  grant=$(_reset_run inspect "$target") || exit 1
+  grant=$(_reset_run inspect "$target" "$kind") || exit 1
   # --yes is how the watcher spends one (watch start --auto-reset)
   if [ "$assume_yes" != "--yes" ]; then
     echo ""
-    read -r -p "Spend it now? This cannot be undone. Type 'yes' to confirm: " confirm
+    read -r -p "Spend it now? This cannot be undone. Type 'yes' to confirm: " confirm || confirm=""
     if [ "$confirm" != "yes" ]; then
       echo "Cancelled — the reset is still there."
-      return
+      return 0
     fi
   fi
   _reset_run claim "$target" "$grant"
@@ -4034,7 +4037,7 @@ import urllib.request, urllib.error
 from datetime import datetime
 
 store_path, mode, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
-grant_id = sys.argv[4] if len(sys.argv) > 4 else None
+extra = sys.argv[4] if len(sys.argv) > 4 else ""
 engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 
@@ -4042,7 +4045,7 @@ BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 CACHE_PATH = os.path.expanduser("~/.claude/claude-swap-usage.json")
 WINDOW_NAMES = {"five_hour": "5h", "seven_day": "7d",
-                "seven_day_overage_included": "7d overage-included (tracks Fable)",
+                "seven_day_overage_included": "7d of the model (Fable)",
                 "seven_day_opus": "7d Opus", "seven_day_sonnet": "7d Sonnet"}
 
 def say(msg=""):
@@ -4054,6 +4057,7 @@ def fail(msg):
 
 with open(store_path) as f:
     store = json.load(f)
+model = engine.model_setting(store)
 accounts = store.get("accounts", [])
 if not 1 <= target <= len(accounts):
     fail(f"Error: account {target} does not exist (valid: 1-{len(accounts)})")
@@ -4088,14 +4092,6 @@ def read_usage():
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.load(r)
 
-def windows(d):
-    fable = next((l.get("percent") for l in d.get("limits", [])
-                  if (((l.get("scope") or {}).get("model") or {})
-                      .get("display_name") or "").lower() == "fable"), None)
-    seven = d.get("seven_day") or {}
-    return (engine.five_hour((d.get("five_hour") or {}).get("utilization"),
-                             seven.get("utilization")), seven, fable)
-
 def pct(v):
     return "-" if v is None else f"{v:.0f}%"
 
@@ -4124,16 +4120,22 @@ if mode == "inspect":
     cooldown = local(ce.get("cooldown_until"))
     if cooldown and cooldown > datetime.now().astimezone():
         fail(f"{who}: resets are cooling down until {fmt(cooldown)}.")
-    gid = ce.get("next_grant_id")
-    grant = next((g for g in ce.get("grants") or [] if g.get("id") == gid), None)
-    if grant is None:
-        if resets_left(d) == 0:
+    now_ts = time.time()
+    row = dict(engine.parse_usage(d, now_ts), n=target)
+    chosen = engine.reset_for(row, now_ts, extra or None, model)
+    if chosen is None:
+        if not row["grants"]:
             fail(f"{who} has no free limit resets left.")
-        fail(f"{who} holds a reset, but claude.ai says none can be spent right "
+        kinds = ", ".join(sorted({engine.reset_key(g) for g in row["grants"]}))
+        fail(f"{who} holds no {extra or 'usable'} reset (it holds: {kinds}).")
+    gid = chosen["id"]
+    grant = next((g for g in ce.get("grants") or [] if g.get("id") == gid), None)
+    if grant is None or not chosen["usable_now"]:
+        fail(f"{who} holds that reset, but claude.ai says it cannot be spent right "
              "now (some only work once the account is at a limit).")
 
-    u5, seven, fable = windows(d)
-    u7, r7 = seven.get("utilization"), local(seven.get("resets_at"))
+    u5, u7 = row["u5"], row["u7"]
+    r7 = local((d.get("seven_day") or {}).get("resets_at"))
     clears = [WINDOW_NAMES.get(c, c) for c in grant.get("clears") or []]
     say(f"Free limit reset — {who}")
     say(f"  {grant.get('label') or gid}")
@@ -4149,9 +4151,15 @@ if mode == "inspect":
         say(f"  ! The plan stops {fmt(min(stops))} (cancelled or downgraded):"
             " the reset is lost then if still unspent.")
     say(f"  Clears: {', '.join(clears) or '?'}")
-    say(f"  Now:    5h {pct(u5)} · 7d {pct(u7)}"
-        + (f" (renews {fmt(r7)}, in {until(r7)})" if r7 else "")
-        + f" · Fable {pct(fable)}")
+    if chosen["kind"] == engine.FULL:
+        say("  Kind:   full — empties the week and every model's week"
+            + (", and the 5h" if chosen["five_hour"] else ""))
+    else:
+        back = row["shares"].get(chosen["model"]) or 0
+        say(f"  Kind:   {chosen['model']} — empties {chosen['model']} and gives"
+            f" {back:.0f}% of the week back")
+    say(f"  Now:    {engine.usage(row, model)}"
+        + (f" (week renews {fmt(r7)}, in {until(r7)})" if r7 else ""))
     say("  The weekly renewal does not move: the reset only empties the windows now.")
     if r7 and (r7 - datetime.now().astimezone()).total_seconds() < 48 * 3600:
         say(f"  ! The 7d window renews anyway in {until(r7)} — little to gain here;"
@@ -4163,7 +4171,11 @@ if mode == "inspect":
     sys.exit(0)
 
 # ---------- claim ----------
-before = resets_left(usage_or_fail(), grant_id)
+grant_id = extra
+before_d = usage_or_fail()
+before = resets_left(before_d, grant_id)
+g = next((x for x in engine.parse_usage(before_d, time.time())["grants"]
+          if x["id"] == grant_id), None)
 body = json.dumps({"program": "cedar_ember", "grant_id": grant_id,
                    "request_id": str(uuid.uuid4())}).encode()
 req = urllib.request.Request(
@@ -4196,17 +4208,24 @@ except Exception:
 spent = after_d is not None and resets_left(after_d, grant_id) < before
 
 if result == "reset" or spent:
-    u5, seven, fable = windows(after_d) if after_d else (None, {}, None)
     say(f"Done — limits reset on {who}.")
-    say(f"  Now: 5h {pct(u5)} · 7d {pct(seven.get('utilization'))} · Fable {pct(fable)}")
+    b_row = engine.parse_usage(before_d, time.time())
+    a_row = engine.parse_usage(after_d, time.time()) if after_d else {}
+    say(f"  Now: {engine.usage(a_row, model)}" if a_row else "  Now: ?")
+    if g and a_row and not engine.reset_worked(g, b_row, a_row):
+        say("  ! It did not leave what this kind of reset should leave"
+            " (claude.ai may take a minute to show it).")
     try:
         # patch the snapshot so the statusline shows it without waiting
         with open(CACHE_PATH) as f:
             snap = json.load(f)
         for row in snap.get("accounts", []):
             if row.get("n") == target and after_d:
-                row.update({"u5": u5, "u7": seven.get("utilization"),
-                            "fable": fable, "resets": resets_left(after_d)})
+                row.update({"u5": a_row.get("u5"), "u7": a_row.get("u7"),
+                            "fable": engine.model_pct(a_row, model),
+                            "resets": a_row.get("resets"),
+                            "resets_model": sum(x["left"] for x in a_row.get("grants") or []
+                                                if x["kind"] == engine.MODEL)})
         with open(CACHE_PATH + ".tmp", "w") as f:
             json.dump(snap, f)
         os.replace(CACHE_PATH + ".tmp", CACHE_PATH)
@@ -5457,7 +5476,8 @@ case "${1:-}" in
     cmd_keys_sync
     ;;
   reset)
-    cmd_reset "${2:-}" "${3:-}"
+    shift
+    cmd_reset "$@"
     ;;
   model)
     cmd_model "${2:-}"
