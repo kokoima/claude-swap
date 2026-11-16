@@ -3229,6 +3229,28 @@ if kept:
                         " -- <claude args>, moved with claude-swap <n>"
                         + (f"; the watch moves them among {', '.join(f'#{i}' for i in rot)}"
                            if len(rot) > 1 else "")))
+
+# API credits: warnings from the last `claude-swap credits` (cache only, no network)
+try:
+    with open(os.path.expanduser("~/.claude/claude-swap-credits.json")) as f:
+        api_credits = json.load(f)
+    numbers = {(a.get("email") or "").lower(): n for n, a in enumerate(accounts, 1)}
+    by_tag = {f"#{numbers[em]}": summ for em, summ in api_credits["accounts"].items()
+              if em in numbers and isinstance(summ, list)}
+    now_c = time.time()
+    warns = engine.credit_warnings(by_tag, now_c)
+    age = now_c - (api_credits.get("updated") or 0)
+except Exception:
+    api_credits, warns, age = None, [], 0
+if api_credits and (warns or age > 86400):
+    print("  " + paint(CYAN, "API credits:")
+          + (paint(GREY, f" (read {int(age // 86400)}d ago — claude-swap credits)")
+             if age > 86400 else ""))
+    colors = {"red": RED, "yellow": YELLOW, "grey": GREY}
+    for level, text in warns[:6]:
+        print("    " + paint(colors.get(level, GREY), text))
+    if len(warns) > 6:
+        print(paint(GREY, f"    … and {len(warns) - 6} more: claude-swap credits"))
 PYEOF
 }
 
