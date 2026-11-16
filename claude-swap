@@ -727,9 +727,11 @@ def _usd(cents):
 def _pool(tranches, kind, now):
     mine = [t for t in tranches
             if ((t.get("scope") or {}).get("kind") or "unscoped") == kind]
-    live = [t for t in mine if (t.get("remaining_amount_minor_units") or 0) > 0
-            and (_iso(t.get("expires_at")) or INF) > now]
+    current = [t for t in mine if (_iso(t.get("expires_at")) or INF) > now]
+    live = [t for t in current if (t.get("remaining_amount_minor_units") or 0) > 0]
     return mine, {
+        # any: a tranche still in date, even if spent (a link that paid out)
+        "any": bool(current),
         "left": _usd(sum(t.get("remaining_amount_minor_units") or 0 for t in live)),
         "granted": _usd(sum(t.get("granted_amount_minor_units") or 0 for t in live)),
         "expires": min((_iso(t.get("expires_at")) for t in live
@@ -795,10 +797,16 @@ def console_summary(account, orgs, per_org, now):
     return out
 
 
+def _dollars(v):
+    """200 -> "200", 1,600 with a separator, and cents under a dollar: 0.40."""
+    return f"{v:.2f}" if abs(v) < 1 else f"{v:,.0f}"
+
+
 def credit_warnings(by_tag, now):
     """[(level, text)] for summaries grouped by a tag such as "#9": included
     credit about to lapse (red under CREDIT_URGENT, yellow under
-    CREDIT_SOON), most urgent first; then links that wait for something."""
+    CREDIT_SOON), most urgent first; then links that wait for something;
+    then, in grey, what a cached summary says lapsed since it was read."""
     import time as _t
     found = []
     for tag, summaries in by_tag.items():
@@ -808,21 +816,30 @@ def credit_warnings(by_tag, now):
             inc, link = s.get("included"), s.get("link") or {}
             if inc and inc.get("left") and inc.get("expires"):
                 left = inc["expires"] - now
-                if left < CREDIT_SOON:
+                when = _t.strftime("%a %d %b", _t.localtime(inc["expires"]))
+                if left <= 0:
+                    # read (and cached) before it lapsed: what is left now is unknown
+                    found.append((3, inc["expires"], "grey",
+                                  f"{who}: {_dollars(inc['left'])} $ of included API credit lapsed"
+                                  f" {when} (as of the last read — claude-swap credits)"))
+                elif left < CREDIT_SOON:
                     urgent = left < CREDIT_URGENT
                     span = f"{int(left // 3600)}h" if left < 86400 else f"{int(left // 86400)}d"
-                    when = _t.strftime("%a %d %b", _t.localtime(inc["expires"]))
                     found.append((0 if urgent else 1, inc["expires"], "red" if urgent else "yellow",
-                                  f"{who}: {inc['left']:,.0f} $ of included API credit lapse"
+                                  f"{who}: {_dollars(inc['left'])} $ of included API credit lapse"
                                   f" {when} (in {span})"))
-            # included None: the credits could not be read, which says nothing
-            if link.get("status") == "linked" and inc is not None and not inc.get("left"):
-                found.append((2, INF, "yellow",
-                              f"{who}: linked ({link.get('plan') or '?'}), no included credit yet"))
+            # included None: the credits could not be read, which says nothing;
+            # a tranche in date but spent is a link that paid out: nothing to say
+            # (a cache written before "any" existed: credit left means one)
+            if (link.get("status") == "linked" and inc is not None
+                    and not inc.get("any", bool(inc.get("left")))):
+                held = f" (held: {link['held']})" if link.get("held") else ""
+                found.append((2, INF, "yellow", f"{who}: linked ({link.get('plan') or '?'}),"
+                              f" no included credit yet{held}"))
             if link.get("status") == "eligible":
                 plans = ", ".join(link.get("linkable") or []) or "?"
                 found.append((2, INF, "yellow", f"{who}: can be linked ({plans})"
-                              + (f", +{link['monthly']:,.0f} $/month" if link.get("monthly") else "")))
+                              + (f", +{_dollars(link['monthly'])} $/month" if link.get("monthly") else "")))
             if s.get("disabled") and link.get("status") == "linked":
                 found.append((3, INF, "grey", f"{who}: API disabled ({s['disabled']})"))
     found.sort(key=lambda x: (x[0], x[1], x[3]))

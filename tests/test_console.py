@@ -80,6 +80,16 @@ class Summary(unittest.TestCase):
         self.assertTrue(s["no_permission"])
         self.assertIsNone(s["included"])
 
+    def test_any_included_tranche_even_spent(self):
+        spent = dict(CREDITS["tranches"][0], remaining_amount_minor_units=0)
+        lapsed = dict(CREDITS["tranches"][0], expires_at="2026-11-01T00:00:00Z")
+        cases = ((CREDITS["tranches"], True), ([spent], True), ([lapsed], False),
+                 ([CREDITS["tranches"][1]], False))
+        for tranches, want in cases:
+            c = dict(CREDITS, tranches=tranches)
+            s = summary({"api-org": dict(PER_ORG["api-org"], credits=c)})[0]
+            self.assertIs(s["included"]["any"], want, tranches)
+
     def test_spent_or_lapsed_tranches_do_not_count(self):
         t = dict(CREDITS["tranches"][0], remaining_amount_minor_units=0)
         old = dict(CREDITS["tranches"][0], expires_at="2026-11-01T00:00:00Z")
@@ -119,6 +129,44 @@ class Warnings(unittest.TestCase):
         w = warn({"#2": [self.inc(200.0, 5 * D)], "#9": [self.inc(200.0, 2 * D)]})
         self.assertEqual([x[0] for x in w], ["red", "yellow"])
         self.assertIn("#9", w[0][1])
+
+    def test_lapsed_since_the_last_read_is_grey(self):
+        # a cached summary read before its included credit lapsed
+        w = warn({"#9": [self.inc(200.0, -1 * D)]})
+        self.assertEqual(len(w), 1)
+        level, text = w[0]
+        self.assertEqual(level, "grey")
+        self.assertIn("lapsed", text)
+        self.assertIn("as of the last read", text)
+        self.assertNotIn("in -", text)
+        self.assertEqual(warn({"#9": [self.inc(200.0, 0)]})[0][0], "grey")
+
+    def test_amounts_under_a_dollar_show_cents(self):
+        self.assertIn("0.40 $", warn({"#9": [self.inc(0.4, 2 * D)]})[0][1])
+        self.assertIn("0.40 $", warn({"#9": [self.inc(0.4, -D)]})[0][1])
+        self.assertIn("1 $", warn({"#9": [self.inc(1.4, 2 * D)]})[0][1])
+        self.assertIn(" 200 $", warn({"#9": [self.inc(200.0, 2 * D)]})[0][1])
+        eligible = {"included": None, "name": "P", "disabled": None,
+                    "link": {"status": "eligible", "monthly": 0.5, "linkable": ["pro"]}}
+        self.assertIn("+0.50 $/month", warn({"#4": [eligible]})[0][1])
+
+    def linked(self, any_, held=None):
+        return {"included": {"left": 0.0, "granted": 0.0, "expires": None, "products": [], "any": any_},
+                "link": {"status": "linked", "plan": "max_20x", "monthly": 200.0, "held": held},
+                "name": "P", "disabled": None}
+
+    def test_linked_with_its_included_credit_spent_says_nothing(self):
+        self.assertEqual(warn({"#7": [self.linked(True)]}), [])
+
+    def test_linked_without_any_included_credit_yet(self):
+        w = warn({"#7": [self.linked(False)]})
+        self.assertEqual(len(w), 1)
+        self.assertEqual(w[0][0], "yellow")
+        self.assertIn("no included credit yet", w[0][1])
+        self.assertNotIn("held", w[0][1])
+        w = warn({"#7": [self.linked(False, held="pending_review")]})
+        self.assertIn("no included credit yet", w[0][1])
+        self.assertIn("pending_review", w[0][1])
 
     def test_linked_without_credit_and_eligible(self):
         linked = {"included": {"left": 0.0, "granted": 0.0, "expires": None, "products": []},
