@@ -232,25 +232,32 @@ def _worth_before(g, renews, now):
     return True
 
 
-def reset_due(r, now, state, model=None):
+def reset_due(r, now, state, model=None, seat=False):
     """The reset to spend on r now, or None (aggressive policy).
 
-    The week spent: its full reset; without one, a model reset whose model
-    spent at least MODEL_RESET_MIN_WEEK of the week, which it gives back.
-    The 5h spent on a seat whose full reset clears the 5h too: that one.
-    The preferred model spent, with at least MODEL_RESET_MIN_WEEK of the
-    week left: a reset of that model. Never in a cooldown, never twice
-    within RESET_RETRY, never a kind that did not work on that account.
+    The week spent: its full reset; without a usable one (none, or one that
+    failed on this account), a model reset whose model spent at least
+    MODEL_RESET_MIN_WEEK of the week, which it gives back. A full reset
+    tried lately blocks that fallback too. The 5h spent on a reserved seat
+    (seat=True) whose full reset clears the 5h too: that one. The preferred
+    model spent, with at least MODEL_RESET_MIN_WEEK of the week left: a
+    reset of that model. Never in a cooldown, never twice within
+    RESET_RETRY, never a kind that did not work on that account.
     """
     if (r.get("reset_cooldown") or 0) > now:
         return None
+
+    def failed(g):
+        key = f"{r['n']}:{reset_key(g)}"
+        return key in (state.get("reset_failed") or []) or (
+            g["kind"] == FULL and r["n"] in (state.get("reset_failed") or []))
 
     def first(gs):
         return next((g for g in gs if _reset_allowed(r, g, now, state)), None)
 
     u7 = r.get("u7") or 0
     if u7 >= LEAVE:
-        full = grants_of(r, now, FULL)
+        full = [g for g in grants_of(r, now, FULL) if not failed(g)]
         if full:
             g = first(full)
             return g if g and _worth_before(g, r.get("r7"), now) else None
@@ -258,10 +265,10 @@ def reset_due(r, now, state, model=None):
             if share < MODEL_RESET_MIN_WEEK:
                 break
             g = first(grants_of(r, now, MODEL, name))
-            if g:
+            if g and _worth_before(g, r.get("r7"), now):
                 return g
         return None
-    if (r.get("u5") or 0) >= LEAVE:
+    if seat and (r.get("u5") or 0) >= LEAVE:
         g = first(g for g in grants_of(r, now, FULL) if g["five_hour"])
         if g:
             return g
@@ -418,7 +425,7 @@ def lane_decide(rows, lane, pool, now, state, auto_reset=False, model=None):
     d = decide(sub, lane, now, state, False, model)
     if auto_reset and d["action"] == "wall":
         for r in rank(sub, now, model):
-            g = reset_due(r, now, state, model)
+            g = reset_due(r, now, state, model, seat=True)
             if g:
                 return dict(d, action="reset", target=r["n"], grant=g,
                             reason="every seat at its limit; " + reset_reason(r, g, model))

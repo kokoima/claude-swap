@@ -349,7 +349,7 @@ class ResetKinds(unittest.TestCase):
         return decide(rows, 2, {**LONG_AGO, **(state or {})}, auto_reset=True, model=model)
 
     def test_a_spent_week_takes_the_full_reset_over_a_model_one(self):
-        d = self.due(self.rows(u7=98, grants=[mgrant(), fgrant()]))
+        d = self.due(self.rows(u7=98, grants=[mgrant(), fgrant()], shares={"Fable": 40}))
         self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 2, "full"))
 
     def test_without_a_full_one_a_model_reset_only_if_it_gives_back_a_quarter(self):
@@ -384,6 +384,19 @@ class ResetKinds(unittest.TestCase):
     def test_a_full_reset_tried_lately_does_not_fall_back_to_a_model_one(self):
         rows = self.rows(u7=98, grants=[fgrant(), mgrant()], shares={"Fable": 40})
         self.assertNotEqual(self.due(rows, {"reset_tried": {"2:full": NOW - H}})["action"], "reset")
+
+    def test_the_5h_reset_is_for_seats_only(self):
+        rows = today({2: dict(u5=100, u7=30, grants=[fgrant(five_hour=True)])})
+        self.assertNotEqual(decide(rows, 2, LONG_AGO, auto_reset=True)["action"], "reset")
+
+    def test_the_model_fallback_waits_for_a_renewing_week(self):
+        rows = self.rows(u7=98, r7=NOW + 2 * H, grants=[mgrant()], shares={"Fable": 40})
+        self.assertNotEqual(self.due(rows)["action"], "reset")
+
+    def test_a_failed_full_reset_does_not_block_the_model_fallback(self):
+        rows = self.rows(u7=98, grants=[fgrant(), mgrant()], shares={"Fable": 40})
+        d = self.due(rows, {"reset_failed": ["2:full"]})
+        self.assertEqual((d["action"], d["grant"]["kind"]), ("reset", "model"))
 
     def test_spends_the_one_that_lapses_first(self):
         rows = self.rows(models=fab(100), grants=[mgrant(gid="late", ends=NOW + 900 * H),
