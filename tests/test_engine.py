@@ -837,5 +837,12 @@ class FiveHour(unittest.TestCase):
         self.assertEqual((d["action"], d["target"]), ("switch", 1))
 
 
+class ModelSetting(unittest.TestCase):
+    def test_fable_unless_set(self):
+        self.assertEqual(E["model_setting"]({}), "fable")
+        self.assertEqual(E["model_setting"]({"model": "opus"}), "opus")
+        self.assertEqual(E["model_setting"]({"model": "  "}), "fable")
+
+
 if __name__ == "__main__":
     unittest.main()
