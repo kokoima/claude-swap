@@ -795,6 +795,20 @@ class KeychainWrite(unittest.TestCase):
             self.assertFalse(O["Keychain"]("me").write(O["VAULT"], text, "a@x.io"))
 
 
+class KeychainHint(unittest.TestCase):
+    """Over SSH macOS keeps the login keychain locked: a failed keychain
+    read or write says so there, and adds nothing anywhere else."""
+
+    def test_an_ssh_session_is_told_the_keychain_is_locked(self):
+        for var in ("SSH_CONNECTION", "SSH_TTY"):
+            with mock.patch.dict(os.environ, {var: "x"}, clear=True):
+                self.assertIn("security unlock-keychain", O["keychain_hint"]())
+
+    def test_a_local_terminal_gets_no_hint(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(O["keychain_hint"](), "")
+
+
 class Orgs(unittest.TestCase):
     """Which claude.ai org an account's plan and usage come from."""
     MAX = {"uuid": "max", "rate_limit_tier": "default_claude_max_20x",

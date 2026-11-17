@@ -22,7 +22,7 @@
 
 set -e
 
-VERSION="1.18.0"
+VERSION="1.18.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -1188,6 +1188,16 @@ class Keychain:
         except Exception:
             pass
 
+def keychain_hint():
+    """Why a keychain read or write may have failed. In an SSH session macOS
+    keeps the login keychain locked; a tmux window opened on the Mac reaches
+    it, since tmux runs in the Mac's own session."""
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return (" — this is an SSH session, where macOS keeps the keychain locked:"
+                " run `security unlock-keychain` in it first, or use a terminal or"
+                " tmux window on the Mac")
+    return ""
+
 def write_private(path, text):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1482,10 +1492,10 @@ def install(store, n, secrets, live, http, now):
             live.backup(setup_login(acc))
             set_account((acc.get("oauth") or {}).get("account"))
             return "oauth", note
-        return "failed", "could not write Claude Code's credential"
+        return "failed", "could not write Claude Code's credential" + keychain_hint()
     s = setup_login(acc)
     if not live.write(s):
-        return "failed", "could not write Claude Code's credential"
+        return "failed", "could not write Claude Code's credential" + keychain_hint()
     live.backup(s)
     set_account(None)
     return "setup", note
@@ -1931,7 +1941,7 @@ def lane_put(store, n, secrets, http, now, base=None):
         note = (f"its full login {'was refused' if m.get('dead') else 'expired'}:"
                 f" claude-swap auth {n}")
     if not secrets.write(run_service(d), dump(o or setup_login(acc))):
-        return "failed", "could not write the reserved sessions' credential"
+        return "failed", "could not write the reserved sessions' credential" + keychain_hint()
     set_account((acc.get("oauth") or {}).get("account") if o else None,
                 os.path.join(d, ".claude.json"))
     rec = store.get("lane") or {}
@@ -3974,7 +3984,7 @@ for i, acc in enumerate(accounts):
     if secrets.read(oauth.VAULT, slot) != ck:
         if not secrets.write(oauth.VAULT, ck, slot):
             print(f"  Account {i+1} ({em}): could not save the Console session to the"
-                  " keychain (over SSH the keychain is locked: run it on the Mac or in tmux)")
+                  " keychain" + oauth.keychain_hint())
             continue
         wrote = True
         print(f"  Account {i+1} ({em}): Console session saved (from {prof})")
@@ -5694,7 +5704,7 @@ def account_rows(i, label, summaries, org_err):
 
 # results: email -> (n, its table rows, its summaries, why its organizations
 # are unknown, or None); turned: the accounts the Console turned away
-results, missing, rejected, silent, turned = {}, [], [], [], []
+results, missing, unread, rejected, silent, turned = {}, [], [], [], [], []
 stop, refused = None, []  # refused: the latest accounts in a row turned away
 for i, acc in enumerate(accounts, 1):
     # a disabled account only when asked for by number (it is a read)
@@ -5703,7 +5713,9 @@ for i, acc in enumerate(accounts, 1):
     em = (acc.get("email") or "").lower()
     ck = secrets.read(oauth.VAULT, oauth.console_slot(em)) if em else None
     if not ck:
-        missing.append(i)
+        # keys-sync saved one: the keychain did not give it back (over SSH it
+        # is locked), which is not the same as never having logged in
+        (unread if acc.get("console_checked") else missing).append(i)
         continue
     label = acc.get("label") or em
     c = oauth.Console(ck)
@@ -5787,6 +5799,9 @@ def spans(ns):
         out.append(f"#{ns[k]}" + (f"-#{ns[j]}" if j > k else ""))
         k = j + 1
     return ", ".join(out)
+if unread:
+    print(paint(YELLOW, "  The keychain did not give back the Console session keys-sync saved for "
+                + spans(unread) + (oauth.keychain_hint() or " — is it locked?")))
 if missing:
     print(paint(GREY, "  No Console session: " + spans(missing)
                 + " — log platform.claude.com in on the account's Chrome profile, then claude-swap keys-sync"))
