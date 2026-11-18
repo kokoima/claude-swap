@@ -22,7 +22,7 @@
 
 set -e
 
-VERSION="1.19.0"
+VERSION="1.20.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -475,6 +475,38 @@ def lane_decide(rows, lane, pool, now, state, auto_reset=False, model=None):
                             reason="every seat at its limit; " + reset_reason(r, g, model))
     return d
 
+
+def free_quota(rows, now, model=None):
+    """What a group of accounts has left, summed: the % free of the 5h, of
+    the week and of the model's own weekly limit (100 = one whole account).
+
+    Only accounts in the rotation count (a reserved seat in its own group).
+    The 5h counts only where the week and the model still let the account
+    work: a spent week leaves its 5h worthless. The model counts only where
+    it is known. next is the soonest weekly renewal that will come, as
+    (epoch, n, % it gives back). None when no account counts."""
+    rs = [r for r in (dict(r, reserved=False) for r in rows) if eligible(r)]
+    if not rs:
+        return None
+
+    def free(p):
+        return max(0, 100 - min(100, p or 0))
+
+    def works(r):
+        p = model_pct(r, model) if model else None
+        return (r.get("u7") or 0) < LEAVE and (p is None or p < LEAVE)
+
+    h5 = [free(r.get("u5")) for r in rs if works(r)]
+    week = [free(r.get("u7")) for r in rs if r.get("u7") is not None]
+    mod = [free(p) for p in (model_pct(r, model) for r in rs) if p is not None] if model else []
+    due = [(r["r7"], r["n"], min(100, round(r.get("u7") or 0))) for r in rs
+           if r.get("r7") and r["r7"] > now
+           and not (r.get("cancel_at") and r["r7"] >= r["cancel_at"])]
+    return {"accounts": len(rs), "h5": sum(h5), "h5_n": len(h5),
+            "d7": sum(week), "d7_n": len(week),
+            "model": sum(mod) if model else None, "model_n": len(mod),
+            "resets": sum(r.get("resets") or 0 for r in rs),
+            "next": min(due) if due else None}
 
 # --- Plan timeline: what check draws, and when the watch re-reads it ---
 # cancel_at is when a cancelled plan stops (the account turns free) and
@@ -3037,6 +3069,88 @@ header = left_part(
 cal_header = "".join(center(f"{DAY_NAMES[d.weekday()]}{d.day}", CW) for d in cal_days)
 split = vlen(header)
 
+now_ts = time.time()
+eng_rows = []
+for r in results:
+    cancel = parse_iso(accounts[r["n"] - 1].get("plan_ends"))
+    limited = r["error"] == "RATE LIMITED"
+    eng_rows.append({
+        "n": r["n"], "label": r["label"], "u5": r["u5"], "u7": r["u7"],
+        "r5": ep(r["r5"]), "r7": ep(r["r7"]), "plan_end": ep(r["plan_end"]),
+        "cancel_at": ep(cancel),
+        # a cancelled plan past its end date is free, whatever is cached
+        "free": is_free(r["plan"]) or bool(cancel and cancel <= datetime.now()),
+        "disabled": r["disabled"], "reserved": r["reserved"],
+        "error": None if limited else r["error"],
+        "rate_limited": limited,
+        "models": r["models"], "shares": r["shares"], "grants": r["grants"],
+        "resets": (r["resets"][engine.FULL]["left"] if r["resets"] else None),
+        "resets_ends": (ep(r["resets"][engine.FULL]["ends"]) if r["resets"] else None),
+        "reset_cooldown": None})
+
+def when(ts):
+    # to the minute, as the table shows it: a model's renewal comes as
+    # ...:59.99 and would print a minute early
+    return local_dt(ts).strftime("%a %d %H:%M")
+
+# ---------- free quota: what each group has left, summed ----------
+# One row for the accounts the watch rotates and one for the reserved seats:
+# the % free of the 5h, the week and the model column, added up (100 = one
+# whole account), and the next weekly renewal. See engine.free_quota.
+W_KPI, KPI_BAR = 10, 10
+
+def kpi_cell(free, n):
+    """A bar of what is free (full = every counted account untouched), green
+    with plenty left and red with little, then '57% (0.6)': the % free,
+    summed, and how many whole accounts it makes."""
+    if not n:
+        return paint(GREY, "·" * KPI_BAR + " " + pad("-", W_KPI, right=True))
+    p = max(0.0, min(100.0, free / n))
+    e = round(p / 100 * KPI_BAR * 8)
+    full, rem = divmod(e, 8)
+    filled = "█" * full + (EIGHTHS[rem - 1] if rem else "")
+    col = threshold_color(100 - p)
+    if USE_COLOR:
+        b = (f"\x1b[{col};{TRACK_BG}m{filled}\x1b[0m"
+             + f"\x1b[{TRACK_BG}m{' ' * (KPI_BAR - len(filled))}\x1b[0m")
+    else:
+        b = filled + "░" * (KPI_BAR - len(filled))
+    whole = free / 100
+    txt = f"{free:.0f}% ({whole:.1f})" if whole < 10 else f"{free:.0f}% ({whole:.0f})"
+    return b + " " + paint(col, pad(txt, W_KPI, right=True))
+
+KPI_MODEL = COL if COL_PREF else None  # the model that can stop an account
+groups = [("General", [e for e in eng_rows if not e["reserved"]]),
+          ("Reserved", [e for e in eng_rows if e["reserved"]])]
+kpis = [(name, engine.free_quota(rows, now_ts, KPI_MODEL),
+         engine.free_quota(rows, now_ts, COL) if COL and not COL_PREF else None)
+        for name, rows in groups]
+kpis = [(name, q, other) for name, q, other in kpis if q]
+if kpis:
+    W_G = max(len(name) for name, _, _ in kpis) + 4
+    cell_w = KPI_BAR + 1 + W_KPI
+    heads = ["5h", "7d"] + ([COL_NAME + ("*" if COL_MARK else "")] if COL else [])
+    print("  " + paint(BOLD, pad("Free quota", W_G)) + "  "
+          + "  ".join(paint(BOLD, pad(h, cell_w)) for h in heads)
+          + "  " + paint(BOLD, "next weekly renewal"))
+    for name, q, other in kpis:
+        mq = other or q
+        cells = [kpi_cell(q["h5"], q["accounts"]), kpi_cell(q["d7"], q["d7_n"])]
+        if COL:
+            cells.append(kpi_cell(mq["model"] or 0, mq["model_n"]))
+        nxt = q["next"]
+        tail = (f"{when(nxt[0])} #{nxt[1]} " + paint(GREEN, f"+{nxt[2]}%")) if nxt else paint(GREY, "-")
+        if q["resets"]:
+            tail += paint(GREY, " · ") + paint(GREEN, f"{q['resets']} full reset{'s' if q['resets'] > 1 else ''} left")
+        print("  " + pad(f"{name} {q['accounts']}", W_G) + "  " + "  ".join(cells) + "  " + tail)
+    notes = [f"5h: only accounts with the week{' and ' + COL_NAME if KPI_MODEL else ''} left"]
+    if COL:
+        notes.append(f"{COL_NAME}: " + " and ".join(
+            f"{(o or q)['model_n']} of {q['accounts']}" for _, q, o in kpis) + " accounts report it")
+    notes.append("(n) = whole accounts")
+    print("  " + " " * W_G + "  " + paint(GREY, " · ".join(notes)))
+    print()
+
 print(paint(BOLD, header) + "│" + paint(BOLD, cal_header))
 print("─" * split + "┼" + "─" * (NCAL * CW))
 
@@ -3198,30 +3312,6 @@ resets_line("Model resets", lambda res: res["models"].get(None), None)
 # ---------- watcher order: the general strategy, same table reordered ----------
 # The decision engine the watch and `auto` use: consume first the quota that
 # is lost first. Blocked accounts follow, by when they free up.
-
-def when(ts):
-    # to the minute, as the table shows it: a model's renewal comes as
-    # ...:59.99 and would print a minute early
-    return local_dt(ts).strftime("%a %d %H:%M")
-
-now_ts = time.time()
-eng_rows = []
-for r in results:
-    cancel = parse_iso(accounts[r["n"] - 1].get("plan_ends"))
-    limited = r["error"] == "RATE LIMITED"
-    eng_rows.append({
-        "n": r["n"], "label": r["label"], "u5": r["u5"], "u7": r["u7"],
-        "r5": ep(r["r5"]), "r7": ep(r["r7"]), "plan_end": ep(r["plan_end"]),
-        "cancel_at": ep(cancel),
-        # a cancelled plan past its end date is free, whatever is cached
-        "free": is_free(r["plan"]) or bool(cancel and cancel <= datetime.now()),
-        "disabled": r["disabled"], "reserved": r["reserved"],
-        "error": None if limited else r["error"],
-        "rate_limited": limited,
-        "models": r["models"], "shares": r["shares"], "grants": r["grants"],
-        "resets": (r["resets"][engine.FULL]["left"] if r["resets"] else None),
-        "resets_ends": (ep(r["resets"][engine.FULL]["ends"]) if r["resets"] else None),
-        "reset_cooldown": None})
 
 order = engine.rank(eng_rows, now_ts, PREF)
 blocked = sorted((e for e in order if engine.blocked(e, PREF)),

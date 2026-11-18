@@ -235,6 +235,13 @@ with `--auto-reset`, `wf` = start watcher with `model fable`, `wp` = stop watche
   it only comes if you renew the plan. A booked downgrade shows
   `↓HH:MM` in cyan and the row goes on. One mark per day: the end beats
   a downgrade, which beats a renewal.
+- **Free quota** — above the table, one row for the accounts the watch
+  rotates and one for the reserved seats: what is left of the 5h, the week
+  and the model column, summed (`57% (0.6)`: 57 % free in all, about 0.6
+  of a whole account), with a bar that empties as it runs out, the next
+  weekly renewal and what it gives back, and the full resets left. The 5h
+  counts only on accounts whose week (and preferred model) still has room,
+  since a spent week leaves its 5h worthless.
 - **Watcher order** — the same rows in the order the watcher (and
   `auto`) consumes them, each with the reason: when its quota is lost
   (`renews …` or `plan ends …`), `last day`, `holds a full reset`,

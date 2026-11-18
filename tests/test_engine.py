@@ -891,5 +891,62 @@ class ModelSetting(unittest.TestCase):
         self.assertEqual(E["model_setting"]({"model": "  "}), "fable")
 
 
+class FreeQuota(unittest.TestCase):
+    """What a group of accounts has left, summed (100 = one whole account)."""
+
+    def q(self, rows, model="Fable"):
+        return E100["free_quota"](rows, NOW, model)
+
+    def test_the_week_and_the_model_are_summed_over_the_group(self):
+        q = self.q([acct(1, u7=40, r7=NOW + 10 * H, models=fab(30)),
+                    acct(2, u7=90, r7=NOW + 5 * H, models=fab(100))])
+        self.assertEqual((q["d7"], q["d7_n"]), (70, 2))
+        self.assertEqual((q["model"], q["model_n"]), (70, 2))
+        self.assertEqual(q["accounts"], 2)
+
+    def test_5h_counts_only_where_the_week_and_the_model_still_let_it_work(self):
+        q = self.q([acct(1, u5=20, u7=40, models=fab(30)),
+                    acct(2, u5=0, u7=100, models=fab(10)),     # week spent
+                    acct(3, u5=0, u7=50, models=fab(100))])    # Fable spent
+        self.assertEqual((q["h5"], q["h5_n"]), (80, 1))
+
+    def test_without_a_model_limit_only_the_week_stops_the_5h(self):
+        q = self.q([acct(1, u5=0, u7=50, models=fab(100))], model=None)
+        self.assertEqual((q["h5"], q["h5_n"]), (100, 1))
+        self.assertIsNone(q["model"])
+
+    def test_the_model_counts_only_where_it_is_known(self):
+        q = self.q([acct(1, u7=0, models=fab(40)), acct(2, u7=0)])
+        self.assertEqual((q["model"], q["model_n"]), (60, 1))
+
+    def test_out_of_the_rotation_accounts_do_not_count(self):
+        q = self.q([acct(1, u7=0), acct(2, u7=0, free=True), acct(3, u7=0, disabled=True),
+                    acct(4, u7=0, error="AUTH ERROR"), acct(5, u5=None, u7=None)])
+        self.assertEqual((q["accounts"], q["d7"]), (1, 100))
+
+    def test_reserved_seats_count_in_their_own_group(self):
+        q = self.q([acct(11, u7=20, reserved=True)])
+        self.assertEqual(q["d7"], 80)
+
+    def test_next_is_the_soonest_weekly_renewal_and_what_it_gives_back(self):
+        q = self.q([acct(1, u7=40, r7=NOW + 10 * H), acct(2, u7=90, r7=NOW + 5 * H),
+                    acct(3, u7=10, r7=NOW - H)])
+        self.assertEqual(q["next"], (NOW + 5 * H, 2, 90))
+        # claude.ai can report a week a hair over 100%: it gives back 100
+        self.assertEqual(self.q([acct(1, u7=101, r7=NOW + H)])["next"][2], 100)
+
+    def test_a_renewal_after_the_plan_ends_never_comes(self):
+        q = self.q([acct(1, u7=90, r7=NOW + 5 * H, cancel_at=NOW + 2 * H),
+                    acct(2, u7=30, r7=NOW + 9 * H)])
+        self.assertEqual(q["next"], (NOW + 9 * H, 2, 30))
+
+    def test_full_resets_left_are_added_up(self):
+        q = self.q([acct(1, resets=2), acct(2, resets=None), acct(3, resets=1)])
+        self.assertEqual(q["resets"], 3)
+
+    def test_an_empty_group_is_none(self):
+        self.assertIsNone(self.q([acct(1, disabled=True)]))
+
+
 if __name__ == "__main__":
     unittest.main()
