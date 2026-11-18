@@ -241,6 +241,13 @@ with `--auto-reset`, `wf` = start watcher with `model fable`, `wp` = stop watche
   `holds a Fable reset`, `little room`, or `blocked until …` for accounts at their limit, which come
   last. The `Now:` line says what the general strategy would do right
   now. See [watch mode](#watch-mode--automatic-switching).
+- **Reserved order** — the reserved accounts ranked by the same rule, for
+  the reserved sessions (`claude-swap run`): `▸` marks the account they are
+  on, `· watch` the ones `watch reserved` lets the watch move them among,
+  and a `left out:` line says why an account is not ranked (a plan not
+  known yet counts as free). Its `Now:` line is what the watch will do
+  with them, or, when it does not move them, the best seat to move them
+  to by hand (`claude-swap <n>`).
 
 ## Watch mode — automatic switching
 
@@ -474,8 +481,8 @@ such an account **reserved** (`claude-swap add --reserved`, or
 
 - `auto` and the watch never pick it and it never becomes the shared
   login, so no swap moves work onto it or off it;
-- `check` still shows its usage, plan and calendar, and lists it on a
-  `Reserved:` line below the watcher order, marking the account the
+- `check` still shows its usage, plan and calendar, and ranks it in a
+  *Reserved order* table below the watcher order, marking the account the
   reserved sessions are on;
 - `claude-swap run [-- <claude args>]` starts a session on the reserved
   accounts, which later swaps of the shared login leave where it is;

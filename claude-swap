@@ -22,7 +22,7 @@
 
 set -e
 
-VERSION="1.18.1"
+VERSION="1.19.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -3272,20 +3272,65 @@ else:
     head = "wait" + (f" until {when(d['wake'])}" if d["wake"] else "")
 print("  " + paint(BOLD, "Now: " + head) + paint(GREY, f" — {d['reason']}"))
 
-# reserved accounts sit out of that order: only `claude-swap run` opens them
+# reserved accounts sit out of that order: only `claude-swap run` opens them.
+# The reserved sessions (one lane) get an order of their own, by the same
+# rule: the one the watch follows when it moves them, and otherwise the
+# best seat to move them to by hand
 kept = [r for r in results if r["reserved"] and not r["disabled"]]
 if kept:
     ln = (store.get("lane") or {}).get("n")
     want = [e.lower() for e in store.get("lane_rotate") or []]
     rot = [i for i, a in enumerate(store.get("accounts", []), 1)
            if (a.get("email") or "").lower() in want and a.get("reserved")]
-    print("  " + paint(CYAN, "Reserved: ")
-          + ", ".join((paint(BOLD, f"#{r['n']} {short(r['label'])} ◂ sessions")
-                       if r["n"] == ln else f"#{r['n']} {short(r['label'])}") for r in kept)
-          + paint(GREY, " — never the shared login; their sessions: claude-swap run"
-                        " -- <claude args>, moved with claude-swap <n>"
-                        + (f"; the watch moves them among {', '.join(f'#{i}' for i in rot)}"
-                           if len(rot) > 1 else "")))
+    watched = len(rot) > 1 and ln in rot
+    seats = [dict(e, reserved=False) for e in eng_rows
+             if e["reserved"] and not e["disabled"]]
+    r_order = engine.rank(seats, now_ts, PREF)
+    r_blocked = sorted((e for e in r_order if engine.blocked(e, PREF)),
+                       key=lambda e: engine.unblock_at(e, PREF) or float("inf"))
+    print()
+    print(paint(BOLD, "  Reserved order")
+          + paint(GREY, " — the reserved sessions (claude-swap run, never the shared login),"
+                        " same rule · "
+                        + (f"the watch moves them among {', '.join(f'#{i}' for i in rot)}"
+                           if len(rot) > 1 else
+                           "the watch does not move them: claude-swap watch reserved <n...>")))
+    if not r_order:
+        print(paint(GREY, "    no reserved account available"))
+    for e in [e for e in r_order if not engine.blocked(e, PREF)] + r_blocked:
+        print(render_row(by_n[e["n"]]) + "  " + note(e)
+              + (paint(CYAN, " · watch") if len(rot) > 1 and e["n"] in rot else ""))
+
+    def left_out(r):
+        """Why a reserved account is not in the order."""
+        if r["error"] and r["error"] != "RATE LIMITED":
+            return r["error"].lower()
+        if not r.get("plan"):
+            return "plan not known: counted as free"
+        if is_free(r["plan"]):
+            return "free plan"
+        return "no usage read"
+    ranked_ns = {e["n"] for e in r_order}
+    out = [r for r in kept if r["n"] not in ranked_ns]
+    if out:
+        print(paint(GREY, "    left out: " + ", ".join(
+            f"#{r['n']}{' ▸' if r['n'] == ln else ''} ({left_out(r)})" for r in out)))
+
+    ld = engine.lane_decide(seats, ln, rot, now_ts, {}, False, PREF) if watched else None
+    if ld is None:
+        ld = engine.decide(seats, ln, now_ts, {}, False, PREF)
+    t = ld["target"]
+    if ld["action"] == "stay":
+        head, tail = f"stay on #{ln}", ld["reason"]
+    elif ld["action"] == "switch":
+        head = f"the watch moves them to #{t}" if watched else f"best seat #{t}"
+        tail = ld["reason"] + ("" if watched else f" · claude-swap {t} moves them")
+    else:
+        head = "every seat at its limit" + (f" until {when(ld['wake'])}" if ld["wake"] else "")
+        tail = ld["reason"]
+    where = f"on #{ln}" if ln else "on no account yet"
+    print("  " + paint(BOLD, "Now: " + head)
+          + paint(GREY, f" — {tail}" + ("" if ld["action"] == "stay" else f" (they are {where})")))
 
 # API credits: warnings from the last `claude-swap credits` (cache only, no network)
 try:
