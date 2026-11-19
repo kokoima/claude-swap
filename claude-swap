@@ -22,13 +22,17 @@
 
 set -e
 
-VERSION="1.20.3"
+VERSION="1.21.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
-# A session of `claude-swap run` on a full login has its account's own
+# A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
-# always works on the shared login.
+# always works on the shared login. The dir is kept in CLAUDE_SWAP_FROM_DIR,
+# which tells `claude-swap <n>` whose lane the session it runs in is on.
+unset CLAUDE_SWAP_FROM_DIR
 case "${CLAUDE_CONFIG_DIR:-}" in
-  "${CLAUDE_SWAP_RUN:-$HOME/.claude-swap/run}"/*) unset CLAUDE_CONFIG_DIR ;;
+  "${CLAUDE_SWAP_RUN:-$HOME/.claude-swap/run}"/*)
+    export CLAUDE_SWAP_FROM_DIR="$CLAUDE_CONFIG_DIR"
+    unset CLAUDE_CONFIG_DIR ;;
 esac
 # Claude Code's files, where it looks for them (CLAUDE_CONFIG_DIR moves both)
 CLAUDE_CREDS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
@@ -247,6 +251,22 @@ def _reset_allowed(r, g, now, state):
     tried = state.get("reset_tried") or {}
     t = tried.get(f"{n}:{key}") or (tried.get(str(n)) if key == FULL else None)
     return not (t and now - t < RESET_RETRY)
+
+
+def with_resets_of(state, others):
+    """state as decide reads it, with the reset marks (reset_tried,
+    reset_failed) of the others added: the lanes of two groups on one seat
+    spend one quota, so a reset either tried there counts for both (the
+    latest try wins). state itself is left as it is: a spend is marked on
+    the lane that made it."""
+    tried = dict(state.get("reset_tried") or {})
+    failed = list(state.get("reset_failed") or [])
+    for o in others:
+        for k, t in (o.get("reset_tried") or {}).items():
+            if t and t > (tried.get(k) or 0):
+                tried[k] = t
+        failed += [k for k in o.get("reset_failed") or [] if k not in failed]
+    return dict(state, reset_tried=tried, reset_failed=failed)
 
 
 def _worth_before(g, renews, now):
@@ -474,6 +494,22 @@ def lane_decide(rows, lane, pool, now, state, auto_reset=False, model=None):
                 return dict(d, action="reset", target=r["n"], grant=g,
                             reason="every seat at its limit; " + reset_reason(r, g, model))
     return d
+
+
+def step_lanes(keys, step):
+    """One look at every group's lane, in the order of keys (the default
+    group's first): step(key) does a lane's turn and says whether it spent a
+    reset. That ends the look: the lanes decide on the rows of the same
+    probe, and a seat just reset (whose figures every group holding it
+    shares) would still read at its limit, so a lane after it could spend
+    another seat's reset and leave the one just freed. The rest wait for
+    the next look, on fresh rows. -> the keys stepped."""
+    done = []
+    for k in keys:
+        done.append(k)
+        if step(k):
+            break
+    return done
 
 
 def free_quota(rows, now, model=None):
@@ -1061,6 +1097,31 @@ def resolve_group(store, n, g=None, config_dir=None):
     return None, (f"#{n} is in {' and '.join(gs)}: say which lane moves,"
                   f" claude-swap {n} {gs[0]}")
 
+def split_group(args):
+    """`--group <g>` taken out of a command's arguments, wherever it is.
+    -> (the other arguments, g or None, error or None)"""
+    rest, g, i = [], None, 0
+    while i < len(args):
+        if args[i] == "--group":
+            if g is not None or i + 1 >= len(args):
+                return args, None, "--group takes one group name"
+            g, i = args[i + 1], i + 2
+        else:
+            rest.append(args[i])
+            i += 1
+    return rest, g, None
+
+def move_args(store, n, g):
+    """The arguments of `claude-swap` that move group g's lane (g a name, or
+    None for the default group's) to seat n: the group named when the seat
+    is in more than one, or it is not the default group's lane."""
+    name = lane_key(store, g) or default_group(store)
+    return [str(n)] + ([name] if lane_key(store, g) or len(groups_for(store, n)) > 1 else [])
+
+def move_hint(store, n, g):
+    """The command that moves group g's lane to seat n (move_args)."""
+    return "claude-swap " + " ".join(move_args(store, n, g))
+
 def console_slot(email):
     """The vault entry of an account's Console session (keys-sync saves it)."""
     return "console:" + (email or "").lower()
@@ -1070,29 +1131,61 @@ def setup_login(acc):
             "expiresAt": acc.get("expires", 0), "scopes": SETUP_SCOPES,
             "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}
 
-def note_login(acc, o, now, account=None):
-    """Record in the store what a saved login is, never its tokens."""
-    m = {k: v for k, v in (acc.get("oauth") or {}).items()
-         if k not in ("dead", "dead_reason")}
+def _noted(old, o, now, account):
+    m = {k: v for k, v in (old or {}).items() if k not in ("dead", "dead_reason")}
     m.update({"fp": fp(o.get("refreshToken")), "fp_at": fp(o.get("accessToken")),
               "expires": o.get("expiresAt"),
               "rt_expires": o.get("refreshTokenExpiresAt"), "saved": int(now)})
     if account:
         m["account"] = account
         m["uuid"] = account.get("accountUuid")
-    acc["oauth"] = m
+    return m
 
-def usable(acc, now):
-    """Whether the account holds a login that can still be installed."""
-    m = acc.get("oauth") or {}
+def note_login(acc, o, now, account=None):
+    """Record in the store what a saved login is, never its tokens."""
+    acc["oauth"] = _noted(acc.get("oauth"), o, now, account)
+
+# A seat in two groups has a full login per group: its main one (oauth:<email>,
+# acc["oauth"]) is its home group's, the first group holding it; in any other
+# group g it takes its login of g (oauth:<email>#g, acc["oauth_groups"][g]),
+# else its setup-token. Below, a login's group g is None for the main one.
+
+def group_slot(acc, g):
+    """An account's vault entry for its login in group g (None: its main one)."""
+    return slot(acc) + ("#" + g if g else "")
+
+def login_meta(acc, g=None):
+    """What the store records of one of an account's logins; {} when it has
+    none. g is the login's key as login_group() resolves it, not a group's
+    name: None for its main login (whatever its home group), else the group
+    whose own login it is (acc["oauth_groups"][g])."""
+    if not g:
+        return acc.get("oauth") or {}
+    return (acc.get("oauth_groups") or {}).get(g) or {}
+
+def note_group_login(acc, g, o, now, account=None):
+    """note_login for an account's login of group g (None: its main one)."""
+    if not g:
+        return note_login(acc, o, now, account)
+    gs = acc.setdefault("oauth_groups", {})
+    gs[g] = _noted(gs.get(g), o, now, account)
+
+def auth_hint(n, g=None):
+    return f"claude-swap auth {n}" + (f" --group {g}" if g else "")
+
+def usable(acc, now, g=None):
+    """Whether the account holds a login (of group g; None: its main one)
+    that can still be installed."""
+    m = login_meta(acc, g)
     if not m.get("fp") or m.get("dead"):
         return False
     rt = m.get("rt_expires")
     return not rt or rt / 1000 > now
 
-def login_state(acc, now):
-    """('ok' | 'expiring' | 'dead' | 'none', seconds left or None)."""
-    m = acc.get("oauth") or {}
+def login_state(acc, now, key=None):
+    """('ok' | 'expiring' | 'dead' | 'none', seconds left or None) of one of
+    the account's logins: key as login_meta takes it (None: its main one)."""
+    m = login_meta(acc, key)
     if not m.get("fp"):
         return "none", None
     rt = m.get("rt_expires")
@@ -1458,25 +1551,62 @@ def load_store(path):
 def save_store(path, store):
     write_private(path, json.dumps(store, indent=2))
 
-def commit(path, store, top=("active", "live")):
+def commit(path, store, top=("active", "live"), before=None):
     """Save the logins of `store` (and its `top` keys) onto the store as it is
-    on disk now, so that what another process wrote meanwhile is kept."""
+    on disk now, so that what another process wrote meanwhile is kept. A top
+    key "lanes.<g>" is one group's lane record alone (lane_top), which goes
+    from the disk too when `store` no longer has it: each lane moves on its
+    own, and a copy read seconds ago must not write back the others'.
+    With `before`, the store as this process read it, only the login records
+    it changed go (an account's main one and each of its group logins on its
+    own, dropped ones too): a lane move read before an `auth <n> --group g`
+    saved must not undo that login. Without it, every account's logins."""
     try:
         fresh = load_store(path)
     except Exception:
         return save_store(path, store)
-    mine = {(a.get("email") or "").strip().lower(): a
-            for a in store.get("accounts", []) if a.get("email")}
+
+    def key(a):
+        return (a.get("email") or "").strip().lower()
+
+    def put(d, f, v):
+        if v is None:
+            d.pop(f, None)
+        else:
+            d[f] = v
+    mine = {key(a): a for a in store.get("accounts", []) if key(a)}
+    old = {key(a): a for a in (before or {}).get("accounts", []) if key(a)}
     for a in fresh.get("accounts", []):
-        b = mine.get((a.get("email") or "").strip().lower())
+        b = mine.get(key(a))
         if b is None:
             continue
-        if b.get("oauth") is None:
-            a.pop("oauth", None)
-        else:
-            a["oauth"] = b["oauth"]
+        if before is None:
+            for f in ("oauth", "oauth_groups"):
+                put(a, f, b.get(f))
+            continue
+        p = old.get(key(a), {})
+        if p.get("oauth") != b.get("oauth"):
+            put(a, "oauth", b.get("oauth"))
+        was, has = p.get("oauth_groups") or {}, b.get("oauth_groups") or {}
+        changed = [g for g in set(was) | set(has) if was.get(g) != has.get(g)]
+        if changed:
+            gs = dict(a.get("oauth_groups") or {})
+            for g in changed:
+                put(gs, g, has.get(g))
+            put(a, "oauth_groups", gs or None)
     for k in top:
-        if k in store:
+        if k.startswith("lanes."):
+            g, lanes = k[6:], dict(fresh.get("lanes") or {})
+            rec = (store.get("lanes") or {}).get(g)
+            if rec is None:
+                lanes.pop(g, None)
+            else:
+                lanes[g] = rec
+            if lanes:
+                fresh["lanes"] = lanes
+            else:
+                fresh.pop("lanes", None)
+        elif k in store:
             fresh[k] = store[k]
     save_store(path, fresh)
 
@@ -1604,26 +1734,28 @@ def sync(store, secrets, live, http, now):
     note_login(acc, o, now, account or m.get("account"))
     return n, "saved", sure
 
-def vault_login(store, n, secrets, http, now):
+def vault_login(store, n, secrets, http, now, group=None):
     """Account n's saved full login, ready to install: refreshed first when
-    about to expire. -> (login or None, note)"""
+    about to expire. In a group other than its home one (group None: the
+    default group), its login of that group. -> (login or None, note)"""
     acc = store["accounts"][n - 1]
+    g = login_group(store, n, group)
     o, note = None, None
-    if usable(acc, now):
-        o = parse(secrets.read(VAULT, slot(acc)))
+    if usable(acc, now, g):
+        o = parse(secrets.read(VAULT, group_slot(acc, g)))
         if o is None:
             note = "its saved login could not be read"
     if o and (o.get("expiresAt") or 0) / 1000 - now < REFRESH_MARGIN:
         try:
             r = refresh(o, http, now)
         except Dead as e:
-            acc["oauth"].update(dead=int(now), dead_reason=str(e))
-            o, note = None, f"its login was refused ({e}): claude-swap auth {n}"
+            login_meta(acc, g).update(dead=int(now), dead_reason=str(e))
+            o, note = None, f"its login was refused ({e}): {auth_hint(n, g)}"
         else:
             if r:
                 # the old refresh token is spent: keep the new pair first
-                if secrets.write(VAULT, dump(r), slot(acc)):
-                    note_login(acc, r, now)
+                if secrets.write(VAULT, dump(r), group_slot(acc, g)):
+                    note_group_login(acc, g, r, now)
                 o = r
             # no answer: install it as it is, Claude Code refreshes it later
     return o, note
@@ -1673,18 +1805,21 @@ def tick(store_path, secrets, live, http, now=None):
     kind 'log' or 'notify'."""
     now = now or time.time()
     store = load_store(store_path)
-    before = json.dumps(store, sort_keys=True)
+    before = json.dumps(store, sort_keys=True)  # what commit compares against
     accounts, active = store.get("accounts", []), store.get("active", 0)
     ev = run_sync(store, secrets, now)
-    lane0 = json.dumps(store.get("lane"), sort_keys=True)
+    lanes0 = lane_records(store)
     lane_adopt(store, secrets)
-    ev += lane_sync(store, secrets, http, now)[0]
-    # the lane's record only when this pass changed it: a move made meanwhile stays
-    top = ("active", "live") + (("lane",) if json.dumps(store.get("lane"), sort_keys=True)
-                                != lane0 else ())
+    for g in lane_groups(store):
+        ev += lane_sync(store, secrets, http, now, group=g)[0]
+    # the lanes' records only when this pass changed them, each on its own: a
+    # move made meanwhile stays
+    lanes1 = lane_records(store)
+    top = ("active", "live") + tuple(k for k in sorted(lanes0.keys() | lanes1.keys())
+                                     if lanes0.get(k) != lanes1.get(k))
     if not 1 <= active <= len(accounts):
         if json.dumps(store, sort_keys=True) != before:
-            commit(store_path, store, top)
+            commit(store_path, store, top, before=json.loads(before))
         return ev
     n_live, what, sure = sync(store, secrets, live, http, now)
     if what == "saved":
@@ -1714,31 +1849,62 @@ def tick(store_path, secrets, live, http, now=None):
         elif note:
             ev.append(("log", f"#{active}: {note}"))
     if json.dumps(store, sort_keys=True) != before:
-        commit(store_path, store, top)
+        commit(store_path, store, top, before=json.loads(before))
     return ev
 
-def due_reminders(accounts, now, warned):
-    """(key, message) for logins about to die or refused, once per login."""
+def lane_logins(store, n):
+    """The keys (login_meta's) of account n's logins that something takes:
+    its main one (None), which the shared login or its home group's lane
+    takes, then its own login of each other group it is in, which that
+    group's lane takes. Never one of a group it is not in, nor of its home
+    group (that lane takes its main one)."""
+    gs = (store["accounts"][n - 1].get("oauth_groups") or {})
+    return [None] + [g for g in gs if g in groups_for(store, n) and login_group(store, n, g) == g]
+
+def due_reminders(accounts, now, warned, store=None):
+    """(key, message) for logins about to die or refused, once per login: an
+    account's main login, and each of its logins of a group (oauth_groups),
+    told apart in the key by "#<g>" after the number (the login's death date
+    stays the key's second field). With the store, a login of a group only
+    while some lane would take it (lane_logins)."""
     out = []
     for i, a in enumerate(accounts, 1):
-        m = a.get("oauth") or {}
-        if a.get("disabled") or not m.get("fp"):
+        if a.get("disabled"):
             continue
-        st, left = login_state(a, now)
-        rt = int(m.get("rt_expires") or 0)
-        if st == "dead":
-            key, msg = f"{i}:{rt}:dead", f"#{i} lost its Claude in Chrome login"
-        elif st == "expiring":  # under the first threshold, so one matches
-            h = min(h for h in EXPIRY_WARN_H if left <= h * 3600)
-            days = left / 86400
-            key = f"{i}:{rt}:{h}"
-            msg = (f"#{i}'s Claude in Chrome login expires in "
-                   + (f"{days:.0f} days" if days >= 1.5 else f"{left / 3600:.0f} h"))
-        else:
-            continue
-        if key not in warned:
-            out.append((key, msg + f" — claude-swap auth {i}"))
+        keys = ([None] + list(a.get("oauth_groups") or {}) if store is None
+                else lane_logins(store, i))
+        for g in keys:
+            m = login_meta(a, g)
+            if not m.get("fp"):
+                continue
+            st, left = login_state(a, now, g)
+            rt = int(m.get("rt_expires") or 0)
+            tag, what = (f"{i}#{g}", f"{g} Claude in Chrome login") if g else \
+                (str(i), "Claude in Chrome login")
+            if st == "dead":
+                key, msg = f"{tag}:{rt}:dead", f"#{i} lost its {what}"
+            elif st == "expiring":  # under the first threshold, so one matches
+                h = min(h for h in EXPIRY_WARN_H if left <= h * 3600)
+                days = left / 86400
+                key = f"{tag}:{rt}:{h}"
+                msg = (f"#{i}'s {what} expires in "
+                       + (f"{days:.0f} days" if days >= 1.5 else f"{left / 3600:.0f} h"))
+            else:
+                continue
+            if key not in warned:
+                out.append((key, msg + " — " + auth_hint(i, g)))
     return out
+
+def worst_login(store, n, now):
+    """login_state of the worst of account n's logins that something takes
+    (lane_logins), for check's Chr column: a login of a group about to die
+    shows there as its main one would. Dead, then expiring (the soonest),
+    then no main login, then good; a group's login only once recorded."""
+    acc = store["accounts"][n - 1]
+    order = {"dead": 0, "expiring": 1, "none": 2, "ok": 3}
+    states = [login_state(acc, now, g) for g in lane_logins(store, n)
+              if g is None or login_meta(acc, g).get("fp")]
+    return min(states, key=lambda s: (order[s[0]], float("inf") if s[1] is None else s[1]))
 
 
 # ---------- Chrome profiles ----------
@@ -2033,15 +2199,17 @@ def run_sync(store, secrets, now, base=None):
             ev.append(("log", f"could not save #{i}'s login to the vault"))
     return ev
 
-# ---------- the reserved accounts' sessions: one lane ----------
-# Every session `claude-swap run` opens on a reserved account shares one
-# config dir, the lane (RUN_BASE/reserved): its keychain item holds the
-# login of the reserved account the lane is on (store["lane"]). Moving the
-# lane writes another reserved account's login there, and the open sessions
-# follow within 30 s, as the shared login's do: a Team seat at its limit
-# hands its sessions to another without restarting them. A reserved
-# account's full login is live in one place only, the lane or the vault,
-# since a refresh token is single-use.
+# ---------- the reserved accounts' sessions: one lane per group ----------
+# Every session `claude-swap run` opens on a group's seats shares one config
+# dir, the group's lane: its keychain item holds the login of the seat the
+# lane is on. Moving the lane writes another seat's login there, and the
+# open sessions follow within 30 s, as the shared login's do: a Team seat at
+# its limit hands its sessions to another without restarting them. A full
+# login is live in one place only, a lane or the vault, since a refresh
+# token is single-use. The default group (the first; the only one, implicit,
+# in a store without groups) keeps the lane of 1.15: RUN_BASE/reserved, its
+# record in store["lane"]. Any other group g has RUN_BASE/lane-<g> and
+# store["lanes"][g]. Below, group None is the default group.
 
 LANE = "reserved"
 
@@ -2051,140 +2219,290 @@ def lane_dir(base=None, group=None):
     name = LANE if not group or group == IMPLICIT else f"lane-{group}"
     return os.path.realpath(os.path.join(base or RUN_BASE, name))
 
+def lane_key(store, g):
+    """How group g's lane is told apart, in its dir and its record: None for
+    the default group's (the lane of 1.15), else g."""
+    return None if not g or g == IMPLICIT or g == default_group(store) else g
+
+def lane_rec(store, g=None):
+    """Group g's lane record ({"n", "mode", "at", "from"}), {} if none."""
+    k = lane_key(store, g)
+    return (store.get("lane") if k is None else (store.get("lanes") or {}).get(k)) or {}
+
+def set_lane_rec(store, g, rec):
+    k = lane_key(store, g)
+    if k is None:
+        store["lane"] = rec
+    else:
+        store["lanes"] = {**(store.get("lanes") or {}), k: rec}
+
+def lane_top(store, *groups):
+    """commit's top keys for the lane records of these groups (or keys):
+    "lane" for the default group's, "lanes.<g>" for any other's."""
+    keys = [lane_key(store, g) for g in groups]
+    return tuple(dict.fromkeys("lane" if k is None else f"lanes.{k}" for k in keys))
+
+def lane_records(store):
+    """Every lane record, by its commit key (lane_top), as JSON to compare."""
+    recs = {"lane": store.get("lane")}
+    recs.update((f"lanes.{g}", r) for g, r in (store.get("lanes") or {}).items())
+    return {k: json.dumps(r, sort_keys=True) for k, r in recs.items()}
+
+def lane_groups(store):
+    """The lanes with a record: the default group's (None) first, then every
+    other's, its group gone or not (its sessions may still be open)."""
+    return [None] + [g for g in (store.get("lanes") or {}) if lane_key(store, g)]
+
+def lane_label(store, g=None):
+    """How a lane's sessions are named in messages."""
+    k = lane_key(store, g)
+    return "the reserved sessions" if k is None else f"the {k} reserved sessions"
+
+def login_group(store, n, g=None):
+    """Which of seat n's logins group g's lane takes when put on it: None for
+    its main one, which is its home group's (and always the default group's
+    lane's, as up to 1.20), else g, for its login of g. A lane of another
+    group keeps in its record which one it was given ("login"), since an edit
+    of the groups can change the answer while the lane holds it."""
+    k = lane_key(store, g)
+    return None if k is None or home_group(store, n) == k else k
+
+def lane_login(store, g=None):
+    """Which login of its seat group g's lane holds (login_group's key)."""
+    rec = lane_rec(store, g)
+    if "login" in rec:
+        return rec["login"]
+    return login_group(store, rec["n"], g) if isinstance(rec.get("n"), int) else None
+
+def lane_record(store, g, n, mode, now, prev, login):
+    """A lane record; the login it holds is kept for any group's but the
+    default one's, whose lane always holds its seat's main login."""
+    rec = {"n": n, "mode": mode, "at": int(now), "from": prev}
+    if lane_key(store, g):
+        rec["login"] = login
+    return rec
+
+def group_edit_refusal(store, g, ns):
+    """Why setting group g's seats to ns (empty: removing g) must not happen,
+    or None. A lane keeps the login it holds while it is on a seat, so an
+    edit must not take that seat out of the lane's group, nor make the lane
+    take another of its logins than the full one it holds (its home group).
+    A lane already on another login than it would take (a seat disabled
+    meanwhile), or on a setup-token, is not held against any edit. Removing
+    a group retires its own lane (retire_lane), so that one is not asked
+    about."""
+    after = dict(store)
+    set_group(after, g, ns)
+    accounts = store.get("accounts", [])
+    for k in lane_groups(store):
+        n = lane_rec(store, k).get("n")
+        if not isinstance(n, int) or not 1 <= n <= len(accounts):
+            continue
+        name = k or default_group(store)  # the default lane's group may be renamed
+        if name == g and not ns:
+            continue
+        was = groups_of(store).get(name, [])
+        will = groups_of(after).get(k or default_group(after), [])
+        to = next((m for m in was if m in will and m != n), None)
+        how = f"claude-swap {to or '<n>'}" + (f" {name}" if store.get("groups") else "")
+        if n in was and n not in will:
+            return f"move the {name} lane off #{n} first: {how}"
+        held = lane_login(store, k)
+        if (lane_rec(store, k).get("mode") == "oauth"
+                and login_group(store, n, k) == held and login_group(after, n, k) != held):
+            old, new = home_group(store, n), home_group(after, n)
+            return (f"#{n}'s home group would be {new or 'none'} instead of {old or 'none'},"
+                    f" so the {name} lane, which is on it, would take another of its"
+                    f" logins: move the {name} lane off #{n} first: {how}")
+    return None
+
 def group_of_dir(store, config_dir, base=None):
     if not config_dir:
         return None
     d = os.path.realpath(config_dir)
     for g in groups_of(store):
-        if d == lane_dir(base, None if g == default_group(store) else g):
+        if d == lane_dir(base, lane_key(store, g)):
             return g
     return None
 
-def lane_of(store):
-    """The reserved account the lane is on, while it still is one: n or None."""
-    n = (store.get("lane") or {}).get("n")
-    accounts = store.get("accounts", [])
-    if not isinstance(n, int) or not 1 <= n <= len(accounts):
-        return None
-    a = accounts[n - 1]
-    return n if a.get("reserved") and a.get("token") and not a.get("disabled") else None
+def is_lane_dir(d, base=None):
+    """Whether config dir d (a realpath) is some group's lane."""
+    name = os.path.basename(d)
+    return d == lane_dir(base) or (
+        os.path.dirname(d) == os.path.realpath(base or RUN_BASE)
+        and name.startswith("lane-") and bool(GROUP_RE.match(name[5:])))
 
-def lane_owner(o, store, http=None):
-    """The reserved account a full login found in the lane belongs to: by its
-    fingerprints, or as one the lane's sessions refreshed (the same
-    authorization). Two accounts authorized within the hour look alike that
-    way: then the server says whose it is, or nobody does. -> n or None"""
+def lane_of(store, group=None):
+    """The seat the group's lane is on, while it is still a live seat of
+    that group: n or None."""
+    n = lane_rec(store, group).get("n")
+    if not isinstance(n, int):
+        return None
+    g = lane_key(store, group) or default_group(store)
+    return n if n in groups_of(store).get(g, []) else None
+
+def rotation(store, group=None):
+    """The seats the watch may move the group's lane among (claude-swap watch
+    reserved [g]), by number, in the store's current order: the default
+    group's list is lane_rotate (as up to 1.20), any other's lane_rotates[g];
+    only live reserved seats of that group."""
+    k = lane_key(store, group)
+    want = {e.lower() for e in (store.get("lane_rotate") if k is None else
+                                (store.get("lane_rotates") or {}).get(k)) or []
+            if isinstance(e, str)}
+    seats = groups_of(store).get(k or default_group(store), [])
+    return [i for i, a in enumerate(store.get("accounts", []), 1)
+            if i in seats and (a.get("email") or "").lower() in want]
+
+def lane_owner(o, store, http=None, group=None):
+    """Whose a full login found in group's lane is, and which of its logins:
+    -> (n, login key as login_group's, []) or (None, None, seats). By its
+    fingerprints, among every login (main or of a group) of each reserved
+    account; or as the one the lane's sessions refreshed (the same
+    authorization), only against the login the lane is expected to hold from
+    each seat (the one it was given, for the seat it is on), so that a login
+    is never filed under another of the same seat. Two accounts authorized
+    within the hour look alike that way: then the server says whose it is,
+    or nobody does, and seats are those it could be ([] when it is no
+    reserved account's, or the server named another)."""
     accounts = store.get("accounts", [])
-    n = owner(o, accounts)
-    if n:
-        return n if accounts[n - 1].get("reserved") else None
-    near = [i for i, a in enumerate(accounts, 1)
-            if a.get("reserved") and (a.get("oauth") or {}).get("fp")
-            and same_chain(o, a["oauth"])]
+    rt, at = fp(o.get("refreshToken")), fp(o.get("accessToken"))
+    for i, a in enumerate(accounts, 1):
+        for g, m in [(None, a.get("oauth") or {})] + list((a.get("oauth_groups") or {}).items()):
+            if (rt and m.get("fp") == rt) or (at and m.get("fp_at") == at):
+                return (i, g, []) if a.get("reserved") else (None, None, [])
+    on = lane_rec(store, group).get("n")
+    takes = {i: (lane_login(store, group) if i == on else login_group(store, i, group))
+             for i, a in enumerate(accounts, 1) if a.get("reserved")}
+    metas = {i: login_meta(accounts[i - 1], g) for i, g in takes.items()}
+    near = [i for i, m in metas.items() if m.get("fp") and same_chain(o, m)]
     if len(near) == 1:
-        return near[0]
+        return near[0], takes[near[0]], []
     p = profile(o["accessToken"], http) if near and http else None
     if p:
         account = account_of(p)
         n = by_identity(accounts, account["accountUuid"], account["emailAddress"])
-        return n if n in near else None
-    return None
+        return (n, takes[n], []) if n in near else (None, None, [])
+    return None, None, near
 
-def lane_put(store, n, secrets, http, now, base=None):
-    """Put the lane on reserved account n: its full login if it holds a
-    usable one (refreshed first when about to expire), else its setup-token.
-    -> (mode, note): mode 'oauth', 'setup', or 'failed' (nothing changed)."""
-    d = lane_dir(base)
+def lane_put(store, n, secrets, http, now, base=None, group=None):
+    """Put group's lane on reserved account n: its full login for that group
+    if it holds a usable one (refreshed first when about to expire), else its
+    setup-token. -> (mode, note): mode 'oauth', 'setup', or 'failed' (nothing
+    changed)."""
+    d = lane_dir(base, lane_key(store, group))
     os.makedirs(d, mode=0o700, exist_ok=True)
-    acc = store["accounts"][n - 1]
-    o, note = vault_login(store, n, secrets, http, now)
-    m = acc.get("oauth") or {}
+    acc, g = store["accounts"][n - 1], login_group(store, n, group)
+    o, note = vault_login(store, n, secrets, http, now, group)
+    m = login_meta(acc, g)
     if not o and not note and m.get("fp"):
         note = (f"its full login {'was refused' if m.get('dead') else 'expired'}:"
-                f" claude-swap auth {n}")
+                f" {auth_hint(n, g)}")
     if not secrets.write(run_service(d), dump(o or setup_login(acc))):
-        return "failed", "could not write the reserved sessions' credential" + keychain_hint()
-    set_account((acc.get("oauth") or {}).get("account") if o else None,
-                os.path.join(d, ".claude.json"))
-    rec = store.get("lane") or {}
-    store["lane"] = {"n": n, "mode": "oauth" if o else "setup", "at": int(now),
-                     "from": rec.get("n") if rec.get("n") != n else rec.get("from")}
-    return store["lane"]["mode"], note
+        return "failed", (f"could not write {lane_label(store, group)}' credential"
+                          + keychain_hint())
+    set_account(m.get("account") if o else None, os.path.join(d, ".claude.json"))
+    rec = lane_rec(store, group)
+    new = lane_record(store, group, n, "oauth" if o else "setup", now,
+                      rec.get("n") if rec.get("n") != n else rec.get("from"), g)
+    set_lane_rec(store, group, new)
+    return new["mode"], note
 
-def lane_sync(store, secrets, http, now, base=None):
-    """Keep the lane's login in line, as the watch does each minute: save to
-    the vault what its sessions refreshed, and put the lane's account back
+def lane_sync(store, secrets, http, now, base=None, group=None):
+    """Keep group's lane's login in line, as the watch does each minute: save
+    to the vault what its sessions refreshed, and put the lane's account back
     if a session wrote the one the lane just left over it.
-    -> (events, ok): ok False when a refreshed login could not be saved."""
-    rec, d = store.get("lane") or {}, lane_dir(base)
+    -> (events, ok): ok False when a refreshed login could not be saved;
+    None (falsy too) when the lane holds a live login that could be several
+    seats' and the server would not name it: left alone, and nothing may
+    write over it until it is filed."""
+    k = lane_key(store, group)
+    rec, d, them = lane_rec(store, group), lane_dir(base, k), lane_label(store, group)
     if not rec.get("n") or not os.path.isdir(d):
         return [], True
     o = parse(secrets.read(run_service(d)))
     if not is_full(o):
         return [], True
-    n = lane_owner(o, store, http)
+    n, g, could = lane_owner(o, store, http, group)
+    if n is None and could and alive(o, now):
+        # one of these seats' logins, its only live copy: whatever goes on
+        # the lane (a move, a new session's seat) or deletes it would lose it
+        who = ", ".join(f"#{i}'s" for i in could[:-1]) + f" or #{could[-1]}'s"
+        return [("log", f"{them} hold a login that could be {who} (authorized within the"
+                        " same hour), and the server did not say whose: it cannot be saved"
+                        " until it does")], None
     if n is None:
-        return [("log", "the reserved sessions hold a login of no reserved account:"
-                        " left alone")], True
+        return [("log", f"{them} hold a login of no reserved account"
+                        + (f" in {k}" if k else "") + ": left alone")], True
     acc, ev = store["accounts"][n - 1], []
-    m = acc.get("oauth") or {}
+    # saved to the slot of the login it is, never another of the same seat
+    m, its = login_meta(acc, g), f"#{n}'s {g + ' ' if g else ''}login"
     if alive(o, now) and (m.get("fp") != fp(o["refreshToken"])
                           or m.get("fp_at") != fp(o["accessToken"])):
-        if not secrets.write(VAULT, dump(o), slot(acc)):
-            return [("log", f"could not save #{n}'s login to the vault")], False
-        note_login(acc, o, now)
-        ev.append(("log", f"saved #{n}'s login, refreshed by the reserved sessions"))
+        if not secrets.write(VAULT, dump(o), group_slot(acc, g)):
+            return [("log", f"could not save {its} to the vault")], False
+        note_group_login(acc, g, o, now)
+        ev.append(("log", f"saved {its}, refreshed by {them}"))
     if n != rec["n"]:
         if n == rec.get("from") and now - (rec.get("at") or 0) < RACE_WINDOW:
             # a session refreshed the account just left and wrote it back
-            mode, note = lane_put(store, rec["n"], secrets, http, now, base)
-            ev.append(("log", f"#{n}'s login was written back over the reserved sessions'"
+            mode, note = lane_put(store, rec["n"], secrets, http, now, base, group)
+            ev.append(("log", f"#{n}'s login was written back over {them}'"
                               f" #{rec['n']} right after the move: #{rec['n']} put back"
                               + (f" ({note})" if note else "")))
         else:
-            store["lane"] = {"n": n, "mode": "oauth", "at": int(now), "from": rec["n"]}
-            ev.append(("notify", f"#{n} logged in by hand in a reserved session:"
-                                 " the reserved sessions are on it now"))
+            set_lane_rec(store, group, lane_record(store, group, n, "oauth", now,
+                                                   rec["n"], g))
+            ev.append(("notify", f"#{n} logged in by hand in a {k + ' ' if k else ''}"
+                                 f"reserved session: {them} are on it now"))
     return ev, True
 
-def lane_move(store, n, secrets, http, now, base=None):
-    """Move the lane to reserved account n, saving first what its sessions
+def lane_move(store, n, secrets, http, now, base=None, group=None):
+    """Move group's lane to reserved account n, saving first what its sessions
     refreshed. -> (mode, note, events); mode 'failed': nothing changed."""
-    ev, ok = lane_sync(store, secrets, http, now, base)
+    ev, ok = lane_sync(store, secrets, http, now, base, group)
     if not ok:
         return "failed", "moving now would lose the login in use", ev
-    mode, note = lane_put(store, n, secrets, http, now, base)
+    mode, note = lane_put(store, n, secrets, http, now, base, group)
     return mode, note, ev
 
-def lane_prepare(store, n, secrets, http, now, base=None, home=None, home_json=None):
-    """The lane ready for a new session on reserved account n, moved to it
+def lane_prepare(store, n, secrets, http, now, base=None, home=None, home_json=None,
+                 group=None):
+    """Group's lane ready for a new session on reserved account n, moved to it
     first if it is on another one (its open sessions move too).
     -> (dir or None, mode, note, moved_from)"""
-    d = lane_dir(base)
-    ev, ok = lane_sync(store, secrets, http, now, base)
-    if not ok:
+    d = lane_dir(base, lane_key(store, group))
+    ev, ok = lane_sync(store, secrets, http, now, base, group)
+    if ok is False:
         return None, "failed", ev[-1][1], None
-    acc = store["accounts"][n - 1]
-    m, on = acc.get("oauth") or {}, lane_of(store)
+    acc, g = store["accounts"][n - 1], login_group(store, n, group)
+    m, on = login_meta(acc, g), lane_of(store, group)
     o = parse(secrets.read(run_service(d))) if os.path.isdir(d) else None
     keep = False
     if on == n and o:
         if is_full(o):
             # what its sessions refreshed is the live copy, unless a fresh
             # `claude-swap auth` or a refusal says otherwise
+            # (and only if it is the login the lane takes from n now)
             refused = m.get("dead") and fp(o.get("refreshToken")) == m.get("fp")
-            keep = bool(alive(o, now) and m.get("fp") and same_chain(o, m) and not refused)
+            keep = bool(alive(o, now) and m.get("fp") and same_chain(o, m) and not refused
+                        and lane_login(store, group) == g)
         else:
-            keep = o.get("accessToken") == acc.get("token") and not usable(acc, now)
+            keep = o.get("accessToken") == acc.get("token") and not usable(acc, now, g)
     if keep:
         mode, note = ("oauth" if is_full(o) else "setup"), None
+    elif ok is None:
+        # a login the server would not name: joining its seat writes nothing
+        # there (and a session's refresh lets the watch have it named), but
+        # putting another login there would lose it
+        return None, "failed", ev[-1][1], None
     else:
-        mode, note = lane_put(store, n, secrets, http, now, base)
+        mode, note = lane_put(store, n, secrets, http, now, base, group)
         if mode == "failed":
             return None, mode, note, None
     link_config(d, home or cc_dir())
     run_config(d, home_json or cc_json(),
-               (acc.get("oauth") or {}).get("account") if mode == "oauth" else None)
+               login_meta(acc, g).get("account") if mode == "oauth" else None)
     return d, mode, note, (on if on and on != n else None)
 
 def lane_adopt(store, secrets, base=None):
@@ -2203,7 +2521,7 @@ def lane_adopt(store, secrets, base=None):
     os.symlink(os.path.basename(d), path)
     o = parse(secrets.read(run_service(d)))
     if is_full(o):
-        n = lane_owner(o, store)
+        n = lane_owner(o, store)[0]
     else:  # a setup-token: whose
         n = next((k for k, a in enumerate(store.get("accounts", []), 1)
                   if o and a.get("reserved") and a.get("token") == o.get("accessToken")), None)
@@ -2212,15 +2530,16 @@ def lane_adopt(store, secrets, base=None):
     return n or i
 
 def reserved_sessions(base=None):
-    """The open sessions of `claude-swap run`: [(pid, name, follows)], follows
-    meaning they run on the lane and move with it; the others carry a
-    setup-token in their environment, which pins them until restarted."""
+    """The open sessions of `claude-swap run`: [(pid, name, lane)], lane the
+    dir (realpath) of the lane they run on and move with; None for the
+    others, which carry a setup-token in their environment that pins them
+    until restarted."""
     try:
         out = subprocess.run(["ps", "eww", "-axo", "pid=,command="], capture_output=True,
                              text=True, timeout=10).stdout
     except Exception:
         return []
-    lane, found = lane_dir(base), []
+    found = []
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
         words = cmd.split()
@@ -2235,38 +2554,346 @@ def reserved_sessions(base=None):
                 name = json.load(f).get("name")
         except Exception:
             name = None
-        found.append((int(pid), name, bool(cfg) and os.path.realpath(cfg) == lane))
+        real = os.path.realpath(cfg) if cfg else None
+        found.append((int(pid), name, real if real and is_lane_dir(real, base) else None))
     return found
 
-def lane_summary(store, sessions=None):
-    """Where the reserved sessions are, for status: (n, line), or None while
-    the lane is on no reserved account."""
-    n = lane_of(store)
+def retire_lane(store, g, secrets, http, now, base=None, sessions=None):
+    """Retire the lane of group g, which is being removed: save first what
+    its sessions refreshed, then delete its credential and drop its records
+    (lanes, lane_rotates), so that no lane holds or syncs that login any
+    more. Refused while sessions run on it: they would keep serving their
+    copy. The default group's lane is never retired. -> (ok, msg)"""
+    k = lane_key(store, g)
+    if k is None:
+        return True, None
+    d = lane_dir(base, k)
+    found = reserved_sessions(base) if sessions is None else sessions
+    on = [s for s in found if s[2] == d]
+    if on:
+        return False, (f"{len(on)} session{'s' if len(on) != 1 else ''} still run on the"
+                       f" {k} lane ({', '.join(s[1] or f'pid {s[0]}' for s in on)}):"
+                       " close them first")
+    ev, ok = lane_sync(store, secrets, http, now, base, k)
+    if not ok:
+        return False, f"{ev[-1][1]}: the {k} lane stays"
+    svc = run_service(d)
+    if secrets.read(svc):
+        secrets.delete(svc)
+        if secrets.read(svc):
+            return False, f"could not delete the {k} lane's credential" + keychain_hint()
+    was = lane_rec(store, k).get("n")
+    for key in ("lanes", "lane_rotates"):
+        rest = {x: v for x, v in (store.get(key) or {}).items() if x != k}
+        if rest:
+            store[key] = rest
+        else:
+            store.pop(key, None)
+    return True, " · ".join([m for _, m in ev] + [f"the {k} lane is retired"
+                                                  + (f" (it was on #{was})" if was else "")])
+
+def lane_summary(store, group=None, sessions=None):
+    """Where group's reserved sessions are, for status: (n, line), or None
+    while its lane is on none of its seats. The sessions pinned by a token of
+    their own are told with the default group's."""
+    n = lane_of(store, group)
     if not n:
         return None
+    k = lane_key(store, group)
     accounts = store.get("accounts", [])
     a = accounts[n - 1]
-    if (store.get("lane") or {}).get("mode") == "oauth":
+    if lane_rec(store, group).get("mode") == "oauth":
         how = "full login, " + ("Claude in Chrome ready" if chrome_ready(a)
                                 else "no Chrome profile has its extension signed in")
     else:
         how = "setup-token, no Claude in Chrome"
     found = reserved_sessions() if sessions is None else sessions
-    follow = sum(1 for s in found if s[2])
-    pinned = len(found) - follow
+    d = lane_dir(None, k)
+    follow = sum(1 for s in found if s[2] == d)
+    pinned = sum(1 for s in found if not s[2]) if k is None else 0
     parts = [how, f"{follow} open session{'' if follow == 1 else 's'} on it"
              + (f" ({pinned} more on a token of their own, which do not move)" if pinned else "")]
-    want = [e.lower() for e in store.get("lane_rotate") or []]
-    rot = [i for i, x in enumerate(accounts, 1)
-           if (x.get("email") or "").lower() in want and x.get("reserved")]
+    rot = rotation(store, group)
     pool = ", ".join(f"#{i}" for i in rot)
     if len(rot) < 2:
-        parts.append("the watch does not move them (claude-swap watch reserved <n...>)")
+        parts.append("the watch does not move them (claude-swap watch reserved"
+                     f" {k + ' ' if k else ''}<n...>)")
     elif n in rot:
         parts.append(f"the watch moves them among {pool}")
     else:
-        parts.append(f"outside the watch's list ({pool}): they stay here until claude-swap <n>")
+        parts.append(f"outside the watch's list ({pool}): they stay here until claude-swap <n>"
+                     + (f" {k}" if k else ""))
     return n, f"{n} ({who(a)}) — " + " · ".join(parts)
+
+# ---------- what status, check and auth show of the groups ----------
+
+def lane_seats(store):
+    """The seats some group's lane is on (check's and status's ▸)."""
+    return {n for n in (lane_of(store, g) for g in groups_of(store)) if n}
+
+def lane_lines(store, sessions=None):
+    """status's lines on each group's reserved sessions, whose lane is on one
+    of its seats: [(n, line)], in the order of the groups. The group is named
+    once there is more than one, so a store with one group reads as up to
+    1.20 ("Reserved sessions: …")."""
+    found = reserved_sessions() if sessions is None else sessions
+    groups = groups_of(store)
+    out = []
+    for g in groups:
+        s = lane_summary(store, g, found)
+        if s:
+            out.append((s[0], f"Reserved sessions{f' ({g})' if len(groups) > 1 else ''}: {s[1]}"))
+    return out
+
+def session_line(store, config_dir, base=None):
+    """status's "This session:" for a session run on a lane (its config dir),
+    naming the lane's group when it is not the default one; None for a
+    session that is on no lane."""
+    d = os.path.realpath(config_dir) if config_dir else None
+    if not d or not is_lane_dir(d, base):
+        return None
+    k = None if d == lane_dir(base) else os.path.basename(d)[len("lane-"):]
+    what = "a reserved session (claude-swap run" + (f", group {k})" if k else ")")
+    move = "claude-swap <n>" + (f" {k}" if k else "")
+    n = lane_of(store, k)
+    if not n:
+        return f"This session: {what}, on no reserved account now: {move} puts them on one"
+    a = store["accounts"][n - 1]
+    if lane_rec(store, k).get("mode") == "oauth":
+        how = "full login, " + ("Claude in Chrome ready" if chrome_ready(a) else
+                                f"no Chrome profile has the extension signed in to {a.get('email')}")
+    else:
+        how = "setup-token, no Claude in Chrome"
+    return (f"This session: {n} ({who(a)}) — {what}, on its {how}; {move} moves"
+            f" {lane_label(store, k)}, the Active login below does not reach them")
+
+def quota_groups(store):
+    """check's «Free quota» rows: [(name, [n...])], the accounts the watch
+    rotates ("General"), then each group's seats; the one group of a store
+    without groups keeps the name it had, "Reserved"."""
+    rows = [("General", [i for i, a in enumerate(store.get("accounts", []), 1)
+                         if not a.get("reserved")])]
+    return rows + [("Reserved" if g == IMPLICIT else g, ns) for g, ns in groups_of(store).items()]
+
+def shared_seats(store):
+    """The seats in more than one group: their quota counts in each."""
+    count = {}
+    for ns in groups_of(store).values():
+        for n in ns:
+            count[n] = count.get(n, 0) + 1
+    return sorted(n for n, c in count.items() if c > 1)
+
+def order_tables(store):
+    """check's «Reserved order»: one table per group, [(group, seats,
+    strays)]. strays: the reserved accounts that are not disabled but no
+    group holds (no token, or in no group), which no lane takes; they are
+    told under the first table only, as «left out»."""
+    groups = groups_of(store)
+    held = {n for ns in groups.values() for n in ns}
+    strays = [i for i, a in enumerate(store.get("accounts", []), 1)
+              if a.get("reserved") and not a.get("disabled") and i not in held]
+    if not groups:
+        return [(default_group(store), [], strays)] if strays else []
+    return [(g, ns, strays if j == 0 else []) for j, (g, ns) in enumerate(groups.items())]
+
+def left_out_reason(store, n, error, plan, free):
+    """Why reserved account n is not in check's «Reserved order»: in no
+    group (of a store with groups), its error (but a 429, which keeps it in),
+    or its plan."""
+    email = (store["accounts"][n - 1].get("email") or "").strip().lower()
+    if store.get("groups") and not any(email in [e.lower() for e in emails]
+                                       for emails in store["groups"].values()):
+        return "in no group"
+    if error and error != "RATE LIMITED":
+        return error.lower()
+    if not plan:
+        return "plan not known: counted as free"
+    return "free plan" if free else "no usage read"
+
+# ---------- what the commands decide ----------
+
+def run_seat(store, n=None, g=None, lanes=True):
+    """Where a new session of `claude-swap run [n] [--group g]` goes.
+    -> (group, seat, asked, error). The group is g, else n's home group,
+    else the default one; None for an account that is not reserved, whose
+    session runs on its own setup-token. A number never moves a lane (an old
+    alias in an open shell did, onto a seat at its limit): while the group's
+    lane is on another of its seats the session joins it there, and asked is
+    the number it asked for. Without a number: the seat the lane is on, else
+    the group's only seat. lanes False (no keychain): there are none."""
+    accounts, groups = store.get("accounts", []), groups_of(store)
+    if g is not None and g not in groups:
+        return None, None, None, f"Error: there is no group {g}"
+    if n is not None:
+        if not 1 <= n <= len(accounts):
+            return None, None, None, f"Error: account {n} does not exist (valid: 1-{len(accounts)})"
+        acc = accounts[n - 1]
+        if acc.get("disabled") or not acc.get("token"):
+            return None, None, None, f"Error: account {n} is disabled or has no token"
+        if not acc.get("reserved"):
+            if g:
+                return None, None, None, (f"Error: account {n} is not reserved: only a reserved"
+                                          " seat runs on a group's lane")
+            return None, n, None, None
+        gs = groups_for(store, n)
+        if g and g not in gs:
+            return None, None, None, f"Error: #{n} is not in {g} (it is in {', '.join(gs)})"
+        if not gs:
+            return None, None, None, "Error: " + resolve_group(store, n)[1]
+        g = g or gs[0]
+        on = lane_of(store, g) if lanes else None
+        return g, on or n, (n if on and on != n else None), None
+    named, g = g is not None, g or default_group(store)
+    on = lane_of(store, g) if lanes else None
+    if on:
+        return g, on, None, None
+    pool = groups.get(g, [])
+    if not pool:
+        return None, None, None, (f"No live seat in {g}:  claude-swap group {g} <n...>"
+                                  if store.get("groups") else
+                                  "No reserved account: mark one with  claude-swap reserve <n>")
+    if len(pool) > 1:
+        seats = ", ".join(f"#{i} {accounts[i - 1].get('email') or accounts[i - 1].get('label') or '?'}"
+                          for i in pool)
+        return None, None, None, (
+            f"Several seats in {g} ({seats}): say which one,  claude-swap run --group {g} <n>"
+            " -- <claude args>" if named else
+            f"Several reserved accounts ({seats}): say which one,  claude-swap run <n>"
+            " -- <claude args>")
+    return g, pool[0], None, None
+
+def watch_reserved(store, args):
+    """`claude-swap watch reserved [<g>] [<n>... | off]` applied to the store.
+    -> (lane key, error). Without a group name (the first argument a number
+    or off) it is the default group's list, lane_rotate, as up to 1.20; with
+    one, that group's (lane_rotates[g]; the default group's is lane_rotate
+    still), of its own seats only. No seats: the list is only shown."""
+    accounts, g = store.get("accounts", []), None
+    if args and not args[0].isdigit() and args[0] != "off":
+        g, args = args[0], args[1:]
+        if g not in groups_of(store):
+            return None, f"Error: there is no group {g}"
+    k = lane_key(store, g)
+    if not args:
+        return k, None
+    picked = []
+    if args != ["off"]:
+        seats = groups_of(store)[g] if g else None
+        for x in args:
+            n = int(x) if x.isdigit() else 0
+            if not 1 <= n <= len(accounts):
+                return k, f"Error: account {x} does not exist (valid: 1-{len(accounts)})"
+            a = accounts[n - 1]
+            if not a.get("reserved"):
+                return k, (f"Error: account {n} is not reserved: the watch moves it as the"
+                           " shared login already")
+            if g and n not in seats:
+                return k, (f"Error: #{n} is not in {g} (its seats: "
+                           + ", ".join(f"#{i}" for i in seats) + ")")
+            if not a.get("email"):
+                return k, f"Error: account {n} has no email in the store"
+            if n not in picked:
+                picked.append(n)
+        if len(picked) < 2:
+            return k, (f"Say at least two seats of {g}, or off" if g else
+                       "Say at least two reserved accounts, or off")
+    emails = [accounts[n - 1]["email"] for n in picked]
+    if k is None:
+        if emails:
+            store["lane_rotate"] = emails
+        else:
+            store.pop("lane_rotate", None)
+    else:
+        rots = {x: v for x, v in (store.get("lane_rotates") or {}).items() if x != k}
+        if emails:
+            rots[k] = emails
+        if rots:
+            store["lane_rotates"] = rots
+        else:
+            store.pop("lane_rotates", None)
+    return k, None
+
+def remove_account(store, n):
+    """Take account n out of the store, and what names it there: its email
+    in the groups and in the watch's lists, its number in the live and lane
+    records (those after it move down). A group left empty goes, but for the
+    default one while others exist: its lane is the one of 1.15, which the
+    next group would take over. -> (the account, its vault entries to delete)"""
+    gone = store["accounts"].pop(n - 1)
+    for rec in [store.get("live"), store.get("lane")] + list((store.get("lanes") or {}).values()):
+        for f in ("n", "from"):
+            if not isinstance((rec or {}).get(f), int):
+                continue
+            if rec[f] == n:
+                rec[f] = None
+            elif rec[f] > n:
+                rec[f] -= 1
+    active = store.get("active", 0)
+    if active == n:
+        store["active"] = 1 if store["accounts"] else 0
+    elif active > n:
+        store["active"] = active - 1
+    e = (gone.get("email") or "").strip().lower()
+    groups = dict(store.get("groups") or {})
+    dflt = next(iter(groups), None)
+    for g in list(groups):
+        left = [x for x in groups[g] if x.lower() != e]
+        if left or (g == dflt and len(groups) > 1):
+            groups[g] = left
+        else:
+            groups.pop(g)
+    if any(groups.values()):
+        store["groups"] = groups
+    else:
+        store.pop("groups", None)
+    left = [x for x in store.get("lane_rotate") or [] if x.lower() != e]
+    if left:
+        store["lane_rotate"] = left
+    else:
+        store.pop("lane_rotate", None)
+    rots = {}
+    for g, emails in (store.get("lane_rotates") or {}).items():
+        left = [x for x in emails if x.lower() != e]
+        if left:
+            rots[g] = left
+    if rots:
+        store["lane_rotates"] = rots
+    else:
+        store.pop("lane_rotates", None)
+    slots = []
+    if e:
+        if gone.get("oauth"):
+            slots.append(slot(gone))
+        slots += [group_slot(gone, g) for g in gone.get("oauth_groups") or {}]
+        slots.append(console_slot(gone["email"]))
+    return gone, slots
+
+def file_login(store, k, o, account, secrets, live, http, now, group=None, base=None):
+    """File login o, which `claude-swap auth` brought back for account k:
+    k's login of group (None, k's home group or a group k is not in: its
+    main one) saved to its vault slot, then put where that login is in use:
+    Claude Code's credential if k is the shared login, else every lane on k
+    that holds that login (a lane on k holding another of its logins keeps
+    it until its next move). -> (login key, installed, [(lane key, mode)]),
+    or None when the vault refused it (nothing changed)."""
+    acc = store["accounts"][k - 1]
+    key = login_group(store, k, group) if group in groups_for(store, k) else None
+    if not secrets.write(VAULT, dump(o), group_slot(acc, key)):
+        return None
+    note_group_login(acc, key, o, now, account)
+    installed, lanes = False, []
+    if key is None and store.get("active") == k:
+        mode, _ = install(store, k, secrets, live, http, now)
+        if mode == "oauth":
+            mark_live(store, k, mode, now, (store.get("live") or {}).get("from"))
+            installed = True
+    else:
+        for lk in lane_groups(store):
+            if lane_of(store, lk) == k and lane_login(store, lk) == key:
+                mode = lane_put(store, k, secrets, http, now, base, group=lk)[0]
+                if mode != "failed":
+                    lanes.append((lk, mode))
+    return key, installed, lanes
 PYEOF
 export CLAUDE_SWAP_OAUTH="$OAUTH_PY"
 
@@ -2316,10 +2943,12 @@ cmd_help() {
   echo "                           Spend one of account N's free resets, of that kind (default:"
   echo "                           the one that helps now); asks first, cannot be undone"
   echo "  claude-swap group [g [n ... | off]]"
-  echo "                           Groups of reserved seats (cobas, kokoima...): list them, set"
+  echo "                           Groups of reserved seats (e.g. one per client): list them, set"
   echo "                           one's seats, or remove it; the first is the default group"
   echo "  claude-swap lane [g]     Where each group's lane is: '<group> <n|-> <oauth|setup|->'"
-  echo "  claude-swap <n> [group]  A reserved seat in two groups says whose lane moves"
+  echo "  claude-swap <n> [group]  On a reserved seat: move its group's lane (its reserved sessions)"
+  echo "                           there; a seat in two groups names one, unless run from a"
+  echo "                           session on one of their lanes"
   echo "  claude-swap model [name] Show or set the model the sessions use (fable, opus...):"
   echo "                           its own weekly limit counts like the 5h and the week"
   echo "                           ('model fable' is what 'auto fable' and 'watch start fable' did)"
@@ -2330,17 +2959,22 @@ cmd_help() {
   echo "  claude-swap key <n>      Set claude.ai sessionKey (free 5h/7d/model limits for that account)"
   echo "  claude-swap keys-sync    Auto-import sessionKeys from Chrome profiles (by email)"
   echo "  claude-swap auth [n|all] Full login per account, which Claude in Chrome needs"
+  echo "  claude-swap auth <n> --group <g>"
+  echo "                           Seat N's own login for group g's lane, when g is not its"
+  echo "                           first group (that one's lane takes its main login)"
   echo "  claude-swap chrome [n|all]  Open the Chrome profile of account N (default: active)"
   echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
   echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's)"
   echo "  claude-swap unreserve <n>  Make it an ordinary account again"
-  echo "  claude-swap watch reserved [n ...|off]"
-  echo "                           Reserved accounts the watch may move the reserved sessions"
-  echo "                           among when theirs reaches its limit (off: never)"
-  echo "  claude-swap run [n] [-- <claude args>]"
-  echo "                           Start claude on the reserved account the reserved sessions are"
-  echo "                           on (N: only while they are on none); claude-swap <n> moves them"
+  echo "  claude-swap watch reserved [g] [n ...|off]"
+  echo "                           Seats the watch may move a group's reserved sessions among"
+  echo "                           when theirs reaches its limit (off: never; no g: the default"
+  echo "                           group's)"
+  echo "  claude-swap run [n] [--group g] [-- <claude args>]"
+  echo "                           Start claude on the seat group g's lane is on (default: the"
+  echo "                           default group; with N, N's first group); N picks the seat only"
+  echo "                           while that lane is on none; claude-swap <n> [g] moves them"
   echo "  claude-swap init         First-time setup"
   echo "  claude-swap version      Show version"
   echo "  claude-swap help         Show this help"
@@ -2380,6 +3014,13 @@ cmd_help() {
   echo "  it, the open ones within 30 s: one Team seat at its limit hands them"
   echo "  to another. On a full login (auth <n>) they have Claude in Chrome."
   echo "  check still shows the reserved accounts, and which one they are on."
+  echo ""
+  echo "  Groups of reserved seats (claude-swap group) keep each client's work on"
+  echo "  its own seats: every group has a lane of its own, and a seat in two"
+  echo "  groups takes, in its second one, a login of its own (auth <n> --group"
+  echo "  <g>), else its setup-token. One alias per group starts its sessions:"
+  echo "    alias cltc='claude-swap run --group clienta -- --dangerously-skip-permissions --chrome'"
+  echo "    alias cltk='claude-swap run --group kokoima -- --dangerously-skip-permissions --chrome'"
   echo ""
   echo "  Claude in Chrome refuses setup-tokens: it needs each account's full"
   echo "  login. 'auth' takes it once per account, in that account's Chrome"
@@ -2550,23 +3191,10 @@ if not accounts:
 
 if is_macos:
     found = session_token()
-    on_lane = bool(found and found[2]) and os.path.realpath(found[2]) == oauth.lane_dir()
+    on_lane = oauth.session_line(store, found[2]) if found else None
     k_own = found and not on_lane and oauth.run_account(found[2], accounts)
     if on_lane:
-        k = oauth.lane_of(store)
-        if k:
-            a = accounts[k - 1]
-            how = (("full login, " + ("Claude in Chrome ready" if oauth.chrome_ready(a) else
-                    f"no Chrome profile has the extension signed in to {a.get('email')}"))
-                   if (store.get("lane") or {}).get("mode") == "oauth"
-                   else "setup-token, no Claude in Chrome")
-            print(f"This session: {k} ({oauth.who(a)})"
-                  f" — a reserved session (claude-swap run), on its {how};"
-                  " claude-swap <n> moves the reserved sessions, the Active login below"
-                  " does not reach them")
-        else:
-            print("This session: a reserved session (claude-swap run), on no reserved account"
-                  " now: claude-swap <n> puts them on one")
+        print(on_lane)
     elif k_own:
         a = accounts[k_own - 1]
         kind = "reserved, " if a.get("reserved") else ""
@@ -2594,11 +3222,12 @@ if 1 <= active <= len(accounts):
 else:
     print(f"Active: none")
 
-# the reserved sessions (claude-swap run) are on an account of their own
-lane_sum = oauth.lane_summary(store) if is_macos else None
-lane_n = lane_sum[0] if lane_sum else None
-if lane_sum:
-    print(f"Reserved sessions: {lane_sum[1]}")
+# the reserved sessions (claude-swap run) are on an account of their own,
+# one per group (its lane)
+lane_lines = oauth.lane_lines(store) if is_macos else []
+lane_ns = {n for n, _ in lane_lines}
+for _, line in lane_lines:
+    print(line)
 
 # Watcher
 wpid_path = os.path.expanduser("~/.claude/claude-swap-watch.pid")
@@ -2679,7 +3308,7 @@ nw = len(str(len(accounts)))
 print(f"  {'#':>{nw + 1}}  {'Account':<30} {'Plan':<20} Token")
 for i, acc in enumerate(accounts):
     n = i + 1
-    marker = "*" if n == active else "▸" if n == lane_n else " "
+    marker = "*" if n == active else "▸" if n in lane_ns else " "
     name = ((acc.get("email") or "").strip() or acc.get("label") or "-")[:30]
     exp_ms = acc.get("expires", 0)
     if exp_ms > now_ms:
@@ -2687,7 +3316,7 @@ for i, acc in enumerate(accounts):
     else:
         exp_dt = "EXPIRED"
     print(f"  {marker}{n:>{nw}}  {name:<30} {plan_next(acc):<20} {exp_dt}")
-if lane_n:
+if lane_ns:
     print(f"  * Active (the shared login, cl) · ▸ reserved sessions (clt)")
 PYEOF
 }
@@ -2718,7 +3347,7 @@ store_read = json.loads(json.dumps(store))  # what save_changes compares against
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
 PREF = engine.model_setting(store)  # the preferred model: the limit the watch counts
-lane_n = oauth.lane_of(store)
+lane_ns = oauth.lane_seats(store)  # the seat of each group's lane (▸)
 local_tz = datetime.now().astimezone().tzinfo
 store_dirty = [False]
 
@@ -3157,10 +3786,11 @@ cal_days = [today + timedelta(days=k) for k in range(NCAL)]
 cal_bounds = [tuple(datetime.combine(d + timedelta(days=k), datetime.min.time())
                     .timestamp() for k in (0, 1)) for d in cal_days]
 
-def chrome_cell(acc):
+def chrome_cell(n):
     """The account's full login, which Claude in Chrome needs: ✓ good,
-    days (or hours) left when it is about to die, ✕ redo it, - none."""
-    st, left = oauth.login_state(acc, time.time())
+    days (or hours) left when it is about to die, ✕ redo it, - none. A seat
+    with a login of its own for another group shows the worst of them."""
+    st, left = oauth.worst_login(store, n, time.time())
     if st == "none":
         return paint(GREY, pad("-", W_CH, right=True))
     if st == "dead":
@@ -3228,9 +3858,10 @@ def when(ts):
     return local_dt(ts).strftime("%a %d %H:%M")
 
 # ---------- free quota: what each group has left, summed ----------
-# One row for the accounts the watch rotates and one for the reserved seats:
-# the % free of the 5h, the week and the model column, added up (100 = one
-# whole account), and the next weekly renewal. See engine.free_quota.
+# One row for the accounts the watch rotates and one per group of reserved
+# seats (a seat in two groups counts in both): the % free of the 5h, the
+# week and the model column, added up (100 = one whole account), and the
+# next weekly renewal. See engine.free_quota and oauth.quota_groups.
 W_KPI, KPI_BAR = 10, 10
 
 def kpi_cell(free, n):
@@ -3254,8 +3885,7 @@ def kpi_cell(free, n):
     return b + " " + paint(col, pad(txt, W_KPI, right=True))
 
 KPI_MODEL = COL if COL_PREF else None  # the model that can stop an account
-groups = [("General", [e for e in eng_rows if not e["reserved"]]),
-          ("Reserved", [e for e in eng_rows if e["reserved"]])]
+groups = [(name, [e for e in eng_rows if e["n"] in ns]) for name, ns in oauth.quota_groups(store)]
 kpis = [(name, engine.free_quota(rows, now_ts, KPI_MODEL),
          engine.free_quota(rows, now_ts, COL) if COL and not COL_PREF else None)
         for name, rows in groups]
@@ -3282,14 +3912,17 @@ if kpis:
         notes.append(f"{COL_NAME}: " + " and ".join(
             f"{(o or q)['model_n']} of {q['accounts']}" for _, q, o in kpis) + " accounts report it")
     notes.append("(n) = whole accounts")
+    if oauth.shared_seats(store):
+        notes.append("a seat in two groups counts in both")
     print("  " + " " * W_G + "  " + paint(GREY, " · ".join(notes)))
     print()
 
 print(paint(BOLD, header) + "│" + paint(BOLD, cal_header))
 print("─" * split + "┼" + "─" * (NCAL * CW))
 
-def render_row(row):
-    marker = "*" if row["n"] == active else "▸" if row["n"] == lane_n else " "
+def render_row(row, lanes=lane_ns):
+    """A row of the table; ▸ on the seats in lanes."""
+    marker = "*" if row["n"] == active else "▸" if row["n"] in lanes else " "
     num = pad(f"{marker}{row['n']}", W_N, right=True)
     name = trunc(row["label"], W_LB)
 
@@ -3317,7 +3950,7 @@ def render_row(row):
         renews_cell(acc, row["plan"]),
         pct_cell(row["u5"]), reset5_cell(row["r5"]),
         pct_cell(row["u7"]), pct_cell(row["col"], unknown=row["grants"] is None),
-        resets_cell(row["resets"]), chrome_cell(acc)) + "│" + cal
+        resets_cell(row["resets"]), chrome_cell(row["n"])) + "│" + cal
 
     if row["error"] and row["error"] != "RATE LIMITED":
         line += "  " + paint(RED, row["error"])
@@ -3329,7 +3962,7 @@ for row in results:
     print(render_row(row))
 
 print()
-print("  " + ("* Active · ▸ reserved sessions   │   " if lane_n else "")
+print("  " + ("* Active · ▸ reserved sessions   │   " if lane_ns else "")
       + "calendar: " + paint(YELLOW, "7d") + " reset time · "
       + paint(MAG, COL_NAME) + " when it falls on a different day · "
       + paint(CYAN, "↓") + " downgrade · " + paint(RED, "✕") + " plan ends"
@@ -3497,48 +4130,44 @@ else:
 print("  " + paint(BOLD, "Now: " + head) + paint(GREY, f" — {d['reason']}"))
 
 # reserved accounts sit out of that order: only `claude-swap run` opens them.
-# The reserved sessions (one lane) get an order of their own, by the same
-# rule: the one the watch follows when it moves them, and otherwise the
-# best seat to move them to by hand
-kept = [r for r in results if r["reserved"] and not r["disabled"]]
-if kept:
-    ln = (store.get("lane") or {}).get("n")
-    want = [e.lower() for e in store.get("lane_rotate") or []]
-    rot = [i for i, a in enumerate(store.get("accounts", []), 1)
-           if (a.get("email") or "").lower() in want and a.get("reserved")]
+# Each group's reserved sessions (its lane) get an order of their own, by
+# the same rule: the one the watch follows when it moves them, and otherwise
+# the best seat to move them to by hand. The reserved accounts no group
+# holds are told under the first one (oauth.order_tables).
+tables = oauth.order_tables(store)
+many = len(tables) > 1
+for g, ns, strays in tables:
+    if not ns and not strays:
+        continue
+    ln = oauth.lane_of(store, g)
+    rot = oauth.rotation(store, g)
     watched = len(rot) > 1 and ln in rot
-    seats = [dict(e, reserved=False) for e in eng_rows
-             if e["reserved"] and not e["disabled"]]
+    seats = [dict(e, reserved=False) for e in eng_rows if e["n"] in ns]
     r_order = engine.rank(seats, now_ts, PREF)
     r_blocked = sorted((e for e in r_order if engine.blocked(e, PREF)),
                        key=lambda e: engine.unblock_at(e, PREF) or float("inf"))
+    them = (f"the {g} reserved sessions (claude-swap run --group {g})" if many else
+            "the reserved sessions (claude-swap run, never the shared login)")
     print()
-    print(paint(BOLD, "  Reserved order")
-          + paint(GREY, " — the reserved sessions (claude-swap run, never the shared login),"
-                        " same rule · "
+    print(paint(BOLD, "  Reserved order" + (f" ({g})" if many else ""))
+          + paint(GREY, f" — {them}, same rule · "
                         + (f"the watch moves them among {', '.join(f'#{i}' for i in rot)}"
                            if len(rot) > 1 else
-                           "the watch does not move them: claude-swap watch reserved <n...>")))
+                           "the watch does not move them: claude-swap watch reserved"
+                           + (f" {g}" if many else "") + " <n...>")))
     if not r_order:
         print(paint(GREY, "    no reserved account available"))
     for e in [e for e in r_order if not engine.blocked(e, PREF)] + r_blocked:
-        print(render_row(by_n[e["n"]]) + "  " + note(e)
+        print(render_row(by_n[e["n"]], {ln}) + "  " + note(e)
               + (paint(CYAN, " · watch") if len(rot) > 1 and e["n"] in rot else ""))
 
-    def left_out(r):
-        """Why a reserved account is not in the order."""
-        if r["error"] and r["error"] != "RATE LIMITED":
-            return r["error"].lower()
-        if not r.get("plan"):
-            return "plan not known: counted as free"
-        if is_free(r["plan"]):
-            return "free plan"
-        return "no usage read"
     ranked_ns = {e["n"] for e in r_order}
-    out = [r for r in kept if r["n"] not in ranked_ns]
+    out = [by_n[n] for n in sorted(ns + strays) if n not in ranked_ns]
     if out:
         print(paint(GREY, "    left out: " + ", ".join(
-            f"#{r['n']}{' ▸' if r['n'] == ln else ''} ({left_out(r)})" for r in out)))
+            f"#{r['n']}{' ▸' if r['n'] == ln else ''} ("
+            + oauth.left_out_reason(store, r["n"], r["error"], r.get("plan"), is_free(r.get("plan")))
+            + ")" for r in out)))
 
     ld = engine.lane_decide(seats, ln, rot, now_ts, {}, False, PREF) if watched else None
     if ld is None:
@@ -3548,7 +4177,7 @@ if kept:
         head, tail = f"stay on #{ln}", ld["reason"]
     elif ld["action"] == "switch":
         head = f"the watch moves them to #{t}" if watched else f"best seat #{t}"
-        tail = ld["reason"] + ("" if watched else f" · claude-swap {t} moves them")
+        tail = ld["reason"] + ("" if watched else f" · {oauth.move_hint(store, t, g)} moves them")
     else:
         head = "every seat at its limit" + (f" until {when(ld['wake'])}" if ld["wake"] else "")
         tail = ld["reason"]
@@ -3803,7 +4432,7 @@ _do_rotate() {
   # Claude Code's keychain item is overwritten, never deleted: running
   # sessions keep serving a deleted item from their cache.
   python3 - "$STORE" "$1" "$IS_MACOS" "${2:-}" <<'PYEOF'
-import os, sys, time, types
+import json, os, sys, time, types
 
 oauth = types.ModuleType("oauth")
 exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
@@ -3811,6 +4440,8 @@ exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 store_path, target, macos = sys.argv[1], sys.argv[2], sys.argv[3] == "true"
 group_arg = sys.argv[4] if len(sys.argv) > 4 else ""
 store = oauth.load_store(store_path)
+# what commit compares against: only the logins this swap changed go back
+store_read = json.loads(json.dumps(store))
 accounts = store.get("accounts", [])
 n = int(target) if target.isdigit() else 0
 if not 1 <= n <= len(accounts):
@@ -3826,51 +4457,57 @@ if group_arg and not acc.get("reserved"):
     sys.exit(1)
 if acc.get("reserved"):
     # the shared login reaches every session and the watch would move them
-    # off it: a reserved account moves the reserved sessions instead
+    # off it: a reserved account moves the reserved sessions of its group
+    # instead (of the group named, or the one of the lane the session this
+    # runs in is on, when the seat is in more than one)
+    grp = oauth.default_group(store)
     if group_arg or store.get("groups"):
         grp, err = oauth.resolve_group(store, n, group_arg or None,
-                                       os.environ.get("CLAUDE_CONFIG_DIR"))
+                                       os.environ.get("CLAUDE_SWAP_FROM_DIR"))
         if err:
             print(f"Error: {err}")
-            sys.exit(1)
-        if grp != oauth.default_group(store):
-            print(f"Error: lanes per group come in 1.21: only {oauth.default_group(store)}"
-                  " has a lane for now")
             sys.exit(1)
     if not macos:
         print(f"Account {n} is reserved: it never becomes the shared login.")
         print(f"Open a session on it with:  claude-swap run {n} -- <claude args>")
         print(f"(or make it an ordinary account first: claude-swap unreserve {n})")
         sys.exit(1)
+    k = oauth.lane_key(store, grp)
+    them, run = oauth.lane_label(store, k), "claude-swap run" + (f" --group {k}" if k else "")
     secrets, _, http = oauth.default_io(True)
     now = time.time()
-    oauth.lane_adopt(store, secrets)
-    prev = oauth.lane_of(store)
+    adopted = oauth.lane_adopt(store, secrets)
+    prev = oauth.lane_of(store, k)
     print()
-    print(f"Moving the reserved sessions (claude-swap run) to account {n}"
+    print(f"Moving {them} ({run}) to account {n}"
           f" ({acc.get('label', '?')}); the shared login stays on #{store.get('active')}")
     print()
-    mode, note, ev = oauth.lane_move(store, n, secrets, http, now)
+    mode, note, ev = oauth.lane_move(store, n, secrets, http, now, group=k)
     for _, msg in ev:
         print(f"  {msg[0].upper() + msg[1:]}")
     if mode == "failed":
-        oauth.commit(store_path, store, top=())
+        oauth.commit(store_path, store, top=(), before=store_read)
         print(f"  {note}")
-        print("\nStopped: the reserved sessions are still on " + (f"#{prev}." if prev else "no account."))
+        print(f"\nStopped: {them} are still on " + (f"#{prev}." if prev else "no account."))
         sys.exit(1)
-    oauth.commit(store_path, store, top=("lane",))
+    # this group's lane record alone: another lane may have moved meanwhile
+    oauth.commit(store_path, store, top=oauth.lane_top(store, k, *([None] if adopted else [])),
+                 before=store_read)
     print("  " + (("Full login installed" + (": Claude in Chrome ready" if oauth.chrome_ready(acc)
                                              else "")) if mode == "oauth" else
-                  f"Setup-token installed (Claude in Chrome needs a full login: claude-swap auth {n})"))
+                  "Setup-token installed (Claude in Chrome needs a full login: "
+                  + oauth.auth_hint(n, oauth.login_group(store, n, k)) + ")"))
     if note:
         print(f"        {note}")
     print()
     open_ = oauth.reserved_sessions()
-    on = [x for x in open_ if x[2]]
-    print(f"Done. {len(on)} open reserved session{'s' if len(on) != 1 else ''} move"
-          f"{'s' if len(on) == 1 else ''} to #{n} within 30 s; new ones (claude-swap run)"
-          " start on it." if on else f"Done. New reserved sessions (claude-swap run) start on #{n}.")
-    pinned = [x for x in open_ if not x[2]]
+    on = [x for x in open_ if x[2] == oauth.lane_dir(None, k)]
+    kind = f"{k} reserved" if k else "reserved"
+    print(f"Done. {len(on)} open {kind} session{'s' if len(on) != 1 else ''} move"
+          f"{'s' if len(on) == 1 else ''} to #{n} within 30 s; new ones ({run})"
+          " start on it." if on else f"Done. New {kind} sessions ({run}) start on #{n}.")
+    # the sessions on a token of their own are told with the default group's
+    pinned = [x for x in open_ if not x[2]] if k is None else []
     if pinned:
         print("Started on a token of their own, these stay where they are until restarted"
               " (/exit, then claude-swap run -- --resume <id>): "
@@ -3901,7 +4538,7 @@ if what == "vault-failed":
 # 2-3. Claude Code's credential and the account it shows
 mode, note = oauth.install(store, n, secrets, live, http, now)
 if mode == "failed":
-    oauth.commit(store_path, store)
+    oauth.commit(store_path, store, before=store_read)
     print(f"  [2/4] {note}")
     print("\nStopped: Claude Code is still on the previous account.")
     sys.exit(1)
@@ -3918,7 +4555,7 @@ if note:
 store["active"] = n
 oauth.mark_live(store, n, mode, now,
                 prev if prev != n else (store.get("live") or {}).get("from"))
-oauth.commit(store_path, store)
+oauth.commit(store_path, store, before=store_read)
 print("  [4/4] Store updated")
 print()
 print(f"Done. Running sessions move to account {n} within 30 s; new ones start on it.")
@@ -4427,17 +5064,21 @@ def is_free(tier):
 def day(ms):
     return datetime.fromtimestamp(ms / 1000).strftime("%a %d %b")
 
-def state_text(a, now):
-    st, left = oauth.login_state(a, now)
-    m = a.get("oauth") or {}
+def state_text(a, now, key=None, n=None):
+    """One of account n's logins (key: login_meta's; None its main one); a
+    login of a group says the command that redoes it."""
+    st, left = oauth.login_state(a, now, key)
+    m = oauth.login_meta(a, key)
+    hint = oauth.auth_hint(n, key) if key else None
     if st == "none":
         return paint("90", "none")
     if st == "dead":
         why = "refused" if m.get("dead") else "expired"
-        return paint("31", f"{why} — redo it")
+        return paint("31", f"{why} — {hint or 'redo it'}")
     until = f"until {day(m['rt_expires'])}" if m.get("rt_expires") else "no expiry known"
     if st == "expiring":
-        return paint("33", f"{until} ({left / 86400:.0f}d left) — redo it soon")
+        return paint("33", f"{until} ({left / 86400:.0f}d left) — redo it soon"
+                           + (f": {hint}" if hint else ""))
     return paint("32", f"ok {until}") + paint("90", f" ({left / 86400:.0f}d)" if left else "")
 
 def show(store):
@@ -4449,22 +5090,33 @@ def show(store):
         prof = a.get("chrome_profile")
         where = names.get(prof, prof) if prof else "-"
         mark = "*" if i == store.get("active") else " "
+        groups = []
         if a.get("disabled"):
             line = paint("90", "disabled")
         elif is_free(a.get("plan")) and "plan" in a:
             line = paint("90", "free plan: Claude Code does not run on it")
         else:
             line = state_text(a, now)
-        print(f" {mark}{i:>2}  {(a.get('label') or '?')[:24]:<24} {(a.get('email') or '-')[:30]:<30} "
-              f"{where[:20]:<20} {line}")
+            # under it, the seat's login of each other group it is in
+            groups = [g for g in oauth.lane_logins(store, i)[1:]
+                      if oauth.login_meta(a, g).get("fp")]
+        head = (f" {mark}{i:>2}  {(a.get('label') or '?')[:24]:<24} {(a.get('email') or '-')[:30]:<30} "
+                f"{where[:20]:<20} ")
+        print(head + line)
+        for g in groups:
+            print(" " * len(head) + f"{g}: {state_text(a, now, g, i)}")
     print()
     print("  claude-swap auth <n>   authorize account n in its Chrome profile (one click)")
     print("  claude-swap auth all   every paid account without a good login, one after another")
+    print("  claude-swap auth <n> --group <g>   a reserved seat's own login for group g's lane,"
+          " when g is not its first group")
 
-def login(n):
-    """One browser authorization for account n, saved to its slot. -> bool"""
+def login(n, group=None):
+    """One browser authorization for account n, saved to its slot (of
+    group: its login for that group's lane). -> bool"""
     store = oauth.load_store(store_path)
     acc = store["accounts"][n - 1]
+    lg = oauth.login_group(store, n, group) if group else None
     email = (acc.get("email") or "").strip()
     if not email:
         print(f"#{n} has no email in the store, so its login could not be matched.")
@@ -4485,7 +5137,8 @@ def login(n):
         os.chmod(opener, 0o700)
         env["BROWSER"] = opener
     print()
-    print(paint("1", f"#{n} {email}") + ": authorize it in "
+    print(paint("1", f"#{n} {email}") + (f", its login for the {lg} lane" if lg else "")
+          + ": authorize it in "
           + (f"Chrome profile '{names.get(prof, prof)}'" if prof else "the browser that opens")
           + f". Check the page shows {email}, then Authorize.")
     print("  If claude.ai asks you to sign in again (it does when the last sign-in is not"
@@ -4512,37 +5165,41 @@ def login(n):
         # it may have taken minutes, and the accounts may have been renumbered
         # meanwhile (a remove): find it again by email, never by number
         store = oauth.load_store(store_path)
+        store_read = json.loads(json.dumps(store))  # what commit compares against
         k = oauth.by_identity(store["accounts"], None, got)
         if k is None:
             print(f"  That login is {got}, which is not in claude-swap: discarded.")
             return False
         if got != email.lower():
             print(f"  That login is {got}: kept for #{k} instead.")
-        acc = store["accounts"][k - 1]
-        if not secrets.write(oauth.VAULT, oauth.dump(o), oauth.slot(acc)):
+        # saved as the login asked for, or its main one if it is another
+        # account's, then put where that login is in use (the lanes on it
+        # move to the new login)
+        r = oauth.file_login(store, k, o, account, secrets, live, http, time.time(), group)
+        if r is None:
             print("  Could not save it to the keychain: nothing changed.")
             return False
-        now = time.time()
-        oauth.note_login(acc, o, now, account)
-        installed = in_lane = False
-        if store.get("active") == k:
-            mode, _ = oauth.install(store, k, secrets, live, http, now)
-            if mode == "oauth":
-                oauth.mark_live(store, k, mode, now, (store.get("live") or {}).get("from"))
-                installed = True
-        elif oauth.lane_of(store) == k:
-            # the reserved sessions are on it: they move to the new login
-            in_lane = oauth.lane_put(store, k, secrets, http, now)[0] == "oauth"
+        key, installed, lanes = r
         oauth.commit(store_path, store,
-                     top=("active", "live") + (("lane",) if in_lane else ()))
+                     top=("active", "live") + oauth.lane_top(store, *[x for x, _ in lanes]),
+                     before=store_read)
         until = f" until {day(o['refreshTokenExpiresAt'])}" if o.get("refreshTokenExpiresAt") else ""
-        print(paint("32", f"  Saved: good{until}.")
+        print(paint("32", f"  Saved{' for the ' + key + ' lane' if key else ''}: good{until}.")
               + (" Active account, so installed now: Claude in Chrome ready." if installed else ""))
         if store["accounts"][k - 1].get("reserved"):
-            print("  Reserved: the reserved sessions (claude-swap run) are on it, so they moved"
-                  " to this login (Claude in Chrome)." if in_lane else
-                  f"  Reserved: the reserved sessions (claude-swap run) take this login when"
-                  f" they are on #{k}:  claude-swap {k}")
+            moved = [x for x, mode in lanes if mode == "oauth"]
+            for x in moved:
+                print(f"  Reserved: {oauth.lane_label(store, x)} (claude-swap run"
+                      + (f" --group {x}" if x else "") + ") are on it, so they moved"
+                      " to this login (Claude in Chrome).")
+            if not moved:
+                # the lane that takes this login: its group's, or for the main
+                # one its home group's
+                g = key or oauth.home_group(store, k)
+                x = oauth.lane_key(store, g)
+                print(f"  Reserved: {oauth.lane_label(store, x)} (claude-swap run"
+                      + (f" --group {x}" if x else "") + ") take this login when"
+                      f" they are on #{k}:  {oauth.move_hint(store, k, g)}")
         acc = oauth.load_store(store_path)["accounts"][k - 1]
         cp = acc.get("chrome_profile")
         if oauth.chrome_ready(acc):
@@ -4561,6 +5218,19 @@ def login(n):
 
 store = oauth.load_store(store_path)
 accounts = store.get("accounts", [])
+USAGE = (f"Usage: claude-swap auth [n|all] [--group g]   (n in 1-{len(accounts)};"
+         " --group only with n)")
+args, group, err = oauth.split_group(args)
+if err or (group and (len(args) != 1 or not args[0].isdigit()
+                      or not 1 <= int(args[0]) <= len(accounts))):
+    print(USAGE)
+    sys.exit(1)
+if group:
+    # a group the seat is in (its home group: its main login, as without it)
+    _, err = oauth.resolve_group(store, int(args[0]), group)
+    if err:
+        print(f"Error: {err}")
+        sys.exit(1)
 if not args:
     show(store)
     sys.exit(0)
@@ -4578,7 +5248,7 @@ if args[0] == "all":
 elif args[0].isdigit() and 1 <= int(args[0]) <= len(accounts):
     targets = [int(args[0])]
 else:
-    print(f"Usage: claude-swap auth [n|all]   (n in 1-{len(accounts)})")
+    print(USAGE)
     sys.exit(1)
 done = 0
 try:
@@ -4587,7 +5257,7 @@ try:
             nxt = accounts[n - 1]
             if input(f"\nEnter for #{n} {nxt.get('email')}, q to stop: ").strip().lower() == "q":
                 break
-        done += login(n)
+        done += login(n, group)
 except (KeyboardInterrupt, EOFError):
     print()
 print()
@@ -5030,7 +5700,8 @@ PYEOF
 
 _watch_state_forget() {
   # drop keys from the watch state, e.g. so a fresh start retries failed
-  # resets; a dotted key (lane.reset_failed) reaches into a nested one
+  # resets; a dotted key (lane.reset_failed) reaches into a nested one, and
+  # a * in it into every one (lanes.*.reset_failed: each group's lane)
   [ -f "$WATCH_STATE" ] || return 0
   python3 - "$WATCH_STATE" "$@" <<'PYEOF'
 import json, sys
@@ -5040,13 +5711,18 @@ try:
         s = json.load(f)
 except Exception:
     sys.exit(0)
+
+def forget(d, parts):
+    if not isinstance(d, dict):
+        return
+    if len(parts) == 1:
+        d.pop(parts[0], None)
+        return
+    for v in (list(d.values()) if parts[0] == "*" else [d.get(parts[0])]):
+        forget(v, parts[1:])
+
 for k in keys:
-    *parents, last = k.split(".")
-    d = s
-    for p in parents:
-        d = d.get(p) if isinstance(d, dict) else None
-    if isinstance(d, dict):
-        d.pop(last, None)
+    forget(s, k.split("."))
 with open(path, "w") as f:
     json.dump(s, f)
 PYEOF
@@ -5089,8 +5765,8 @@ cmd_watch_start() {
   fi
   rm -f "$WATCH_PID"
   # a fresh start gives every account another chance at a reset that failed,
-  # the reserved sessions' seats too
-  _watch_state_forget reset_failed lane.reset_failed
+  # the seats of every group's reserved sessions too
+  _watch_state_forget reset_failed lane.reset_failed 'lanes.*.reset_failed'
   local self
   self="$(command -v claude-swap || echo "$0")"
   self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
@@ -5173,6 +5849,9 @@ if s.get("decision"):
     print(f"  {s['decision']}")
 if s.get("lane_decision"):
     print(f"  {s['lane_decision']}")
+# every other group's lane: "reserved sessions (<g>): ..."
+for line in (s.get("lane_decisions") or {}).values():
+    print(f"  {line}")
 lr = s.get("last_reset")
 if isinstance(lr, dict):
     # time, account, kind and outcome (worked / did not work / not spent /
@@ -5183,7 +5862,9 @@ if isinstance(lr, dict):
         when = "?"
     what = f"{lr.get('kind', '?')} reset on #{lr.get('n', '?')} {lr.get('label') or ''}".rstrip()
     if lr.get("lane"):
-        what += " (reserved sessions)"
+        # True for the default group's lane, else the group's name
+        what += (f" ({lr['lane']} reserved sessions)" if isinstance(lr["lane"], str)
+                 else " (reserved sessions)")
     print(f"  last reset: {when} · {what} · {lr.get('outcome', '?')}"
           + (f" — now {lr['now']}" if lr.get("now") else ""))
 PYEOF
@@ -5198,10 +5879,11 @@ PYEOF
 cmd_group() {
   # Groups of reserved seats: list them, set one's seats (group <g> <n>...) or
   # remove it (group <g> off). Kept by email in the store; the first is the
-  # default group, whose lane is the one of 1.15.
+  # default group, whose lane is the one of 1.15. Removing another group
+  # retires its lane.
   check_store
   python3 - "$STORE" "$@" <<'PYEOF'
-import os, sys, types
+import os, sys, time, types
 
 oauth = types.ModuleType("oauth")
 exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
@@ -5215,10 +5897,11 @@ def listing():
     if not groups:
         print("No reserved seats yet (claude-swap add --reserved).")
         return
-    dflt, on = oauth.default_group(store), oauth.lane_of(store)
+    dflt = oauth.default_group(store)
     for g, ns in groups.items():
         seats = "  ".join(f"#{n} {accounts[n - 1].get('email') or '?'}" for n in ns) or "(no live seats)"
-        lane = f" · lane on #{on}" if g == dflt and on else ""
+        on = oauth.lane_of(store, g)
+        lane = f" · lane on #{on}" if on else ""
         print(f"{g}{' (default)' if g == dflt else ''}: {seats}{lane}")
 
 if not args:
@@ -5229,12 +5912,21 @@ g, rest = args[0], args[1:]
 if rest == ["off"]:
     if g not in (store.get("groups") or {}):
         sys.exit(f"Error: there is no group {g}")
-    why = oauth.group_off_refusal(store, g)
+    why = oauth.group_off_refusal(store, g) or oauth.group_edit_refusal(store, g, [])
     if why:
         sys.exit(f"Error: {why}")
-    if len(store["groups"]) == 1 and any(x[2] for x in oauth.reserved_sessions()):
+    lane = oauth.lane_dir(None, oauth.lane_key(store, g))
+    if len(store["groups"]) == 1 and any(x[2] == lane for x in oauth.reserved_sessions()):
         sys.exit(f"Error: {g} is the only group and sessions are open on its lane:"
                  " close them first")
+    if oauth.lane_key(store, g):
+        # another group's lane goes with it, its login saved first
+        secrets, _, http = oauth.default_io()
+        ok, msg = oauth.retire_lane(store, g, secrets, http, time.time())
+        if not ok:
+            sys.exit(f"Error: {msg}")
+        if msg:
+            print(msg[0].upper() + msg[1:] + ".")
     oauth.set_group(store, g, [])
 elif rest:
     if g == oauth.IMPLICIT or not oauth.GROUP_RE.match(g):
@@ -5252,6 +5944,9 @@ elif rest:
             sys.exit(f"Error: account {n} has no email in the store")
         if n not in picked:
             picked.append(n)
+    why = oauth.group_edit_refusal(store, g, picked)
+    if why:
+        sys.exit(f"Error: {why}")
     oauth.set_group(store, g, picked)
 else:
     sys.exit("Usage: claude-swap group [<g> <n> ... | <g> off]")
@@ -5261,8 +5956,7 @@ PYEOF
 }
 
 cmd_lane() {
-  # One line per group: <group> <n|-> <oauth|setup|->. Only the default group
-  # has a lane so far.
+  # One line per group: <group> <n|-> <oauth|setup|->, of the group's lane.
   check_store
   python3 - "$STORE" "${1:-}" <<'PYEOF'
 import os, sys, types
@@ -5275,66 +5969,56 @@ store = oauth.load_store(store_path)
 groups = oauth.groups_of(store)
 if want and want not in groups:
     sys.exit(f"Error: there is no group {want}")
-dflt = oauth.default_group(store)
 for g in groups:
     if want and g != want:
         continue
-    n = oauth.lane_of(store) if g == dflt else None
-    mode = (store.get("lane") or {}).get("mode") if n else None
+    n = oauth.lane_of(store, g)
+    mode = oauth.lane_rec(store, g).get("mode") if n else None
     print(g, n or "-", mode if mode in ("oauth", "setup") else "-")
 PYEOF
 }
 
 cmd_watch_reserved() {
-  # Which reserved accounts the watch may move the reserved sessions among
-  # when the one they are on reaches its limit (none: it leaves them alone).
+  # Which seats the watch may move a group's reserved sessions among when the
+  # one they are on reaches its limit (none: it leaves them alone). Without a
+  # group name, the default group's list (lane_rotate, as up to 1.20).
   check_store
   python3 - "$STORE" "$@" <<'PYEOF'
-import json, os, sys
+import json, os, sys, types
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+
 store_path, args = sys.argv[1], sys.argv[2:]
-with open(store_path) as f:
-    d = json.load(f)
-accounts = d.get("accounts", [])
+store = oauth.load_store(store_path)
+accounts = store.get("accounts", [])
+before = json.dumps(store, sort_keys=True)
+k, err = oauth.watch_reserved(store, args)
+if err:
+    sys.exit(err)
+if json.dumps(store, sort_keys=True) != before:
+    oauth.save_store(store_path, store)
 
 def name(i):
     a = accounts[i - 1]
     return f"#{i} {a.get('label') or a.get('email') or '?'}"
 
-if args == ["off"]:
-    d.pop("lane_rotate", None)
-elif args:
-    picked = []
-    for x in args:
-        n = int(x) if x.isdigit() else 0
-        if not 1 <= n <= len(accounts):
-            sys.exit(f"Error: account {x} does not exist (valid: 1-{len(accounts)})")
-        a = accounts[n - 1]
-        if not a.get("reserved"):
-            sys.exit(f"Error: account {n} is not reserved: the watch moves it as the shared"
-                     " login already")
-        if not a.get("email"):
-            sys.exit(f"Error: account {n} has no email in the store")
-        if n not in picked:
-            picked.append(n)
-    if len(picked) < 2:
-        sys.exit("Say at least two reserved accounts, or off")
-    d["lane_rotate"] = [accounts[n - 1]["email"] for n in picked]
-if args:
-    tmp = store_path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(d, f, indent=2)
-    os.replace(tmp, store_path)
-want = [e.lower() for e in d.get("lane_rotate") or []]
-pool = [i for i, a in enumerate(accounts, 1) if (a.get("email") or "").lower() in want]
-if pool:
-    print("When the account the reserved sessions are on reaches its limit, the watch"
-          " moves them to another of: " + ", ".join(name(i) for i in pool))
-    print("A move by hand (claude-swap <n>) is kept until that account reaches its limit,"
-          " and one outside these is left alone.")
-else:
-    print("The watch leaves the reserved sessions where they are."
-          "  To let it move them: claude-swap watch reserved <n> <m> ...")
+def show(k):
+    them = oauth.lane_label(store, k)
+    pool = oauth.rotation(store, k)  # what the watch moves them among
+    if len(pool) > 1:
+        print(f"When the account {them} are on reaches its limit, the watch"
+              " moves them to another of: " + ", ".join(name(i) for i in pool))
+        print(f"A move by hand (claude-swap <n>{' ' + k if k else ''}) is kept until that"
+              " account reaches its limit, and one outside these is left alone.")
+    else:
+        print(f"The watch leaves {them} where they are.  To let it move them:"
+              f" claude-swap watch reserved {k + ' ' if k else ''}<n> <m> ...")
+
+# a group named, or a list set: that one; else every group's
+for x in ([k] if args else
+          [None] + [g for g in oauth.groups_of(store) if oauth.lane_key(store, g)]):
+    show(x)
 PYEOF
 }
 
@@ -5551,12 +6235,18 @@ try:
               "login_warned", "last_reset"):
         if k in prev:
             state[k] = prev[k]
-    prev_lane = prev.get("lane")
-    if isinstance(prev_lane, dict):
-        lane = {k: prev_lane[k] for k in ("reset_tried", "reset_failed")
-                if k in prev_lane}
-        if lane:
-            state["lane"] = lane
+    # each group's lane's too: the default group's in "lane" (as up to
+    # 1.20), every other's in "lanes" by its name
+    def marks(prev_lane):
+        return {k: prev_lane[k] for k in ("reset_tried", "reset_failed")
+                if k in prev_lane} if isinstance(prev_lane, dict) else {}
+    lane = marks(prev.get("lane"))
+    if lane:
+        state["lane"] = lane
+    lanes = {g: m for g, m in ((g, marks(ls)) for g, ls in (prev.get("lanes") or {}).items())
+             if m}
+    if lanes:
+        state["lanes"] = lanes
 except Exception:
     pass
 
@@ -5664,70 +6354,113 @@ def refresh_subscriptions(store):
             log(f"subscription: {who} — {', '.join(changes)}")
             notify(f"{who}: {', '.join(changes)}")
 
-def lane_pool(store):
-    """The reserved accounts the watch may put the reserved sessions on
-    (claude-swap watch reserved), by number, in the store's current order."""
-    want = [e.lower() for e in store.get("lane_rotate") or []]
-    return [i for i, a in enumerate(store.get("accounts", []), 1)
-            if (a.get("email") or "").lower() in want and a.get("reserved")
-            and a.get("token") and not a.get("disabled")]
+# One lane per group of reserved seats (claude-swap group): the default
+# group's is the lane of 1.15, whose memory stays in state["lane"] and whose
+# decision in state["lane_decision"], as up to 1.20; any other group k's in
+# state["lanes"][k] and state["lane_decisions"][k], its texts naming it.
 
-def lane_step(store, rows, model):
-    """Move the reserved sessions off a reserved account at its limit, as the
-    shared login is moved. -> (decision or None, peak % of their account)"""
-    ln, pool = oauth.lane_of(store), lane_pool(store)
-    ls = state.setdefault("lane", {})
+def lane_state(k):
+    """The watch's memory of a group's lane (k: lane_key, None the default)."""
+    return (state.setdefault("lane", {}) if k is None else
+            state.setdefault("lanes", {}).setdefault(k, {}))
+
+def lane_said(k, text):
+    """What the watch makes of a group's lane, for watch status (None: no
+    lane to tell of)."""
+    if k is None:
+        if text:
+            state["lane_decision"] = text
+        else:
+            state.pop("lane_decision", None)
+    elif text:
+        state.setdefault("lane_decisions", {})[k] = text
+    else:
+        (state.get("lane_decisions") or {}).pop(k, None)
+
+def lane_step(store, rows, model, group=None):
+    """Move a group's reserved sessions off a reserved seat at its limit, as
+    the shared login is moved, among that group's own list (rotation).
+    -> (decision or None, peak % of their seat, whether it spent a reset)"""
+    k = oauth.lane_key(store, group)
+    ln, pool = oauth.lane_of(store, k), oauth.rotation(store, k)
+    ls = lane_state(k)
+    them = "reserved sessions" + (f" ({k})" if k else "")
+    Them = them[0].upper() + them[1:]
     p = next((r for r in rows if r["n"] == ln), None)
     peak = engine.load(p, model) if p and p["u5"] is not None else 0
     if ln is None:
-        return None, peak
+        lane_said(k, None)
+        return None, peak, False
     # a move the watch did not make is the user's pick, kept until its limit
     if ls.get("set_by_watch") is None:
         ls["set_by_watch"] = ln
     elif ln != ls["set_by_watch"]:
         ls.update({"set_by_watch": ln, "manual": True})
-        log(f"reserved sessions on #{ln} by hand — kept until it reaches its limit")
-    d = engine.lane_decide(rows, ln, pool, time.time(), ls, auto_reset, model)
-    state["lane_decision"] = (f"reserved sessions: {d['reason']}" if d else
-                              f"reserved sessions on #{ln}"
-                              + (" (not among the ones the watch moves them on)"
-                                 if len(pool) > 1 else " (the watch does not move them)"))
+        log(f"{them} on #{ln} by hand — kept until it reaches its limit")
+    # a seat shared by two groups has one quota: a reset any lane tried
+    # there counts for all (each lane's own tries stay in its memory)
+    others = [s for s in [state.get("lane")] + list((state.get("lanes") or {}).values())
+              if isinstance(s, dict) and s is not ls]
+    d = engine.lane_decide(rows, ln, pool, time.time(),
+                           engine.with_resets_of(ls, others), auto_reset, model)
+    lane_said(k, f"{them}: {d['reason']}" if d else
+              f"{them} on #{ln}" + (" (not among the ones the watch moves them on)"
+                                    if len(pool) > 1 else " (the watch does not move them)"))
     if d is None:
-        return None, peak
+        return None, peak, False
+    # the command a user would type: the group named when it must be
+    move = [self_bin] + oauth.move_args(store, d["target"], k)
     if d["action"] == "reset":
-        log(f"reserved sessions: {d['reason']}")
+        log(f"{them}: {d['reason']}")
         # the sessions go to the seat only once its reset has freed it
-        if spend_reset(d["target"], store, rows, d["grant"], ls, model) \
-                and d["target"] != ln:
-            if run_logged([self_bin, str(d["target"])]):
+        outcome = spend_reset(d["target"], store, rows, d["grant"], ls, model, lane=k or True)
+        if outcome == "worked" and d["target"] != ln:
+            if run_logged(move):
                 ls.update({"last_switch": time.time(), "set_by_watch": d["target"],
                            "manual": False, "wall_noted": False})
             else:
-                log("moving the reserved sessions failed")
-                notify("Moving the reserved sessions failed — check the watch log")
+                log(f"moving the {them} failed")
+                notify(f"Moving the {them} failed — check the watch log")
         save_state()
-        return d, peak
+        return d, peak, outcome != "not spent"
     if d["action"] == "switch":
         tgt = next((r for r in rows if r["n"] == d["target"]), {})
-        log(f"reserved sessions #{ln} -> #{d['target']} {tgt.get('label', '')}: {d['reason']}")
-        if run_logged([self_bin, str(d["target"])]):
-            notify(f"Reserved sessions moved to #{d['target']} {tgt.get('label', '')}"
+        log(f"{them} #{ln} -> #{d['target']} {tgt.get('label', '')}: {d['reason']}")
+        if run_logged(move):
+            notify(f"{Them} moved to #{d['target']} {tgt.get('label', '')}"
                    f" — {d['reason']}")
             ls.update({"last_switch": time.time(), "set_by_watch": d["target"],
                        "manual": False, "wall_noted": False})
         else:
-            log("moving the reserved sessions failed")
-            notify("Moving the reserved sessions failed — check the watch log")
+            log(f"moving the {them} failed")
+            notify(f"Moving the {them} failed — check the watch log")
     elif d["action"] == "wall":
         if not ls.get("wall_noted"):
             when = f" — first one free at {clock(d['wake'])}" if d["wake"] else ""
-            log(f"reserved sessions: {d['reason']}{when}")
-            notify("Reserved accounts all at the limit" + when)
+            log(f"{them}: {d['reason']}{when}")
+            notify("Reserved accounts" + (f" of {k}" if k else "") + " all at the limit" + when)
             ls["wall_noted"] = True
     elif ls.get("wall_noted"):
         ls["wall_noted"] = False
     save_state()
-    return d, peak
+    return d, peak, False
+
+def lanes_step(store, rows, model):
+    """lane_step for every group's lane, the default group's first, until
+    one spends a reset (engine.step_lanes: the rest wait for the next look).
+    -> (the decisions, the highest peak % of their seats)"""
+    keys = oauth.lane_groups(store)
+    # a lane retired meanwhile (its group removed) has nothing left to tell
+    for k in [k for k in state.get("lane_decisions") or {} if k not in keys]:
+        lane_said(k, None)
+    steps = []
+
+    def turn(k):
+        d, pk, spent = lane_step(store, rows, model, k)
+        steps.append((d, pk))
+        return spent
+    engine.step_lanes(keys, turn)
+    return [d for d, _ in steps if d], max((pk for _, pk in steps), default=0)
 
 def run_logged(args):
     r = subprocess.run(args, capture_output=True, text=True)
@@ -5738,14 +6471,17 @@ def run_logged(args):
 
 VERIFY_WAIT = 60  # claude.ai can take a minute to show what a reset emptied
 
-def spend_reset(n, store, rows, grant, mem, model):
+def spend_reset(n, store, rows, grant, mem, model, lane=None):
     """Spend the reset the engine chose on account n (that very grant), then
     check it did what its kind does. mem keeps the try: the watch's state,
-    or the reserved sessions' own. True only if it was spent and a fresh
-    cookie read shows it did what it should. A read that does not come, or
-    does not match yet, is looked at once more a minute later; only one that
-    comes and contradicts the kind stops that kind on the account until the
-    next 'watch start'. The outcome goes to the state's last_reset."""
+    or a group's reserved sessions' own (lane: True for the default group's,
+    else the group's name, as last_reset tells it). It "worked" only if it
+    was spent and a fresh cookie read shows it did what it should. A read
+    that does not come, or does not match yet, is looked at once more a
+    minute later; only one that comes and contradicts the kind stops that
+    kind on the account until the next 'watch start'. The outcome goes to
+    the state's last_reset, and is returned: worked, could not verify, did
+    not work, or not spent (the only one that left the seat as it was)."""
     before = next((r for r in rows if r["n"] == n), {"n": n})
     label = before.get("label", "?")
     kind = engine.FULL if grant["kind"] == engine.FULL else grant["model"]
@@ -5798,10 +6534,10 @@ def spend_reset(n, store, rows, grant, mem, model):
     state["last_reset"] = {
         "time": datetime.now().isoformat(timespec="seconds"), "n": n,
         "label": label, "kind": kind, "outcome": outcome,
-        "lane": mem is not state,
+        "lane": lane or mem is not state,
         "now": engine.usage(after, shown) if after and after.get("src") == "web" else None}
     save_state()
-    return worked
+    return outcome
 
 # ---------- full logins (Claude in Chrome) ----------
 # Claude Code refreshes the login in use every ~8 h; a minute later it is in
@@ -5825,11 +6561,12 @@ def login_tick():
             notify(msg)
     try:
         with open(store_path) as f:
-            accounts = json.load(f).get("accounts", [])
+            fresh = json.load(f)
     except Exception:
         return
     warned = state.get("login_warned", [])
-    due = oauth.due_reminders(accounts, now, warned)
+    # each login of a group too, while a lane of that group would take it
+    due = oauth.due_reminders(fresh.get("accounts", []), now, warned, fresh)
     for key, msg in due:
         log(msg)
         notify(msg)
@@ -5905,7 +6642,7 @@ while True:
                       "decision": d["reason"],
                       "last_time": datetime.now().strftime("%H:%M")})
         save_state()
-        ld, lane_peak = lane_step(store, rows, model)
+        lds, lane_peak = lanes_step(store, rows, model)
 
         if d["action"] == "reset":
             spend_reset(d["target"], store, rows, d["grant"], state, model)
@@ -5946,7 +6683,7 @@ while True:
             save_state()
 
         sleep_for = cadence
-        wakes = [w for w in (d["wake"], ld and ld["wake"]) if w]
+        wakes = [w for w in [d["wake"]] + [x["wake"] for x in lds] if w]
         if wakes:
             # +20 s: let the window actually roll over before looking
             sleep_for = min(cadence, max(30, min(wakes) - time.time() + 20))
@@ -5965,7 +6702,7 @@ cmd_model() {
   # show or set the model the sessions use; the watch reads it every look
   check_store
   python3 - "$STORE" "${1:-}" <<'PYEOF'
-import os, sys, types
+import json, os, sys, types
 engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 oauth = types.ModuleType("oauth")
@@ -5974,8 +6711,9 @@ exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 store_path, want = sys.argv[1], sys.argv[2].strip().lower()
 store = oauth.load_store(store_path)
 if want:
+    store_read = json.loads(json.dumps(store))
     store["model"] = want
-    oauth.commit(store_path, store, top=("model",))
+    oauth.commit(store_path, store, top=("model",), before=store_read)
 m = engine.model_setting(store)
 if want:
     print(f"Model set to {m}; the watch applies it on its next look.")
@@ -6270,11 +7008,12 @@ PYEOF
 
 cmd_run() {
   # A Claude Code session on a reserved account, whatever the shared login
-  # does: no swap of it and no watch moves it. The reserved sessions share a
-  # config dir, the lane, which `claude-swap <n>` moves from one reserved
-  # account to another, open sessions included (on its full login Claude in
-  # Chrome works). A new one starts on the account the lane is on; a number
-  # only picks one while the lane is on none.
+  # does: no swap of it and no watch moves it. The reserved sessions of a
+  # group share a config dir, its lane, which `claude-swap <n> [g]` moves
+  # from one of its seats to another, open sessions included (on a full login
+  # Claude in Chrome works). A new one starts on the seat its group's lane is
+  # on (--group g; else n's home group, else the default group); a number
+  # only picks one while that lane is on none.
   # Another account's session gets its setup-token in CLAUDE_CODE_OAUTH_TOKEN,
   # which Claude Code puts before the keychain, and stays on it.
   check_store
@@ -6300,8 +7039,9 @@ RESTORE = ("import os, time, types\n"
 store_path, args = sys.argv[1], sys.argv[2:]
 head, rest = (args[:args.index("--")], args[args.index("--") + 1:]) \
     if "--" in args else (args, [])
-if len(head) > 1 or (head and not head[0].isdigit()):
-    sys.exit("Usage: claude-swap run [n] [-- <claude args>]")
+head, group, err = oauth.split_group(head)
+if err or len(head) > 1 or (head and not head[0].isdigit()):
+    sys.exit("Usage: claude-swap run [n] [--group g] [-- <claude args>]")
 with open(store_path) as f:
     store = json.load(f)
 accounts = store.get("accounts", [])
@@ -6324,56 +7064,45 @@ def usage(n, acc):
     return None
 
 macos = sys.platform == "darwin"
+adopted = None
 if macos:
     secrets, _, http = oauth.default_io(True)
-    oauth.lane_adopt(store, secrets)
-if head:
-    n = int(head[0])
-    if not 1 <= n <= len(accounts):
-        sys.exit(f"Error: account {n} does not exist (valid: 1-{len(accounts)})")
-    acc = accounts[n - 1]
-    if acc.get("disabled") or not acc.get("token"):
-        sys.exit(f"Error: account {n} is disabled or has no token")
-    ln = oauth.lane_of(store) if macos and acc.get("reserved") else None
-    if ln and ln != n:
-        # a number never moves the others (an old alias in an open shell
-        # did, onto a seat at its limit): only claude-swap <n> does
-        c = usage(ln, accounts[ln - 1])
-        sys.stderr.write(f"claude-swap run: the reserved sessions are on #{ln}"
-                         + (f" (5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%)"
-                            if c else "")
-                         + f": this one joins them. To move them all to #{n}:"
-                         f"  claude-swap {n}\n")
-        n, acc = ln, accounts[ln - 1]
-else:
-    # the account the reserved sessions are on; else the only reserved one
-    pool = [(i, a) for i, a in enumerate(accounts, 1)
-            if a.get("reserved") and a.get("token") and not a.get("disabled")]
-    n = oauth.lane_of(store) if macos else None
-    if n:
-        acc = accounts[n - 1]
-    elif not pool:
-        sys.exit("No reserved account: mark one with  claude-swap reserve <n>")
-    elif len(pool) > 1:
-        sys.exit("Several reserved accounts ("
-                 + ", ".join(f"#{i} {a.get('email') or a.get('label') or '?'}" for i, a in pool)
-                 + "): say which one,  claude-swap run <n> -- <claude args>")
-    else:
-        n, acc = pool[0]
+    adopted = oauth.lane_adopt(store, secrets)
+# the seat the group's lane is on, which a number joins and never moves (an
+# old alias in an open shell did, onto a seat at its limit): only
+# claude-swap <n> moves it; with no lane on a seat, the number, else the
+# group's only seat
+g, n, asked, err = oauth.run_seat(store, int(head[0]) if head else None, group, macos)
+if err:
+    sys.exit(err)
+acc = accounts[n - 1]
+k = oauth.lane_key(store, g) if g else None
+them = oauth.lane_label(store, k)
+if asked:
+    c = usage(n, acc)
+    sys.stderr.write(f"claude-swap run: {them} are on #{n}"
+                     + (f" (5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%)"
+                        if c else "")
+                     + f": this one joins them. To move them all to #{asked}:"
+                     f"  {oauth.move_hint(store, asked, g)}\n")
 
-# A reserved account's sessions run on the lane, a config dir they share,
-# which `claude-swap <n>` moves among the reserved accounts (macOS: the lane's
-# keychain item). Any other account's run on its setup-token: its full login
-# lives in Claude Code's own credential, and two copies of one would spend
-# each other's refresh token.
+# A reserved account's sessions run on its group's lane, a config dir they
+# share, which `claude-swap <n> [g]` moves among the group's seats (macOS:
+# the lane's keychain item). Any other account's run on its setup-token: its
+# full login lives in Claude Code's own credential, and two copies of one
+# would spend each other's refresh token.
 own, mode, note, moved = None, "setup", None, None
-if macos and acc.get("reserved"):
+if macos and g:
     try:
-        own, mode, note, moved = oauth.lane_prepare(store, n, secrets, http, time.time())
+        own, mode, note, moved = oauth.lane_prepare(store, n, secrets, http, time.time(),
+                                                     group=k)
     except Exception as e:
-        own, note = None, f"the reserved sessions' config dir could not be set up ({type(e).__name__}: {e})"
+        own, note = None, f"{them}' config dir could not be set up ({type(e).__name__}: {e})"
     if json.dumps(store, sort_keys=True) != before:
-        oauth.commit(store_path, store, top=("lane",))
+        # this group's lane record alone: another lane may have moved meanwhile
+        oauth.commit(store_path, store,
+                     top=oauth.lane_top(store, k, *([None] if adopted else [])),
+                     before=json.loads(before))
     if not own:
         mode = "setup"
 
@@ -6383,14 +7112,17 @@ fig = (f"5h {(c.get('u5') or 0):.0f}% · 7d {(c.get('u7') or 0):.0f}%" if c
 age = time.time() - (snap.get("updated") or 0)
 if c and age > 600:
     fig += f" ({int(age // 60)} min old)"
-lane = "reserved" if acc.get("reserved") else "NOT reserved: the watch may also use it"
+lane = (("reserved" + (f" ({k})" if k else "")) if acc.get("reserved")
+        else "NOT reserved: the watch may also use it")
 sys.stderr.write(f"claude-swap run: #{n} {acc.get('label') or '?'} · {acc.get('email') or '-'}"
                  f" · {fig} · {lane} · {'full login' if mode == 'oauth' else 'setup-token'}\n")
 if moved:
-    sys.stderr.write(f"claude-swap run: the reserved sessions moved from #{moved} to #{n}"
+    sys.stderr.write(f"claude-swap run: {them} moved from #{moved} to #{n}"
                      " (the open ones follow within 30 s)\n")
 if own:
-    sys.stderr.write("claude-swap run: claude-swap <n> moves it, with the other reserved"
+    sys.stderr.write(f"claude-swap run: claude-swap <n> {k} moves it, with the other {k}"
+                     f" reserved sessions, to seat n of {k}\n" if k else
+                     "claude-swap run: claude-swap <n> moves it, with the other reserved"
                      " sessions, to reserved account n\n")
 if mode == "oauth":
     prof = acc.get("chrome_profile")
@@ -6407,12 +7139,12 @@ else:
         # the Claude in Chrome bridge turns setup-tokens away (missing scope)
         rest = [a for a in rest if a != "--chrome"]
         sys.stderr.write("claude-swap run: --chrome dropped (Claude in Chrome needs a full"
-                         " login: claude-swap auth " + str(n) + ")\n")
+                         " login: " + oauth.auth_hint(n, oauth.login_group(store, n, k)) + ")\n")
 
-env = {k: v for k, v in os.environ.items()
-       if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+env = {x: v for x, v in os.environ.items()
+       if x not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES",
-                    "CLAUDE_SWAP_ENGINE", "CLAUDE_SWAP_OAUTH")}
+                    "CLAUDE_SWAP_ENGINE", "CLAUDE_SWAP_OAUTH", "CLAUDE_SWAP_FROM_DIR")}
 if own:
     env["CLAUDE_CONFIG_DIR"] = own
     # detached, so it outlives this process turning into claude and leaves
@@ -6425,7 +7157,8 @@ if own:
 else:
     env["CLAUDE_CODE_OAUTH_TOKEN"] = acc["token"]
 # the statusline shows this account: the lane's, whichever it is by then
-env["CLAUDE_SWAP_PINNED"] = "reserved" if own else str(n)
+# (the default group's lane is still called reserved, as up to 1.20)
+env["CLAUDE_SWAP_PINNED"] = (k or "reserved") if own else str(n)
 os.execvpe("claude", ["claude"] + rest, env)
 PYEOF
   exec python3 -c "$run_py" "$STORE" "$@"
@@ -6458,34 +7191,23 @@ PYEOF
   read -r -p "Remove this account? (y/n) " confirm
   case "$confirm" in
     [yY]*)
-      python3 -c "
-import json, os, types
-with open('$STORE') as f:
-    d = json.load(f)
-target = $target
-gone = d['accounts'].pop(target - 1)
-live = d.get('live') or {}
-for k in ('n', 'from'):  # account numbers after the removed one move down
-    if live.get(k) == target:
-        live[k] = None
-    elif (live.get(k) or 0) > target:
-        live[k] -= 1
-if gone.get('email'):  # its saved full login and its Console session go too
-    oauth = types.ModuleType('oauth')
-    exec(os.environ['CLAUDE_SWAP_OAUTH'], oauth.__dict__)
+      python3 - "$STORE" "$target" <<'PYEOF'
+import os, sys, types
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+
+store_path, target = sys.argv[1], int(sys.argv[2])
+store = oauth.load_store(store_path)
+# out of the groups and the watch's lists too; the numbers after it move down
+gone, slots = oauth.remove_account(store, target)
+if slots:  # its saved full logins (main and per group) and its Console session go too
     secrets = oauth.default_io()[0]
-    if gone.get('oauth'):
-        secrets.delete(oauth.VAULT, oauth.slot(gone))
-    secrets.delete(oauth.VAULT, oauth.console_slot(gone['email']))
-active = d.get('active', 0)
-if active == target:
-    d['active'] = 1 if d['accounts'] else 0
-elif active > target:
-    d['active'] = active - 1
-with open('$STORE', 'w') as f:
-    json.dump(d, f, indent=2)
-print(f'Account {target} removed. Active: {d[\"active\"]}')
-"
+    for s in slots:
+        secrets.delete(oauth.VAULT, s)
+oauth.save_store(store_path, store)
+print(f"Account {target} removed. Active: {store['active']}")
+PYEOF
       ;;
     *)
       echo "Cancelled."
@@ -6552,7 +7274,7 @@ case "${1:-}" in
       stop) cmd_watch_stop ;;
       status) cmd_watch_status ;;
       reserved) shift 2; cmd_watch_reserved "$@" ;;
-      *) echo "Usage: claude-swap watch [start [--auto-reset]|stop|status|reserved [n ...|off]]"; exit 1 ;;
+      *) echo "Usage: claude-swap watch [start [--auto-reset]|stop|status|reserved [g] [n ...|off]]"; exit 1 ;;
     esac
     ;;
   add)

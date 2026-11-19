@@ -469,6 +469,73 @@ class LaneResets(unittest.TestCase):
         d = self.lane(self.rows({11: dict(u7=100), 13: dict(u5=100, r5=NOW + 5 * 60)}))
         self.assertEqual((d["action"], d["target"], d["grant"]["kind"]), ("reset", 11, "full"))
 
+    def test_a_reset_another_groups_lane_tried_on_a_shared_seat_counts(self):
+        # two groups' lanes on one seat spend one quota: a reset the other
+        # lane spent (or saw fail) there is not spent again by this one
+        rows = self.rows({13: dict(u5=100, r5=NOW + 2 * H)})
+        other = {"reset_tried": {"11:full": NOW - 60}, "set_by_watch": 13}
+        own = {"set_by_watch": 11, "reset_tried": {"13:full": NOW - 9 * H}}
+        view = E["with_resets_of"](own, [other])
+        d = E["lane_decide"](rows, 11, [11, 13], NOW, view, True, "Fable")
+        self.assertEqual(d["action"], "wall")
+        self.assertEqual(view["set_by_watch"], 11)  # the rest is this lane's own
+        self.assertEqual(view["reset_tried"], {"11:full": NOW - 60, "13:full": NOW - 9 * H})
+        self.assertEqual(own["reset_tried"], {"13:full": NOW - 9 * H})  # left as it was
+        failed = E["with_resets_of"](own, [{"reset_failed": ["11:full"]}, {"reset_failed": [11]}])
+        self.assertEqual(failed["reset_failed"], ["11:full", 11])
+        d = E["lane_decide"](rows, 11, [11, 13], NOW, failed, True, "Fable")
+        self.assertEqual(d["action"], "wall")
+        # the latest try counts, whichever lane made it
+        newer = E["with_resets_of"]({"reset_tried": {"11:full": NOW - 60}},
+                                    [{"reset_tried": {"11:full": NOW - 9 * H}}])
+        self.assertEqual(newer["reset_tried"]["11:full"], NOW - 60)
+        self.assertEqual(E["with_resets_of"](own, [])["reset_tried"], own["reset_tried"])
+
+
+class LanePass(unittest.TestCase):
+    """One look of the watch steps every group's lane on the same rows; a
+    reset one lane spends ends that look, since the others would decide on
+    figures it has just made stale."""
+
+    def test_the_lanes_are_stepped_in_order_until_one_spends_a_reset(self):
+        stepped = []
+
+        def step(k):
+            stepped.append(k)
+            return k == "kokoima"
+        self.assertEqual(E["step_lanes"]([None, "kokoima", "other"], step), [None, "kokoima"])
+        self.assertEqual(stepped, [None, "kokoima"])
+        self.assertEqual(E["step_lanes"]([None, "other"], step), [None, "other"])
+        self.assertEqual(E["step_lanes"]([], step), [])
+
+    def test_one_reset_per_look_on_seats_two_groups_share(self):
+        # clienta moves among #2 #3, kokoima among #3 #4; #3 is in both, every
+        # seat is at its limit, #3 and #4 each hold a full reset
+        rows = [acct(n, reserved=True, u5=100, u7=40, r5=NOW + 3 * H, r7=NOW + 100 * H,
+                     grants=[fgrant(five_hour=True, gid=f"f{n}")] if n in (3, 4) else [])
+                for n in (2, 3, 4)]
+        lanes = {None: ([2, 3], 3, {}), "kokoima": ([3, 4], 3, {})}
+        spent, stepped = [], []
+
+        def step(k):  # as the watch's lane_step, spending what it decides
+            stepped.append(k)
+            pool, on, mem = lanes[k]
+            others = [m for x, (_, _, m) in lanes.items() if x != k]
+            d = E["lane_decide"](rows, on, pool, NOW, E["with_resets_of"](mem, others),
+                                 True, "Fable")
+            if d and d["action"] == "reset":
+                mem.setdefault("reset_tried", {})[
+                    f"{d['target']}:{E['reset_key'](d['grant'])}"] = NOW
+                spent.append(d["target"])
+                return True
+            return False
+        self.assertEqual(E["step_lanes"]([None, "kokoima"], step), [None])
+        self.assertEqual((spent, stepped), ([3], [None]))
+        # without the stop, kokoima, still reading #3 at its limit, would
+        # spend #4's reset in the same look and leave the seat just freed
+        step("kokoima")
+        self.assertEqual(spent, [3, 4])
+
 
 class ResetOutcome(unittest.TestCase):
     """What a spent reset should leave, by its kind."""

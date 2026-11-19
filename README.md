@@ -402,8 +402,10 @@ over. Purchased (or free) credit in the same organization pays everything.
 | `claude-swap chrome [n\|all]` | Open the Chrome profile of account N (default: the active one); `chrome <n> "Profile 3"` sets it |
 | `claude-swap disable <n>` / `enable <n>` | Exclude/re-include an account (free accounts, etc.) |
 | `claude-swap reserve <n>` / `unreserve <n>` | Keep account N for sessions of its own: auto and the watch never use it |
-| `claude-swap watch reserved [n ...\|off]` | Reserved accounts the watch may move the reserved sessions among when theirs reaches its limit |
-| `claude-swap run [n] [-- <claude args>]` | Start `claude` on the reserved account the reserved sessions are on, whatever the shared login is (N: only while they are on none) |
+| `claude-swap watch reserved [group] [n ...\|off]` | Reserved accounts the watch may move a group's lane among when its seat reaches its limit (no group: the default one) |
+| `claude-swap run [n] [--group g] [-- <claude args>]` | Start `claude` on a group's lane (default group without `--group`), whatever the shared login is (N: joins the lane of its group) |
+| `claude-swap group [<g> <n ...>\|<g> off]` | Groups of reserved seats, each with a lane of its own; the first is the default. No argument: list them |
+| `claude-swap lane [g]` | Where each group's lane is, one line per group (`<group> <n\|-> <oauth\|setup\|->`), for scripts |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
@@ -567,6 +569,33 @@ As with any session, Claude in Chrome needs `--chrome`.
 
 Generate the setup-token in a throwaway config so the login in use is not
 touched: `CLAUDE_CONFIG_DIR=$(mktemp -d) claude setup-token`.
+
+#### Groups of reserved seats (1.21)
+
+When different work must stay on different seats (one client's sessions only
+on that client's seats), make groups. Each group has a lane of its own: its
+own config dir, its own seat, its own watch list. The first group is the
+default one and keeps the lane described above (`run/reserved`); the others
+get `run/lane-<group>`. A seat may be in several groups.
+
+```bash
+claude-swap group clienta 11 12 13      # the first group: the default lane
+claude-swap group studio 12 14          # another lane; #12 is in both
+claude-swap lane                        # clienta 12 oauth / studio 14 setup
+claude-swap run --group studio -- --chrome
+claude-swap 14 studio                   # move the studio lane (a seat in two groups needs the name)
+claude-swap watch reserved studio 12 14 # let the watch move it
+claude-swap auth 12 --group studio      # its own full login for the second group
+```
+
+A seat's full login belongs to its first group. In any other group it needs a
+login of its own (`auth <n> --group <g>`): two logins of one account are two
+independent refresh chains, while one login copied to two lanes would revoke
+itself on the first refresh. Without one, that lane runs on the setup-token
+(no Claude in Chrome). `check` shows a Free quota row and a Reserved order per
+group, `status` a line per lane; removing a group (`group <g> off`) retires
+its lane once no session runs on it. Without groups everything works as in
+1.20: one implicit group with every reserved account.
 
 ### Free limit resets
 
