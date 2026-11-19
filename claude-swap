@@ -1031,10 +1031,25 @@ def set_group(store, g, ns):
     else:
         store.pop("groups", None)
 
+def group_off_refusal(store, g):
+    """Why `group g off` must not happen, or None. The default group owns the
+    lane of today (store["lane"], run/reserved): removing it while others
+    exist would hand that lane to the next group."""
+    groups = store.get("groups") or {}
+    if g in groups and g == default_group(store) and len(groups) > 1:
+        return (f"{g} is the default group (its lane is the reserved sessions of today):"
+                " remove the other groups first")
+    return None
+
 def resolve_group(store, n, g=None, config_dir=None):
     """Whose lane `claude-swap n` moves -> (group, None) or (None, why)."""
     gs = groups_for(store, n)
     if not gs:
+        if store.get("groups"):
+            d = default_group(store)
+            seats = " ".join(str(k) for k in sorted(set(groups_of(store).get(d, [])) | {n}))
+            return None, (f"#{n} is in no group of reserved seats: to put it in {d},"
+                          f" claude-swap group {d} {seats}")
         return None, f"#{n} is in no group of reserved seats (claude-swap group)"
     if g:
         return (g, None) if g in gs else (None, f"#{n} is not in {g} (it is in {', '.join(gs)})")
@@ -5214,6 +5229,9 @@ g, rest = args[0], args[1:]
 if rest == ["off"]:
     if g not in (store.get("groups") or {}):
         sys.exit(f"Error: there is no group {g}")
+    why = oauth.group_off_refusal(store, g)
+    if why:
+        sys.exit(f"Error: {why}")
     if len(store["groups"]) == 1 and any(x[2] for x in oauth.reserved_sessions()):
         sys.exit(f"Error: {g} is the only group and sessions are open on its lane:"
                  " close them first")

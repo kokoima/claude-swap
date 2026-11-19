@@ -1026,6 +1026,22 @@ class Groups(Base):
         self.assertIsNone(g)
         self.assertIn("not in kokoima", err)
 
+    def test_a_seat_in_no_group_gets_the_command_that_puts_it_in_the_default(self):
+        self.store["accounts"][0]["reserved"] = True
+        O["set_group"](self.store, "cobas", [2, 3])
+        g, err = O["resolve_group"](self.store, 1)
+        self.assertIsNone(g)
+        self.assertIn("claude-swap group cobas 1 2 3", err)
+
+    def test_the_default_group_cannot_go_while_others_exist(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        self.assertIsNone(O["group_off_refusal"](self.store, "cobas"))
+        O["set_group"](self.store, "kokoima", [3])
+        why = O["group_off_refusal"](self.store, "cobas")
+        self.assertIn("cobas is the default group", why)
+        self.assertIn("remove the other groups first", why)
+        self.assertIsNone(O["group_off_refusal"](self.store, "kokoima"))
+
 
 if __name__ == "__main__":
     unittest.main()
