@@ -2686,7 +2686,7 @@ class GeneralGroup(Base):
                        if m), None)
             self.assertIn(fn, allowed, f"line {i + 1} reads the reserved mark: {line.strip()}")
         src = "\n".join(lines)
-        self.assertEqual(src.count('"reserved": not oauth.in_general('), 2)  # check, watch
+        self.assertEqual(src.count('"reserved": not oauth.in_general('), 3)  # check, watch, web
         self.assertIn("oauth.in_general(store, n)", src[src.index("cmd_auto() {"):
                                                          src.index("_do_rotate() {")])
         # after `auth <n>`, a lane seat in general too is told of its lanes
@@ -4115,7 +4115,7 @@ class GeneralShown(Base):
         with open(SCRIPT) as f:
             src = f.read()
         for call in ("oauth.active_line(store)", "oauth.watch_running(store, ws, wpid)",
-                     "oauth.general_head(store)", "oauth.order_head(store, g, many)",
+                     "oauth.general_head(store)", "oauth.order_head(store, g, many,",
                      "oauth.watch_marked(store, oauth.GENERAL)", "engine.general_now(",
                      "oauth.shared_note(store)", "oauth.group_lines(store)",
                      "oauth.auth_footer(store)", "oauth.auth_none_left(store)"):

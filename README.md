@@ -325,6 +325,36 @@ claude-swap watch stop && claude-swap watch start --auto-reset
 The other thresholds are constants at the top of the script (`ROOM_5H`,
 `ROOM_7D`, `LAST_DAY`, `MIN_DWELL`…).
 
+### Order criteria (1.23)
+
+Every order table (`check`, the interactive menu, the web page) and every
+group's watch can go by one of five criteria. `caduca` is the default and
+is exactly the order of earlier versions:
+
+| Key | Puts first |
+|-----|------------|
+| `caduca` | What is lost first: quota that lapses (weekly renewal or plan end) soonest |
+| `sin-cortes` | The longest run without a cut: the room left on the tightest limit, in 5-hour windows. Each limit is timed at its own pace, measured from the watch log (a full 5h window costs about 25% of the week on Max 20x, 17% on Team); a 5h window that is not running does not count |
+| `libre` | The most free right now: the lowest of 5h, week and the model's limit |
+| `semana` | The most week left |
+| `libera` | What frees up first: the 5h window that renews soonest (useful at the wall) |
+
+Accounts at a limit stay last, except under `libera`, which ranks them by
+when they free up.
+
+```bash
+claude-swap check --order sin-cortes     # show every order table by that criterion
+claude-swap watch general order libre    # general's watch goes by it from now on
+claude-swap watch studio order caduca    # back to the default
+```
+
+In the menu, `o` shows the next criterion and `o1`–`o5` picks one. Under
+`libre`, `semana` and `sin-cortes` the watch uses the criterion to choose
+where to go when it has to leave an account; it does not switch back on
+its own to a better-ranked one, so as not to rebuild prompt caches every
+few minutes. The margin, reset and one-reset-per-look rules are the same
+under every criterion.
+
 ### Model limits and reset kinds
 
 Besides the 5h and the week, claude.ai has a weekly limit per model
@@ -379,6 +409,57 @@ over. Purchased (or free) credit in the same organization pays everything.
 - `check` prints those warnings from the cache under `API credits:`
   (and how old the cache is, past a day). It does not call the Console.
 
+## Web page (1.23)
+
+```bash
+claude-swap web start          # LaunchAgent on http://127.0.0.1:10002
+claude-swap web status
+claude-swap web devices        # the tailnet's devices, and which may use the page
+claude-swap web devices laptop phone   # only these (names or tailnet IPs)
+claude-swap web devices any    # every device of the allowed logins again
+claude-swap web stop
+```
+
+One page with everything `check` shows: where the shared login and each
+lane are, the free quota per group, every account's bars, plan, renewal,
+resets and Chrome login, the calendar, the warnings and the watch log.
+From it you can switch the shared login, move a group's lane, turn each
+group's watch on or off and set its seats, resets and order, start or
+stop the watch, and spend a free reset (it shows what the reset clears
+first and asks you to type «si»). It cannot add or remove accounts, sync
+keys, log in or edit groups. Every action runs `claude-swap` itself with
+a fixed list of allowed commands.
+
+It reads only local files (no network); **Refresh** runs `check` in the
+background, at most once a minute.
+
+**On the tailnet** — the server listens on 127.0.0.1 only. Publish it with
+Tailscale Serve, **in HTTP mode, never Funnel**:
+
+```bash
+tailscale serve --bg --https=10002 http://127.0.0.1:10002
+```
+
+- Who may use it: requests through Serve must carry the
+  `Tailscale-User-Login` of the node's owner, or, when the store has a
+  `web.allow` list, of one of the logins in it (the list replaces the
+  owner: include yours). A request with no proxy headers is accepted only
+  when it is addressed to 127.0.0.1/localhost, i.e. from this machine.
+- Which devices: `web devices <name|ip>…` limits it to those devices,
+  matched by the address Serve reports. Each choice is saved as the
+  device's stable node ID, so renaming a device keeps it in and another
+  device taking its name does not get in; a device registered again must
+  be chosen again. Without a list, any device signed in with an allowed
+  login may use it — servers included.
+- Do not publish the port with `tailscale serve --tcp` or
+  `--tls-terminated-tcp`: those pass the client's own headers through
+  untouched, so any device on the tailnet could claim the owner's login.
+- POSTs need a per-session CSRF token and a matching `Origin`. The page
+  never receives setup-tokens, sessionKeys or logins: only what `check`
+  shows.
+- After installing a new version of the script, run `web stop` and
+  `web start`: the server keeps the old page and engine in memory.
+
 ## Commands
 
 | Command | Description |
@@ -386,14 +467,15 @@ over. Purchased (or free) credit in the same organization pays everything.
 | `claude-swap` | Interactive: dashboard + switch prompt |
 | `claude-swap <n>` | Switch to account N |
 | `claude-swap status` | Current account + watcher state |
-| `claude-swap check` | Full dashboard (limits, calendar, watcher order) |
+| `claude-swap check [--order <key>]` | Full dashboard (limits, calendar, watcher order); `--order` ranks every order table by that criterion (see Order criteria) |
 | `claude-swap auto` | Auto-switch to the best available account |
 | `claude-swap model [name]` | The model the sessions use (default `fable`): its weekly limit counts like the 5h and the week |
 | `claude-swap credits [n]` | API credits per account and Console organization: included credit and when it lapses, purchased credit, month spend against the cap, tier, active keys (read-only) |
 | `claude-swap watch start [--auto-reset]` | Background auto-switcher (LaunchAgent on macOS) — see watch mode |
 | `claude-swap watch stop` | Stop the watcher |
 | `claude-swap watch status` | Watcher state + last probe + log tail |
-| `claude-swap reset <n> [full\|fable] [--grant <id>] [--yes]` | Spend one of account N's free resets, by kind (default: what helps now); shows what it clears, asks for `yes` unless `--yes` |
+| `claude-swap watch <g> [on\|off \| seats <n ...>\|all \| resets on\|off \| order <key>]` | Group g's own watch: on or off, the seats it moves among, whether it spends free resets, the order it goes by |
+| `claude-swap reset <n> [full\|fable] [--grant <id>] [--yes\|--preview]` | Spend one of account N's free resets, by kind (default: what helps now); shows what it clears, asks for `yes` unless `--yes`; `--preview` only shows it and the grant id |
 | `claude-swap add [--reserved]` | Add a new account (`--reserved`: see Reserved accounts) |
 | `claude-swap remove <n>` | Remove an account |
 | `claude-swap key <n>` | Set a claude.ai sessionKey manually |
@@ -406,6 +488,8 @@ over. Purchased (or free) credit in the same organization pays everything.
 | `claude-swap run [n] [--group g] [-- <claude args>]` | Start `claude` on a group's lane (default group without `--group`), whatever the shared login is (N: joins the lane of its group) |
 | `claude-swap group [<g> <n ...>\|<g> off]` | Groups of reserved seats, each with a lane of its own; the first is the default. No argument: list them |
 | `claude-swap lane [g]` | Where each group's lane is, one line per group (`<group> <n\|-> <oauth\|setup\|->`), for scripts |
+| `claude-swap web [start\|stop\|status]` | The web page (see Web page) |
+| `claude-swap web devices [<name\|ip> ...\|any]` | Which tailnet devices may use the web page |
 | `claude-swap init` | Guided first-time setup (accounts → sessionKeys → watcher) |
 
 Short aliases: `s` (status), `c` (check), `a` (auto), `ks` (keys-sync).
@@ -666,6 +750,7 @@ Everything lives locally under `~/.claude/`:
 | `~/Library/LaunchAgents/com.claude-swap.watch.plist` | The watcher's LaunchAgent (macOS, while it runs) |
 | Keychain, service `claude-swap` | Each account's full login for Claude in Chrome (refresh token included), one entry per email. The store only keeps fingerprints and expiry dates of it |
 | `~/.claude-swap/run/reserved/` | The Claude Code config the reserved sessions (`run`) share: links into `~/.claude`, plus its `.claude.json`, policies and caches. Its credential is the keychain item `Claude Code-credentials-<hash of the path>`, which holds the login of the reserved account they are on |
+| `claude-swap-web.pid` / `.log`, `~/Library/LaunchAgents/com.claude-swap.web.plist` | The web server's process id and port, its log, and its LaunchAgent (while it runs) |
 | `claude-swap-usage.json` | Last usage snapshot for every account, rewritten by `check` and by the watcher. Percentages, free resets left, labels — no credentials — meant for read-only consumers such as a status line |
 
 Tokens are only ever sent to `api.anthropic.com` (and refresh tokens to
