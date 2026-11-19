@@ -2460,5 +2460,28 @@ class Shown(Base):
         self.assertEqual(why(self.store, 3, "NO TOKEN", None, False), "no token")
 
 
+class SessionsDespiteBadBytes(unittest.TestCase):
+    """`ps` may list another process whose arguments are not UTF-8: the
+    reserved sessions must still be found (they were all missed, so status
+    said 0 open sessions and a lane could be retired under them)."""
+
+    def test_a_non_utf8_process_does_not_hide_the_sessions(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        lane = os.path.join(d, "run", "reserved")
+        os.makedirs(lane)
+        ps = os.path.join(d, "ps")
+        with open(ps, "wb") as f:
+            f.write(b"#!/bin/sh\nprintf '"
+                    + b"  7 ssh host echo == servidor \\267 x\\n"
+                    + b"  8 claude --resume CLAUDE_SWAP_PINNED=reserved CLAUDE_CONFIG_DIR="
+                    + lane.encode() + b"\\n'\n")
+        os.chmod(ps, 0o755)
+        with mock.patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ["PATH"]}), \
+                mock.patch.dict(O, {"RUN_BASE": os.path.join(d, "run")}):
+            found = O["reserved_sessions"]()
+        self.assertEqual([(pid, cfg) for pid, _, cfg in found], [(8, os.path.realpath(lane))])
+
+
 if __name__ == "__main__":
     unittest.main()

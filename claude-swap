@@ -22,7 +22,7 @@
 
 set -e
 
-VERSION="1.21.0"
+VERSION="1.21.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -2535,8 +2535,10 @@ def reserved_sessions(base=None):
     others, which carry a setup-token in their environment that pins them
     until restarted."""
     try:
+        # errors="replace": another process's arguments may hold bytes that
+        # are not UTF-8, which must not hide every session
         out = subprocess.run(["ps", "eww", "-axo", "pid=,command="], capture_output=True,
-                             text=True, timeout=10).stdout
+                             text=True, errors="replace", timeout=10).stdout
     except Exception:
         return []
     found = []
@@ -3160,7 +3162,7 @@ def session_token():
 
     def ps(*args):
         return subprocess.run(["ps", *args], capture_output=True, text=True,
-                               timeout=5).stdout.strip()
+                               errors="replace", timeout=5).stdout.strip()
     pid = os.getppid()
     for _ in range(12):
         if pid <= 1:
