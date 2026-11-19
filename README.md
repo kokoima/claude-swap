@@ -570,6 +570,37 @@ As with any session, Claude in Chrome needs `--chrome`.
 Generate the setup-token in a throwaway config so the login in use is not
 touched: `CLAUDE_CONFIG_DIR=$(mktemp -d) claude setup-token`.
 
+#### Everything is a group: general (1.22)
+
+The shared login (`cl`, `~/.claude`) is a group too: **general**. Any account,
+Max or Team, can be in any groups, several at once.
+
+```bash
+claude-swap group general add 11 12     # Team seats usable by cl as well
+claude-swap group general rm 4          # cl never uses #4 again
+claude-swap group studio copy clienta   # same seats as another group
+claude-swap 12 general                  # put cl on #12
+claude-swap 12 clienta                  # move clienta's lane to #12
+claude-swap watch general seats 1 2 3   # the watch rotates cl among these only
+claude-swap watch studio on             # a watch per group: on/off,
+claude-swap watch studio resets off     #   seats and free resets
+```
+
+- **Logins.** An account's full login belongs to its first group in the
+  store's order (`claude-swap group` lists them; general is added last when it
+  is created). Elsewhere it needs a login of its own,
+  `claude-swap auth <n> --group <g>`, or it runs on its setup-token (no Claude
+  in Chrome). So a Team seat whose first group is a lane keeps its login there,
+  and `cl` on it uses the setup-token until `auth <n> --group general`.
+- **Watches.** Each group's watch is on or off, moves among its seats (all of
+  them unless `seats` says otherwise) and spends free resets only if allowed:
+  for general, only on its seat list. At most one reset is spent per look.
+  `watch start` without `--auto-reset` turns general's resets off.
+- **Inside a lane session**, a bare `claude-swap <n>` for an account that is
+  also in general is refused: name the place (`<n> general` or `<n> <group>`).
+- Without a general group the store works exactly as in 1.21; the first
+  `group general …` command creates it from the accounts not reserved.
+
 #### Groups of reserved seats (1.21)
 
 When different work must stay on different seats (one client's sessions only

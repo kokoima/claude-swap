@@ -537,6 +537,147 @@ class LanePass(unittest.TestCase):
         self.assertEqual(spent, [3, 4])
 
 
+class GeneralWatch(unittest.TestCase):
+    """The shared login's watch (1.22: general is a group with a watch of its
+    own): all of general is decide as up to 1.21; a list of seats keeps it on
+    those. The shared login is the one place sessions must always have, so
+    an account outside the list is kept only as decide keeps any (a pick by
+    hand, until it is blocked), unlike a lane on a seat outside its list."""
+
+    def watch(self, rows, active, seats, state=None, auto_reset=False):
+        return E["watch_decide"](rows, active, seats, NOW, state or LONG_AGO, auto_reset)
+
+    def test_all_of_general_is_decide_as_up_to_1_21(self):
+        for over, auto in (({3: {"u5": 100}}, False), ({1: {"grants": [fgrant()]}}, True),
+                           ({}, False)):
+            rows = today(over)
+            self.assertEqual(self.watch(rows, 3, None, auto_reset=auto),
+                             decide(rows, 3, LONG_AGO, auto_reset=auto))
+
+    def test_a_list_keeps_the_shared_login_on_its_seats(self):
+        # #5 would be next; only #2 and #3 are the watch's
+        rows = today({3: {"u5": 100}})
+        self.assertEqual(decide(rows, 3, LONG_AGO)["target"], 5)
+        d = self.watch(rows, 3, [2, 3])
+        self.assertEqual((d["action"], d["target"]), ("switch", 2))
+        d = self.watch(today({3: {"u5": 100}, 2: {"u5": 100}}), 3, [2, 3])
+        self.assertEqual(d["action"], "wall")
+
+    def test_a_pick_by_hand_outside_the_list_stays_until_it_is_blocked(self):
+        d = self.watch(today(), 5, [2, 3], {"manual": True})
+        self.assertEqual((d["action"], d["target"]), ("stay", 5))
+        # at its limit it moves, onto the list (#8, next outside it, is not the watch's)
+        d = self.watch(today({5: {"u7": 100}}), 5, [2, 3], {"manual": True})
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+
+    def test_the_watchs_own_placement_outside_the_list_moves_onto_it(self):
+        # left there before the list was set: back to the list after the dwell
+        d = self.watch(today(), 5, [2, 3])
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+
+    def test_no_active_account_picks_one_of_the_list(self):
+        d = self.watch(today(), 0, [2, 3])
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+        d = self.watch(today({1: {"u5": 0}}), 0, [2])
+        self.assertEqual((d["action"], d["target"]), ("switch", 2))
+
+    def test_its_resets_are_spent_on_its_seats_only(self):
+        rows = today({1: {"grants": [fgrant()]}})
+        self.assertEqual(self.watch(rows, 3, [1, 3], auto_reset=True)["target"], 1)
+        d = self.watch(rows, 3, [2, 3], auto_reset=True)
+        self.assertNotEqual(d["action"], "reset")
+
+    def test_the_active_account_outside_the_list_never_has_its_reset_spent(self):
+        # cl on #5, picked by hand outside the list, its week spent, holding a
+        # full reset: without a list that reset is spent; with one, cl moves
+        rows = today({5: {"u7": 100, "grants": [fgrant()]}})
+        d = self.watch(rows, 5, None, {"manual": True}, auto_reset=True)
+        self.assertEqual((d["action"], d["target"]), ("reset", 5))
+        d = self.watch(rows, 5, [2, 3], {"manual": True}, auto_reset=True)
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+        # a row without grants (resets counted only) neither
+        rows = today({5: {"u7": 100, "resets": 1, "resets_ends": NOW + 500 * H}})
+        self.assertEqual(self.watch(rows, 5, None, auto_reset=True)["action"], "reset")
+        d = self.watch(rows, 5, [2, 3], auto_reset=True)
+        self.assertEqual((d["action"], d["target"]), ("switch", 3))
+
+    def test_check_says_what_generals_watch_would_do(self):
+        # check's «Now:» never spends a reset; with all of general it is decide
+        rows = today({3: {"u5": 100}, 1: {"grants": [fgrant()]}})
+        self.assertEqual(E["general_now"](rows, 3, (True, None, True), NOW),
+                         (decide(rows, 3), True))
+        d, watched = E["general_now"](rows, 3, (True, [2, 3], True), NOW)
+        self.assertEqual((d["action"], d["target"], watched), ("switch", 2, True))
+        # its watch off: the best account to put cl on by hand, among all of general
+        d, watched = E["general_now"](rows, 3, (False, [2, 3], True), NOW)
+        self.assertEqual((d["action"], d["target"], watched), ("switch", 5, False))
+
+
+class WatchPass(unittest.TestCase):
+    """One look of the watch (1.22): the shared login's turn first
+    (general_step), then each group's lane (step_lanes), and a seat can be in
+    general and in a lane group: at most one reset per look among all of
+    them, and a reset either tried on a shared seat counts for the other
+    (with_resets_of)."""
+
+    def rows(self):
+        # #3 in general and in kokoima, its week spent, with a full reset;
+        # #4, kokoima's other seat, at its 5h
+        return [acct(3, u7=100, r7=NOW + 100 * H, grants=[fgrant(gid="f3")]),
+                acct(4, u5=100, u7=40, r5=NOW + 3 * H, r7=NOW + 100 * H)]
+
+    def look(self, rows, watch, general, lane, spent):
+        """A look as the watch takes it: general_step's turn, then the lane's,
+        each marking the reset it spends on its own memory."""
+        def mark(mem, d):
+            mem.setdefault("reset_tried", {})[
+                f"{d['target']}:{E['reset_key'](d['grant'])}"] = NOW
+
+        def step(k):
+            if k == "general":
+                d, _, ends = E["general_step"](rows, 3, watch, NOW, general, [lane])
+                if ends:
+                    mark(general, d)
+                    spent.append((k, d["target"]))
+                return ends
+            d = E["lane_decide"](rows, 3, [3, 4], NOW, E["with_resets_of"](lane, [general]), True)
+            if d and d["action"] == "reset":
+                mark(lane, d)
+                spent.append((k, d["target"]))
+                return True
+            return False
+        return E["step_lanes"](["general", None], step)
+
+    def test_the_shared_logins_reset_ends_the_look(self):
+        rows, general, lane, spent = self.rows(), dict(LONG_AGO), {}, []
+        self.assertEqual(self.look(rows, (True, None, True), general, lane, spent), ["general"])
+        self.assertEqual(spent, [("general", 3)])
+        # the next look, on rows claude.ai has not caught up with yet: the
+        # lane does not spend #3's reset again, nor does the shared login
+        self.assertEqual(self.look(rows, (True, None, True), general, lane, spent),
+                         ["general", None])
+        self.assertEqual(spent, [("general", 3)])
+
+    def test_a_lanes_reset_on_a_shared_seat_counts_for_the_shared_login(self):
+        rows = self.rows()
+        lane = {"reset_tried": {"3:full": NOW - 60}}
+        d, why, ends = E["general_step"](rows, 3, (True, None, True), NOW, LONG_AGO, [lane])
+        self.assertEqual((d["action"], ends, why), ("wall", False, d["reason"]))
+        d, _, ends = E["general_step"](rows, 3, (True, None, True), NOW, LONG_AGO, [])
+        self.assertEqual((d["action"], d["target"], ends), ("reset", 3, True))
+        self.assertEqual(LONG_AGO, {"last_switch": NOW - 10 * H})  # read, never written
+
+    def test_general_without_resets_or_off_leaves_the_reset_to_the_lane(self):
+        rows, general, lane, spent = self.rows(), dict(LONG_AGO), {}, []
+        d, _, ends = E["general_step"](rows, 3, (True, None, False), NOW, general, [lane])
+        self.assertEqual((d["action"], ends), ("wall", False))
+        self.assertEqual(E["general_step"](rows, 3, (False, None, True), NOW, general, [lane]),
+                         (None, E["GENERAL_OFF"], False))
+        self.assertEqual(self.look(rows, (False, None, True), general, lane, spent),
+                         ["general", None])
+        self.assertEqual(spent, [(None, 3)])
+
+
 class ResetOutcome(unittest.TestCase):
     """What a spent reset should leave, by its kind."""
 

@@ -1824,8 +1824,8 @@ class GroupCommands(Base):
         self.assertEqual(O["run_seat"](self.store, None, "kokoima", False),
                          ("kokoima", 3, None, None))
 
-    def test_a_move_hint_names_the_group_when_it_must_or_it_is_not_the_default(self):
-        self.assertEqual(O["move_hint"](self.store, 2, "clienta"), "claude-swap 2")
+    def test_a_move_hint_names_the_group_once_the_store_has_groups(self):
+        self.assertEqual(O["move_hint"](self.store, 2, "clienta"), "claude-swap 2 clienta")
         self.assertEqual(O["move_hint"](self.store, 3, "clienta"), "claude-swap 3 clienta")
         self.assertEqual(O["move_hint"](self.store, 3, "kokoima"), "claude-swap 3 kokoima")
         self.store.pop("groups")
@@ -1834,10 +1834,11 @@ class GroupCommands(Base):
     # the watch, per group
 
     def test_the_watch_moves_a_lane_by_the_command_a_user_would_type(self):
-        # the default group's lane by its number alone, as up to 1.20, unless
-        # the seat is shared (claude-swap 3 alone would ask which lane)
-        self.assertEqual(O["move_args"](self.store, 2, None), ["2"])
-        self.assertEqual(O["move_args"](self.store, 2, "clienta"), ["2"])
+        # the group named once the store has lane groups, so a lane's move is
+        # never a bare number (which moves cl for a seat in general); by its
+        # number alone in a store without groups, as up to 1.20
+        self.assertEqual(O["move_args"](self.store, 2, None), ["2", "clienta"])
+        self.assertEqual(O["move_args"](self.store, 2, "clienta"), ["2", "clienta"])
         self.assertEqual(O["move_args"](self.store, 3, None), ["3", "clienta"])
         self.assertEqual(O["move_args"](self.store, 3, "kokoima"), ["3", "kokoima"])
         self.store.pop("groups")
@@ -2458,6 +2459,1667 @@ class Shown(Base):
         self.assertEqual(why(self.store, 4, "AUTH ERROR", "default_raven", False), "in no group")
         del self.store["accounts"][2]["token"]  # listed in clienta, but no token
         self.assertEqual(why(self.store, 3, "NO TOKEN", None, False), "no token")
+
+
+
+class GeneralGroup(Base):
+    """general, the shared login's group (1.22): who may be the login of
+    ~/.claude (cl). Without groups.general it is every account not marked
+    reserved, as up to 1.21; migrate_general writes that list, last in the
+    groups, and from then on the list rules and the mark follows it (for
+    the scripts and menus of before). A lane group's seat may be in general
+    too: it is a seat of that group all the same."""
+    def setUp(self):
+        super().setUp()
+        self.store["accounts"].append({"label": "acc4", "email": "a4@x.io",
+                                       "token": "sk-ant-oat01-setup4",
+                                       "expires": int((NOW + 300 * 86400) * 1000)})
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+
+    def marks(self):
+        return [bool(a.get("reserved")) for a in self.store["accounts"]]
+
+    def edit(self, g, *args):
+        return O["group_edit"](self.store, g, list(args))
+
+    # editing general and naming groups
+
+    def test_a_bare_list_for_general_that_takes_accounts_out_asks_for_yes(self):
+        self.assertEqual(self.edit("general", "1"),
+                         (None, "Error: this takes #4 out of general (cl): add --yes, or use"
+                                " group general add/rm"))
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [1, 2, 4])
+        self.assertEqual(self.edit("general", "3"),
+                         (None, "Error: this takes #1, #2, #4 out of general (cl): add --yes,"
+                                " or use group general add/rm"))
+        self.assertEqual(self.edit("general", "1", "--yes"), ([1], None))
+        self.assertEqual(self.edit("general", "--yes", "4", "1"), ([4, 1], None))
+        # a list that keeps every account in it, add and rm need nothing more
+        self.assertEqual(self.edit("general", "1", "2", "4", "3"), ([1, 2, 4, 3], None))
+        self.assertEqual(self.edit("general", "rm", "4"), ([1, 2], None))
+        self.assertEqual(self.edit("general", "add", "3", "--yes"), ([1, 2, 4, 3], None))
+        # a lane group's list as before
+        O["set_group"](self.store, "clienta", [2, 3])
+        self.assertEqual(self.edit("clienta", "3"), ([3], None))
+        self.assertEqual(self.edit("clienta", "3", "--yes"),
+                         (None, "Error: account --yes does not exist (valid: 1-4)"))
+
+    def test_the_words_of_the_commands_are_never_a_new_groups_name(self):
+        for w in ("start", "stop", "status", "run", "help", "off", "all", "seats",
+                  "resets", "on"):
+            self.assertEqual(self.edit(w, "2"),
+                             (None, f"Error: '{w}' is a word of claude-swap's commands,"
+                                    " never a group's name"), w)
+        self.assertIsNone(self.edit("reserved", "2")[0])
+        # a group of before so named can still be edited
+        self.store["groups"] = {"on": ["a2@x.io"]}
+        self.assertEqual(self.edit("on", "add", "3"), ([2, 3], None))
+
+    # membership
+
+    def test_without_general_it_is_the_accounts_not_reserved(self):
+        self.assertEqual(O["general_of"](self.store), [1, 4])
+        self.assertEqual([O["in_general"](self.store, n) for n in (1, 2, 3, 4)],
+                         [True, False, False, True])
+        self.assertEqual([O["is_reserved"](self.store, n) for n in (1, 2, 3, 4)],
+                         [False, True, True, False])
+        # live accounts only: one disabled, or with no token, is in neither
+        self.store["accounts"][3]["disabled"] = True
+        del self.store["accounts"][2]["token"]
+        self.assertEqual(O["general_of"](self.store), [1])
+        self.assertFalse(O["is_reserved"](self.store, 3))
+        self.assertFalse(O["is_reserved"](self.store, 4))
+        self.assertNotIn("groups", self.store)
+
+    def test_migration_writes_general_last_and_keeps_the_default_group(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["set_group"](self.store, "studio", [3])
+        self.store["accounts"][3]["disabled"] = True  # listed: back in general when enabled
+        seats = O["groups_of"](self.store)
+        self.assertTrue(O["migrate_general"](self.store))
+        self.assertEqual(list(self.store["groups"]), ["clienta", "studio", "general"])
+        self.assertEqual(self.store["groups"]["general"], ["a1@x.io", "a4@x.io"])
+        self.assertEqual(O["default_group"](self.store), "clienta")
+        self.assertEqual(O["groups_of"](self.store), seats)
+        self.assertEqual(O["general_of"](self.store), [1])
+        self.assertEqual(self.marks(), [False, True, True, False])
+        # once is enough
+        snap = json.dumps(self.store, sort_keys=True)
+        self.assertFalse(O["migrate_general"](self.store))
+        self.assertEqual(json.dumps(self.store, sort_keys=True), snap)
+
+    def test_migration_drops_the_listed_accounts_that_were_no_seats(self):
+        # up to 1.21 unreserve left an account in its groups' lists, where it
+        # was no seat (a seat had to be reserved). With general every listed
+        # live account is one: those entries go, so the seats stay the same
+        O["set_group"](self.store, "clienta", [1, 2, 3])  # #1, active, not reserved
+        O["set_group"](self.store, "studio", [1, 3, 4])
+        self.store["accounts"][2]["disabled"] = True  # reserved: a seat again when enabled
+        self.store["groups"]["clienta"].append("gone@x.io")  # no account: no seat either way
+        seats = O["groups_of"](self.store)
+        self.assertEqual(seats, {"clienta": [2], "studio": []})
+        dropped = []
+        self.assertTrue(O["migrate_general"](self.store, dropped))
+        self.assertEqual(O["groups_of"](self.store), seats)
+        self.assertEqual(dropped, [("clienta", "a1@x.io"), ("studio", "a1@x.io"),
+                                   ("studio", "a4@x.io")])
+        self.assertEqual(self.store["groups"], {
+            "clienta": ["a2@x.io", "a3@x.io", "gone@x.io"], "studio": ["a3@x.io"],
+            "general": ["a1@x.io", "a4@x.io"]})
+        self.assertEqual(O["default_group"](self.store), "clienta")
+        self.store["accounts"][2].pop("disabled")
+        self.assertEqual(O["groups_of"](self.store), {"clienta": [2, 3], "studio": [3]})
+        self.assertFalse(O["migrate_general"](self.store, dropped))
+        self.assertEqual(len(dropped), 3)
+
+    def test_script_group_general_tells_what_the_migration_dropped(self):
+        O["set_group"](self.store, "clienta", [1, 2, 3])
+        r = self.sh("group", "general", "add", "3")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(O["load_store"](self.store_path)["groups"]["clienta"],
+                         ["a2@x.io", "a3@x.io"])
+        self.assertTrue(r.stdout.startswith(
+            "#1 a1@x.io taken out of clienta: it was not reserved, so it was no seat of it"
+            " (claude-swap group clienta add 1 makes it one)\n"), r.stdout)
+
+    def test_migration_of_a_store_without_groups_keeps_the_implicit_group(self):
+        self.assertTrue(O["migrate_general"](self.store))
+        self.assertEqual(self.store["groups"], {"general": ["a1@x.io", "a4@x.io"]})
+        self.assertEqual(O["default_group"](self.store), "reserved")
+        self.assertEqual(O["groups_of"](self.store), {"reserved": [2, 3]})
+        self.assertIsNone(O["lane_key"](self.store, "reserved"))
+        self.assertEqual(O["run_seat"](self.store, 2), ("reserved", 2, None, None))
+        self.assertEqual(O["run_seat"](self.store, 1), (None, 1, None, None))
+        self.assertEqual(O["resolve_group"](self.store, 1),
+                         (None, "#1 is in no group of reserved seats (claude-swap group)"))
+
+    def test_with_general_the_list_rules_and_the_mark_follows_it(self):
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [1, 2])
+        self.assertEqual(O["general_of"](self.store), [1, 2])
+        self.assertEqual([O["is_reserved"](self.store, n) for n in (1, 2, 3, 4)],
+                         [False, False, True, True])
+        self.assertEqual(self.marks(), [False, False, True, True])
+        # a mark out of line is not what counts
+        self.store["accounts"][0]["reserved"] = True
+        self.assertTrue(O["in_general"](self.store, 1))
+        self.assertEqual(O["general_of"](self.store), [1, 2])
+
+    def test_general_is_in_the_stores_order(self):
+        O["set_group"](self.store, "general", [4, 1])
+        self.assertEqual(O["general_of"](self.store), [1, 4])
+
+    def test_general_may_be_left_empty_but_stays(self):
+        O["set_group"](self.store, "general", [])
+        self.assertEqual(self.store["groups"], {"general": []})
+        self.assertEqual(O["general_of"](self.store), [])
+        self.assertEqual(self.marks(), [True, True, True, True])
+        self.assertEqual(O["groups_of"](self.store), {"reserved": [1, 2, 3, 4]})
+
+    def test_an_account_with_no_email_goes_by_its_mark(self):
+        # groups list emails: one with none cannot be listed, so its mark stands
+        self.store["accounts"][3]["email"] = ""
+        O["migrate_general"](self.store)
+        self.assertEqual(self.store["groups"]["general"], ["a1@x.io"])
+        self.assertEqual(O["general_of"](self.store), [1, 4])
+        O["set_group"](self.store, "general", [1, 2])
+        self.assertEqual(O["general_of"](self.store), [1, 2, 4])
+        self.assertNotIn("reserved", self.store["accounts"][3])
+
+    def test_a_seat_in_general_and_in_clienta_is_a_seat_of_clienta(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [1, 2, 4])
+        self.assertEqual(O["groups_of"](self.store), {"clienta": [2, 3]})
+        self.assertEqual(O["groups_for"](self.store, 2), ["clienta"])
+        self.assertTrue(O["in_general"](self.store, 2))
+        self.assertFalse(O["is_reserved"](self.store, 2))
+        O["set_lane_rec"](self.store, None, {"n": 2, "mode": "setup", "at": NOW, "from": None})
+        self.assertEqual(O["lane_of"](self.store), 2)
+        self.assertEqual(O["run_seat"](self.store, 2), ("clienta", 2, None, None))
+        self.assertEqual(O["order_tables"](self.store), [("clienta", [2, 3], [])])
+        # any account, one never reserved too
+        O["set_group"](self.store, "clienta", [1, 2, 3])
+        self.assertEqual(O["groups_of"](self.store), {"clienta": [1, 2, 3]})
+        self.store["lane_rotate"] = ["a1@x.io", "a2@x.io"]
+        self.assertEqual(O["rotation"](self.store), [1, 2])
+        self.assertEqual(O["watch_reserved"](self.store, ["1", "3"]), (None, None))
+
+    def test_a_lane_knows_the_logins_of_a_seat_in_general(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["set_group"](self.store, "general", [1, 2, 4])
+        self.store["accounts"][1].pop("reserved", None)  # no mark: it is in general
+        self.give(2, login("two"))
+        self.give(1, login("one"))
+        self.assertEqual(O["lane_owner"](login("two"), self.store), (2, None, []))
+        # an account of general alone is no lane's
+        self.assertEqual(O["lane_owner"](login("one"), self.store), (None, None, []))
+
+    def test_without_general_a_listed_account_not_reserved_is_no_seat(self):
+        O["set_group"](self.store, "clienta", [1, 2])
+        self.assertEqual(O["groups_of"](self.store), {"clienta": [2]})
+        self.assertEqual(O["watch_reserved"](self.store, ["1", "2"])[1],
+                         "Error: account 1 is not reserved: the watch moves it as the"
+                         " shared login already")
+
+    def test_engine_rows_mark_reserved_by_general(self):
+        from test_engine import E, acct
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [2, 4])
+        rows = [acct(n, reserved=not O["in_general"](self.store, n)) for n in (1, 2, 3, 4)]
+        self.assertEqual([r["n"] for r in rows if E["eligible"](r)], [2, 4])
+        self.assertEqual(E["decide"](rows, 1, NOW, {}, False, None)["target"], 2)
+
+    def test_the_mark_is_read_only_where_general_is_worked_out(self):
+        # every command asks in_general/is_reserved; the engine reads its
+        # rows' "reserved", which check, auto and the watch fill from general
+        with open(SCRIPT) as f:
+            lines = f.read().split("\n")
+        allowed = {"in_general", "migrate_general"}
+        for i, line in enumerate(lines):
+            if not re.search(r'\.get\("reserved"\)', line) or re.search(r'\b(r|cur)\.get\(', line):
+                continue
+            fn = next((m.group(1) for x in reversed(lines[:i + 1])
+                       for m in [re.match(r"def (\w+)\(|(?:read -r -d '' |)(\w+)\(\) \{", x)]
+                       if m), None)
+            self.assertIn(fn, allowed, f"line {i + 1} reads the reserved mark: {line.strip()}")
+        src = "\n".join(lines)
+        self.assertEqual(src.count('"reserved": not oauth.in_general('), 2)  # check, watch
+        self.assertIn("oauth.in_general(store, n)", src[src.index("cmd_auto() {"):
+                                                         src.index("_do_rotate() {")])
+        # after `auth <n>`, a lane seat in general too is told of its lanes
+        # (for a login a lane takes: one of a lane group, or the main one out
+        # of general or of a seat whose first group is a lane group)
+        auth = src[src.index("cmd_auth() {"):]
+        self.assertIn("if oauth.on_lanes(store, k) and key != oauth.GENERAL and (\n"
+                      "                key or not oauth.in_general(store, k)\n"
+                      "                or oauth.main_home(store, k) != oauth.GENERAL):", auth)
+
+    # edits: group <g> <n...> | add | rm | copy
+
+    def test_group_add_rm_and_copy(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["migrate_general"](self.store)
+        self.assertEqual(self.edit("clienta", "add", "1", "2"), ([2, 3, 1], None))
+        self.assertEqual(self.edit("clienta", "rm", "3"), ([2], None))
+        self.assertEqual(self.edit("clienta", "3", "2", "3"), ([3, 2], None))
+        self.assertEqual(self.edit("studio", "add", "3"), ([3], None))
+        self.assertEqual(self.edit("studio", "copy", "clienta"), ([2, 3], None))
+        self.assertEqual(self.edit("studio", "copy", "general"), ([1, 4], None))
+        self.assertEqual(self.edit("general", "add", "3"), ([1, 4, 3], None))
+        self.assertEqual(self.edit("general", "rm", "4", "1"), ([], None))
+        self.assertEqual(self.edit("general", "copy", "clienta"), ([2, 3], None))
+
+    def test_general_is_edited_before_it_is_written(self):
+        # without groups.general, its accounts are the ones not reserved
+        self.assertEqual(self.edit("general", "add", "2"), ([1, 4, 2], None))
+        self.assertEqual(self.edit("general", "rm", "1"), ([4], None))
+        self.assertEqual(self.edit("clienta", "copy", "general")[1],
+                         "Error: account 1 is not reserved (claude-swap reserve 1)")
+
+    def test_group_edits_are_checked_as_a_list_is(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        err = lambda *a: self.edit(*a)[1]
+        self.assertEqual(err("clienta", "rm", "1"), "Error: #1 is not in clienta")
+        self.assertEqual(err("clienta", "add", "9"),
+                         "Error: account 9 does not exist (valid: 1-4)")
+        self.assertEqual(err("clienta", "copy", "nope"), "Error: there is no group nope")
+        self.assertEqual(err("nope", "rm", "2"), "Error: there is no group nope")
+        self.assertEqual(err("clienta", "copy", "clienta"),
+                         "Error: clienta cannot be copied onto itself")
+        self.assertEqual(err("clienta", "rm", "2", "3"),
+                         "Error: that leaves clienta with no seats: claude-swap group clienta off")
+        for bad in (("clienta", "add"), ("clienta", "rm"), ("clienta", "copy"),
+                    ("clienta", "copy", "a", "b")):
+            self.assertTrue(err(*bad).startswith("Usage: claude-swap group"), bad)
+        # without general a group's seats are reserved accounts, as up to 1.21
+        self.assertEqual(err("clienta", "add", "1"),
+                         "Error: account 1 is not reserved (claude-swap reserve 1)")
+        self.store["accounts"][1]["email"] = ""
+        self.assertEqual(err("studio", "2"), "Error: account 2 has no email in the store")
+        self.assertEqual(err("general", "add", "2"), "Error: account 2 has no email in the store")
+        self.assertIn("never 'reserved'", err("reserved", "3"))
+        self.assertIn("a group name is", err("Bad!", "3"))
+
+    def test_general_cannot_be_removed(self):
+        for _ in range(2):  # before the migration and after it
+            why = O["group_off_refusal"](self.store, "general")
+            self.assertEqual(why, "general is the shared login's group (cl): it cannot be"
+                                  " removed; claude-swap group general <n...> sets its accounts")
+            O["migrate_general"](self.store)
+
+    def test_the_default_group_counts_lane_groups_only(self):
+        O["set_group"](self.store, "general", [1, 4])  # general first
+        O["set_group"](self.store, "clienta", [2, 3])
+        self.assertEqual(O["default_group"](self.store), "clienta")
+        self.assertIsNone(O["group_off_refusal"](self.store, "clienta"))
+        O["set_group"](self.store, "studio", [3])
+        self.assertIn("clienta is the default group", O["group_off_refusal"](self.store, "clienta"))
+        O["set_group"](self.store, "studio", [])
+        O["set_group"](self.store, "clienta", [])
+        self.assertEqual(self.store["groups"], {"general": ["a1@x.io", "a4@x.io"]})
+        self.assertEqual(O["default_group"](self.store), "reserved")
+        self.assertEqual(O["groups_of"](self.store), {"reserved": [2, 3]})
+
+    def test_a_general_edit_keeps_a_lane_on_its_seat_and_the_store_as_it_was(self):
+        O["migrate_general"](self.store)
+        O["set_lane_rec"](self.store, None, {"n": 2, "mode": "setup", "at": NOW, "from": None})
+        snap = json.dumps(self.store, sort_keys=True)
+        self.assertIsNone(O["group_edit_refusal"](self.store, "general", [1, 3, 4]))
+        why = O["group_edit_refusal"](self.store, "general", [1, 2, 4])
+        self.assertEqual(why, "move the reserved lane off #2 first: claude-swap 3")
+        self.assertEqual(json.dumps(self.store, sort_keys=True), snap)
+
+    # reserve / unreserve
+
+    def test_reserve_and_unreserve_are_general_membership(self):
+        O["migrate_general"](self.store)
+        # cl is on #1: reserved, it would be a seat of the implicit group,
+        # whose lane would take the main login live in cl (GeneralLogins)
+        self.assertEqual(O["set_reserved"](self.store, 1, True),
+                         "switch cl off #1 first: claude-swap 4")
+        self.store["active"] = 4
+        self.assertIsNone(O["set_reserved"](self.store, 1, True))
+        self.assertEqual(self.store["groups"]["general"], ["a4@x.io"])
+        self.assertIsNone(O["set_reserved"](self.store, 2, False))
+        self.assertEqual(O["general_of"](self.store), [2, 4])
+        self.assertEqual(self.marks(), [True, False, True, False])
+        self.assertIsNone(O["set_reserved"](self.store, 2, False))  # already: no change
+        self.assertEqual(self.store["groups"]["general"], ["a4@x.io", "a2@x.io"])
+        O["set_lane_rec"](self.store, None, {"n": 3, "mode": "setup", "at": NOW, "from": None})
+        self.assertEqual(O["set_reserved"](self.store, 3, False),
+                         "move the reserved lane off #3 first: claude-swap 1")
+        self.assertFalse(O["in_general"](self.store, 3))
+
+    def test_reserve_without_general_is_the_mark_as_up_to_1_21(self):
+        self.assertIsNone(O["set_reserved"](self.store, 1, True))
+        self.assertIsNone(O["set_reserved"](self.store, 2, False))
+        self.assertNotIn("groups", self.store)
+        self.assertEqual(self.marks(), [True, False, True, False])
+
+    def test_removing_an_account_takes_it_out_of_general_which_stays(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["set_group"](self.store, "general", [1])
+        O["remove_account"](self.store, 1)
+        self.assertEqual(self.store["groups"], {"clienta": ["a2@x.io", "a3@x.io"], "general": []})
+        O["remove_account"](self.store, 1)
+        O["remove_account"](self.store, 1)
+        self.assertEqual(self.store["groups"], {"general": []})
+
+    # the commands
+
+    sh = GroupCommands.sh
+
+    def test_script_group_general_creates_it_and_edits_it(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        r = self.sh("group", "general", "add", "2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        s = O["load_store"](self.store_path)
+        self.assertEqual(list(s["groups"]), ["clienta", "general"])
+        self.assertEqual(s["groups"]["general"], ["a1@x.io", "a4@x.io", "a2@x.io"])
+        self.assertEqual([bool(a.get("reserved")) for a in s["accounts"]],
+                         [False, False, True, False])
+        self.assertEqual(r.stdout, "general (cl, the shared login): #1 a1@x.io  #2 a2@x.io"
+                                   "  #4 a4@x.io · active #1\n"
+                                   "clienta (default, clt): #2 a2@x.io  #3 a3@x.io\n")
+
+    def test_script_group_general_off_is_refused(self):
+        r = self.sh("group", "general", "off")
+        self.assertEqual((r.returncode, r.stderr.strip()),
+                         (1, "Error: general is the shared login's group (cl): it cannot be"
+                             " removed; claude-swap group general <n...> sets its accounts"))
+        self.assertNotIn("groups", O["load_store"](self.store_path))
+
+    def test_script_lane_groups_take_accounts_of_general_once_it_exists(self):
+        O["set_group"](self.store, "clienta", [2, 3])
+        r = self.sh("group", "clienta", "add", "1")
+        self.assertEqual((r.returncode, r.stderr.strip()),
+                         (1, "Error: account 1 is not reserved (claude-swap reserve 1)"))
+        O["migrate_general"](self.store)
+        # cl elsewhere: #1's main login goes to clienta, its first group now
+        self.store["active"] = 4
+        for edit in (("clienta", "add", "1"), ("studio", "copy", "clienta")):
+            r = self.sh("group", *edit)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.store = O["load_store"](self.store_path)  # sh writes self.store first
+        r = self.sh("group", "clienta", "rm", "3")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        s = O["load_store"](self.store_path)
+        # a list is kept in the store's order once read back (copy, rm)
+        self.assertEqual(s["groups"], {"clienta": ["a1@x.io", "a2@x.io"],
+                                       "general": ["a1@x.io", "a4@x.io"],
+                                       "studio": ["a1@x.io", "a2@x.io", "a3@x.io"]})
+        self.assertNotIn("reserved", s["accounts"][0])
+        self.assertEqual(r.stdout, "general (cl, the shared login): #1 a1@x.io  #4 a4@x.io"
+                                   " · active #4\n"
+                                   "clienta (default, clt): #1 a1@x.io  #2 a2@x.io\n"
+                                   "studio (claude-swap run --group studio): #1 a1@x.io"
+                                   "  #2 a2@x.io  #3 a3@x.io\n")
+
+    def test_script_reserve_and_unreserve(self):
+        r = self.sh("reserve", "1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        s = O["load_store"](self.store_path)
+        self.assertNotIn("groups", s)
+        self.assertTrue(s["accounts"][0]["reserved"])
+        self.store = s
+        O["migrate_general"](self.store)
+        r = self.sh("unreserve", "1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("is an ordinary account again", r.stdout)
+        self.store = O["load_store"](self.store_path)  # sh writes self.store first
+        r = self.sh("reserve", "4")
+        s = O["load_store"](self.store_path)
+        self.assertEqual(s["groups"]["general"], ["a1@x.io"])
+        self.assertEqual([bool(a.get("reserved")) for a in s["accounts"]],
+                         [False, True, True, True])
+
+    def test_script_reserve_an_account_with_no_email_keeps_its_mark(self):
+        self.store["accounts"][0]["email"] = ""
+        O["migrate_general"](self.store)
+        r = self.sh("reserve", "1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        s = O["load_store"](self.store_path)
+        self.assertTrue(s["accounts"][0]["reserved"])
+        self.assertEqual(s["groups"]["general"], ["a4@x.io"])
+
+    def test_script_add_puts_an_ordinary_account_in_general(self):
+        O["migrate_general"](self.store)
+        O["save_store"](self.store_path, self.store)
+        e = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+        e.update(HOME=os.path.join(self.dir, "home"), CLAUDE_SWAP_STORE=self.store_path,
+                 CLAUDE_SWAP_RUN=os.path.join(self.dir, "run"), NO_COLOR="1")
+        for flag, email in (([], "a5@x.io"), (["--reserved"], "a6@x.io")):
+            r = subprocess.run(["bash", SCRIPT, "add", *flag], env=e, capture_output=True,
+                               text=True, timeout=60,
+                               input=f"sk-ant-oat01-setup-{email}\n\n{email}\n")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        s = O["load_store"](self.store_path)
+        self.assertEqual(s["groups"]["general"], ["a1@x.io", "a4@x.io", "a5@x.io"])
+        self.assertEqual([bool(a.get("reserved")) for a in s["accounts"]],
+                         [False, True, True, False, False, True])
+
+
+
+class GeneralLogins(Base):
+    """Which login each place uses once general is a group (1.22): an
+    account's main login (oauth:<email>) is its first group's, in the
+    store's order of groups, general included (the migration appends it
+    last): a seat of a lane group keeps it there, as up to 1.21, and an
+    account only in general gives it to the shared login. Every other place
+    takes the account's login of that group (general's too: cl's own), else
+    its setup-token. Each full login lives in one place: an edit of the
+    groups that would hand a login held somewhere to another place is
+    refused, and `claude-swap <n> [g]` says which place moves. Here the
+    groups are clienta, studio, then general; #2 is in clienta and general."""
+    def setUp(self):
+        super().setUp()
+        self.store["accounts"].append({"label": "acc4", "email": "a4@x.io",
+                                       "token": "sk-ant-oat01-setup4",
+                                       "expires": int((NOW + 300 * 86400) * 1000)})
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["set_group"](self.store, "studio", [3])
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [1, 2, 4])  # #2 in general and in clienta
+
+    def give_group(self, n, g, o):
+        acc = self.store["accounts"][n - 1]
+        self.secrets.write(O["VAULT"], O["dump"](o), O["group_slot"](acc, g))
+        O["note_group_login"](acc, g, o, NOW, ident(n))
+
+    def gslot(self, n, g):
+        acc = self.store["accounts"][n - 1]
+        return O["parse"](self.secrets.read(O["VAULT"], O["group_slot"](acc, g)))
+
+    def put(self, n, g):
+        return O["lane_put"](self.store, n, self.secrets, FakeHttp(), NOW, group=g)
+
+    def lane_holds(self, g):
+        return O["parse"](self.secrets.read(O["run_service"](O["lane_dir"](None, g))))
+
+    def refusal(self, g, *ns):
+        return O["group_edit_refusal"](self.store, g, list(ns))
+
+    def file(self, k, o, g=None):
+        return O["file_login"](self.store, k, o, ident(k), self.secrets, self.live, FakeHttp(),
+                               NOW, g)
+
+    # which login a place takes
+
+    def test_login_group_with_general(self):
+        lg = lambda n, g: O["login_group"](self.store, n, g)
+        # the main login is the first group's: #2 is in clienta, then general
+        self.assertEqual([O["main_home"](self.store, n) for n in (1, 2, 3, 4)],
+                         ["general", "clienta", "clienta", "general"])
+        # the shared login takes the main one where general is the home, else
+        # the account's own general login
+        self.assertEqual([lg(n, "general") for n in (1, 2, 3, 4)],
+                         [None, "general", "general", None])
+        # a lane of the home group takes the main login, the default one's too
+        self.assertEqual((lg(2, None), lg(2, "clienta")), (None, None))
+        self.assertEqual((lg(3, None), lg(3, "clienta"), lg(3, "studio")),
+                         (None, None, "studio"))
+        # a group after general: an account in both keeps its main login for cl
+        O["set_group"](self.store, "later", [2, 4])
+        self.assertEqual(list(self.store["groups"]), ["clienta", "studio", "general", "later"])
+        self.assertEqual((lg(4, "later"), lg(4, "general"), lg(2, "later")),
+                         ("later", None, "later"))
+        O["set_group"](self.store, "studio", [2, 3])
+        self.assertEqual(lg(2, "studio"), "studio")
+        O["set_group"](self.store, "clienta", [3])  # #2: studio is its first group now
+        self.assertEqual((O["main_home"](self.store, 2), lg(2, "studio"), lg(2, "general")),
+                         ("studio", None, "general"))
+        O["set_group"](self.store, "studio", [3])  # #2: general first
+        self.assertEqual((O["main_home"](self.store, 2), lg(2, "general"), lg(2, "later")),
+                         ("general", None, "later"))
+
+    def test_without_general_a_seats_logins_are_as_up_to_1_21(self):
+        self.store["groups"].pop("general")
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+        lg = lambda n, g: O["login_group"](self.store, n, g)
+        self.assertEqual((lg(2, None), lg(3, None), lg(3, "studio")), (None, None, "studio"))
+        self.assertEqual(O["main_home"](self.store, 3), "clienta")
+        # the shared login takes the main login, on any account (1.21 let
+        # `reserve` leave cl on a reserved one)
+        self.assertEqual([O["cl_login"](self.store, n) for n in (1, 2, 3, 4)], [None] * 4)
+
+    def test_the_shared_login_takes_the_main_login_where_general_is_the_home(self):
+        # #1, only in general: cl takes its main login
+        self.give(1, login("one"))
+        self.assertEqual(O["install"](self.store, 1, self.secrets, self.live, FakeHttp(), NOW),
+                         ("oauth", None))
+        self.assertEqual(self.live_now()["refreshToken"], "sk-ant-ort01-one")
+        # #2, in clienta then general: the clienta lane takes its main login...
+        self.give(2, login("main"))
+        self.assertEqual(self.put(2, None)[0], "oauth")
+        self.assertEqual(self.lane_holds(None)["refreshToken"], "sk-ant-ort01-main")
+        self.assertIsNone(O["lane_login"](self.store))
+        # ...and cl its setup-token, until it has a general login of its own
+        self.assertEqual(O["install"](self.store, 2, self.secrets, self.live, FakeHttp(), NOW),
+                         ("setup", "cl runs on #2's setup-token: its full login belongs to"
+                                   " clienta; claude-swap auth 2 --group general for one of"
+                                   " cl's own"))
+        self.assertEqual(self.live_now()["accessToken"], "sk-ant-oat01-setup2")
+        self.give_group(2, "general", login("g", rt_left=25 * 86400))
+        self.assertEqual(O["install"](self.store, 2, self.secrets, self.live, FakeHttp(), NOW),
+                         ("oauth", None))
+        self.assertEqual(self.live_now()["refreshToken"], "sk-ant-ort01-g")
+        self.assertEqual(self.lane_holds(None)["refreshToken"], "sk-ant-ort01-main")
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-main")
+        # the lane elsewhere, cl still never takes the main login of clienta's
+        self.put(3, None)
+        self.store["accounts"][1]["oauth_groups"]["general"]["dead"] = 1
+        mode, note = O["install"](self.store, 2, self.secrets, self.live, FakeHttp(), NOW)
+        self.assertEqual((mode, self.live_now()["accessToken"]), ("setup", "sk-ant-oat01-setup2"))
+        self.assertEqual(note, "its general login was refused: claude-swap auth 2 --group general")
+
+    def test_cl_saves_what_claude_code_refreshed_of_its_general_login_to_that_slot(self):
+        self.store["active"] = 2
+        self.give(2, login("main"))
+        self.give_group(2, "general", login("g", rt_left=25 * 86400))
+        O["install"](self.store, 2, self.secrets, self.live, FakeHttp(), NOW)
+        self.assertEqual(O["sync"](self.store, self.secrets, self.live, FakeHttp(), NOW),
+                         (2, "same", True))
+        # Claude Code refreshed it: the server names #2, and cl's login of #2 is its general one
+        o = login("g2", at_left=8 * H)
+        self.put_live(o)
+        http = FakeHttp(profile=profile_for(2))
+        self.assertEqual(O["sync"](self.store, self.secrets, self.live, http, NOW),
+                         (2, "saved", True))
+        self.assertEqual(self.gslot(2, "general")["refreshToken"], "sk-ant-ort01-g2")
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-main")
+
+    def test_a_lane_after_general_never_takes_the_main_login_of_cls_account(self):
+        O["set_group"](self.store, "later", [2, 4])  # #4: general, then later
+        self.give(4, login("four"))
+        self.assertEqual(self.put(4, "later"), ("setup", None))
+        self.assertEqual(self.lane_holds("later")["accessToken"], "sk-ant-oat01-setup4")
+        self.assertEqual(self.store["lanes"]["later"]["login"], "later")
+        self.assertEqual(O["run_seat"](self.store, 4), ("later", 4, None, None))
+        # a seat whose first group is clienta takes its main one there, as up to 1.21
+        self.give(2, login("main", rt_left=25 * 86400))
+        self.assertEqual(self.put(2, None)[0], "oauth")
+        self.assertEqual(self.lane_holds(None)["refreshToken"], "sk-ant-ort01-main")
+        # the default lane's record says so too (1.21.1 reads an explicit None as main)
+        self.assertIn("login", self.store["lane"])
+        self.assertIsNone(self.store["lane"]["login"])
+
+    def test_a_lane_after_general_saves_its_refresh_to_that_groups_slot(self):
+        O["set_group"](self.store, "later", [2, 4])
+        self.give(4, login("main"))
+        self.give_group(4, "later", login("c", rt_left=25 * 86400))
+        self.put(4, "later")
+        o = login("c2", at_left=8 * H)
+        o["refreshTokenExpiresAt"] = login("c", rt_left=25 * 86400)["refreshTokenExpiresAt"]
+        self.secrets.write(O["run_service"](O["lane_dir"](None, "later")), O["dump"](o))
+        ev, ok = O["lane_sync"](self.store, self.secrets, FakeHttp(), NOW, group="later")
+        self.assertTrue(ok)
+        self.assertEqual(ev, [("log", "saved #4's later login, refreshed by the later reserved"
+                                      " sessions")])
+        self.assertEqual(self.gslot(4, "later")["refreshToken"], "sk-ant-ort01-c2")
+        self.assertEqual(self.slot_of(4)["refreshToken"], "sk-ant-ort01-main")
+        # cl's own general login is never filed as a lane's
+        self.give_group(2, "general", login("g"))
+        self.assertEqual(O["lane_owner"](login("g"), self.store, None, "later"),
+                         (None, None, []))
+
+    def test_the_logins_something_takes_of_a_seat_in_general(self):
+        for n, gs in ((2, ("clienta", "studio", "general")), (3, ("clienta", "studio"))):
+            for g in gs:
+                self.give_group(n, g, login(f"{n}{g}", rt_left=2 * 86400))
+        # #2: clienta's lane its main one, cl its general one (it is in no
+        # studio); #3: clienta's lane its main one, studio's its own
+        self.assertEqual(O["lane_logins"](self.store, 2), [None, "general"])
+        self.assertEqual(O["lane_logins"](self.store, 3), [None, "studio"])
+        msgs = [m for _, m in O["due_reminders"](self.store["accounts"], NOW, set(), self.store)]
+        self.assertIn("#2's general Claude in Chrome login expires in 2 days — claude-swap"
+                      " auth 2 --group general", msgs)
+        self.assertEqual(len(msgs), 2)
+
+    # edits that would move a login held somewhere
+
+    def test_general_refuses_a_seat_whose_lane_holds_its_main_login(self):
+        O["set_group"](self.store, "later", [2, 4])
+        O["set_group"](self.store, "general", [1, 2])  # #4: only in later now
+        self.give(4, login("four"))
+        self.put(4, "later")  # its main login there
+        self.assertIsNone(O["lane_login"](self.store, "later"))
+        why = ("#4's home group would be general instead of later, so the later lane,"
+               " which is on it, would take another of its logins: move the later lane off"
+               " #4 first: claude-swap 2 later")
+        self.assertEqual(self.refusal("general", 1, 2, 4), why)
+        self.assertEqual(O["set_reserved"](self.store, 4, False), why)
+        self.assertFalse(O["in_general"](self.store, 4))
+        # a seat whose first group comes before general keeps its home: #3's lane stays
+        self.give(3, login("three"))
+        self.put(3, None)
+        self.assertIsNone(self.refusal("general", 1, 2, 3))
+        # off its seat, or on its setup-token, the lane holds nothing of #4's
+        self.put(2, "later")
+        self.assertIsNone(self.refusal("general", 1, 2, 4))
+        self.store["accounts"][3].pop("oauth")
+        self.put(4, "later")
+        self.assertEqual(self.store["lanes"]["later"]["mode"], "setup")
+        self.assertIsNone(self.refusal("general", 1, 2, 4))
+
+    def test_general_refuses_letting_go_a_seat_whose_lane_holds_its_groups_login(self):
+        O["set_group"](self.store, "later", [2, 4])
+        self.give_group(4, "later", login("c"))
+        self.put(4, "later")  # #4's later login: out of general, later takes its main one
+        self.assertEqual(self.refusal("general", 1, 2),
+                         "#4's home group would be later instead of general, so the later"
+                         " lane, which is on it, would take another of its logins: move the"
+                         " later lane off #4 first: claude-swap 2 later")
+
+    def test_the_hint_names_a_seat_the_same_edit_leaves_alone(self):
+        O["set_group"](self.store, "later", [2, 4])
+        self.give_group(4, "later", login("c"))
+        self.put(4, "later")
+        # #2 would move home too (later is its home once out of clienta and general)
+        self.store["accounts"].append({"label": "acc5", "email": "a5@x.io",
+                                       "token": "sk-ant-oat01-setup5", "reserved": True,
+                                       "expires": int((NOW + 300 * 86400) * 1000)})
+        O["set_group"](self.store, "later", [2, 4, 5])
+        O["set_group"](self.store, "clienta", [3])
+        self.assertEqual(O["login_group"](self.store, 2, "later"), "later")
+        self.assertEqual(self.refusal("general", 1),
+                         "#4's home group would be later instead of general, so the later"
+                         " lane, which is on it, would take another of its logins: move the"
+                         " later lane off #4 first: claude-swap 5 later")
+
+    def test_an_edit_that_moves_the_home_of_cls_main_login_is_refused(self):
+        # cl on #1, only in general: it holds #1's main login
+        self.store["active"] = 1
+        # (the hint: an account whose cl login the edit leaves alone, #2's general one)
+        self.assertEqual(self.refusal("clienta", 1, 2, 3), "switch cl off #1 first: claude-swap 2")
+        self.assertEqual(self.refusal("studio", 1, 3), "switch cl off #1 first: claude-swap 2")
+        # a group after general leaves #1's home where it is
+        self.assertIsNone(self.refusal("later", 1))
+        # cl on #2 (home clienta) holds its general login: the main one may move
+        self.store["active"] = 2
+        self.assertIsNone(self.refusal("general", 1, 4))
+        self.assertIsNone(O["set_reserved"](self.store, 2, True))
+        self.assertFalse(O["in_general"](self.store, 2))
+        O["set_group"](self.store, "general", [1, 2, 4])
+        # out of clienta, general is #2's home: cl takes its main login then,
+        # which no lane holds
+        self.assertIsNone(self.refusal("clienta", 3))
+        # an account in no lane group leaves general as up to 1.21 (the watch moves off it)
+        self.store["active"] = 4
+        self.assertIsNone(self.refusal("general", 1, 2))
+        self.assertIsNone(O["group_edit_refusal"](self.store, "general", []))
+
+    def test_without_general_no_edit_is_refused_for_the_shared_login(self):
+        self.store["groups"].pop("general")
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+        self.store["active"] = 3  # a reserved account on cl, as 1.21 let `reserve` leave it
+        self.assertIsNone(self.refusal("studio", 2, 3))
+        self.assertIsNone(O["set_reserved"](self.store, 1, True))
+
+    # claude-swap <n> [g]
+
+    def test_claude_swap_n_moves_the_shared_login_or_a_lane(self):
+        rt = lambda n, g=None, d=None: O["rotate_target"](self.store, n, g, d)
+        for n, g in ((1, None), (2, None), (2, "general"), (4, "general")):
+            self.assertEqual(rt(n, g), ("general", None), (n, g))
+        self.assertEqual(rt(2, "clienta"), ("clienta", None))
+        self.assertEqual(rt(3, "studio"), ("studio", None))
+        self.assertEqual(rt(3), (None, "#3 is in clienta and studio: say which lane moves,"
+                                       " claude-swap 3 clienta"))
+        self.assertEqual(rt(3, None, O["lane_dir"](None, "studio")), ("studio", None))
+        self.assertEqual(rt(3, "general"), (None, "#3 is not in general, so it never becomes"
+                                                  " the shared login: claude-swap group general"
+                                                  " add 3"))
+        self.assertEqual(rt(1, "clienta"), (None, "#1 is not in clienta: claude-swap group"
+                                                  " clienta add 1"))
+        self.assertEqual(rt(2, "studio"), (None, "#2 is not in studio (it is in clienta)"))
+        O["set_group"](self.store, "studio", [2])
+        O["set_group"](self.store, "clienta", [3])
+        self.assertEqual(rt(3), ("clienta", None))  # out of general, in one group
+
+    def test_in_a_lane_session_a_seat_in_general_needs_the_place_named(self):
+        # agents in a lane's sessions learned `claude-swap <n>` as "move this
+        # lane" (1.21): for a seat of that lane's group that is in general
+        # too, a bare number is refused, never a silent move of cl
+        rt = lambda n, g=None, d=None: O["rotate_target"](self.store, n, g, d)
+        mine = O["lane_dir"]()  # the default group's lane: clienta's
+        self.assertEqual(rt(2, None, mine),
+                         (None, "#2 is in general and in clienta: claude-swap 2 general moves"
+                                " cl, claude-swap 2 clienta moves this session's lane"))
+        self.assertEqual(rt(2, "general", mine), ("general", None))
+        self.assertEqual(rt(2, "clienta", mine), ("clienta", None))
+        # a seat out of this lane's group, or out of general, is as without it
+        self.assertEqual(rt(2, None, O["lane_dir"](None, "studio")), ("general", None))
+        self.assertEqual(rt(1, None, mine), ("general", None))
+        self.assertEqual(rt(3, None, mine), ("clienta", None))
+        # outside a lane session, the spec's meaning: the shared login
+        self.assertEqual(rt(2), ("general", None))
+        self.assertEqual(rt(2, None, os.path.join(self.dir, "cc")), ("general", None))
+
+    def test_script_in_a_lane_session_a_bare_number_of_a_seat_in_general_is_refused(self):
+        lane = os.path.join(self.dir, "run", "reserved")
+        os.makedirs(lane)
+        r = self.sh("2", CLAUDE_CONFIG_DIR=lane)
+        self.assertEqual((r.returncode, r.stdout.strip()),
+                         (1, "Error: #2 is in general and in clienta: claude-swap 2 general"
+                             " moves cl, claude-swap 2 clienta moves this session's lane"))
+
+    def test_the_watch_moves_cl_with_general_named(self):
+        # a seat that leaves general between the decision and the command
+        # must not have a lane moved instead
+        self.assertEqual(O["switch_args"](self.store, 2), ["2", "general"])
+        self.store["groups"].pop("general")
+        self.assertEqual(O["switch_args"](self.store, 1), ["1"])  # as up to 1.21
+        with open(SCRIPT) as f:
+            src = f.read()
+        body = src[src.index("cmd_watch_run() {"):]
+        self.assertIn("run_logged([self_bin] + oauth.switch_args(store, d[\"target\"]))", body)
+        self.assertNotIn("run_logged([self_bin, str(d[\"target\"])])", body)
+
+    def test_an_old_own_dir_never_files_the_main_login_of_cls_account(self):
+        # 1.14's per-account dirs: their refreshes went to the main slot. The
+        # main login of an account whose home is general is cl's: an old copy
+        # there is never filed; #2's first group is clienta, so its main login
+        # is clienta's, as up to 1.21
+        def refreshed(tag, of):
+            o = login(tag, at_left=8 * H)
+            o["refreshTokenExpiresAt"] = of["refreshTokenExpiresAt"]
+            return o
+        for n, tag in ((2, "main"), (4, "four")):
+            self.give(n, login(tag))
+            d = O["run_dir"](self.store["accounts"][n - 1])
+            os.makedirs(d)
+            self.secrets.write(O["run_service"](d), O["dump"](refreshed(tag + "2", login(tag))))
+        ev = O["run_sync"](self.store, self.secrets, NOW)
+        self.assertEqual(ev, [("log", "saved #2's login, refreshed by its own sessions")])
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-main2")
+        self.assertEqual(self.slot_of(4)["refreshToken"], "sk-ant-ort01-four")
+
+    def test_claude_swap_n_without_general_is_as_up_to_1_21(self):
+        self.store["groups"].pop("general")
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+        rt = lambda n, g=None: O["rotate_target"](self.store, n, g)
+        self.assertEqual(rt(1), ("general", None))
+        self.assertEqual(rt(1, "clienta"), (None, "account 1 is not reserved: only a reserved"
+                                                  " seat takes a group (claude-swap 1 clienta)"))
+        self.assertEqual(rt(2), ("clienta", None))
+        self.assertEqual(rt(3, "general"), (None, "account 3 is reserved: it never becomes the"
+                                                  " shared login (claude-swap unreserve 3)"))
+        self.store.pop("groups")  # the one implicit group of 1.20
+        self.assertEqual(rt(3), ("reserved", None))
+
+    def test_a_lanes_move_names_its_group_when_a_seat_is_in_general(self):
+        # the watch types what a user would: `claude-swap 2` alone would move cl
+        self.assertEqual(O["move_args"](self.store, 2, None), ["2", "clienta"])
+        self.assertEqual(O["move_hint"](self.store, 3, "studio"), "claude-swap 3 studio")
+        self.assertEqual(O["move_word"](self.store, None), " clienta")
+        self.assertEqual(O["move_word"](self.store, "studio"), " studio")
+        O["set_lane_rec"](self.store, None, {"n": 3, "mode": "setup", "at": NOW, "from": None})
+        self.assertIn("claude-swap <n> clienta moves the reserved sessions",
+                      O["session_line"](self.store, O["lane_dir"]()))
+        # the watch names it whenever the store has lane groups: a bare number
+        # is never a lane's move it could take for cl's
+        O["set_group"](self.store, "general", [1, 4])
+        self.assertEqual(O["move_args"](self.store, 2, None), ["2", "clienta"])
+        self.assertEqual(O["move_word"](self.store, None), "")
+
+    def test_claude_swap_n_decides_with_rotate_target(self):
+        with open(SCRIPT) as f:
+            src = f.read()
+        body = src[src.index("_do_rotate() {"):src.index("cmd_add() {")]
+        self.assertIn("oauth.rotate_target(store, n, group_arg or None,", body)
+        self.assertNotIn("only a reserved seat takes a group", body)
+
+    # auth
+
+    def test_auth_all_is_generals_paid_accounts_without_a_good_login(self):
+        for a, plan in zip(self.store["accounts"], ("default_claude_max_20x", "default_raven",
+                                                    "default_raven", "default_claude_max_20x")):
+            a["plan"] = plan
+        self.give(1, login("one", rt_left=25 * 86400))
+        # #2, a Team seat in general too, keeps its main login for clienta, its
+        # first group: like #3, a seat's login, done one by one (auth <n>)
+        self.assertEqual(O["auth_targets"](self.store, NOW), [4])
+        self.store["accounts"][3]["plan"] = "free"
+        self.store["accounts"][1]["disabled"] = True
+        self.assertEqual(O["auth_targets"](self.store, NOW), [])
+        with open(SCRIPT) as f:
+            src = f.read()
+        self.assertIn("oauth.auth_targets(store, ", src[src.index("cmd_auth() {"):])
+
+    def test_auth_group_general_needs_an_account_in_general(self):
+        self.assertIsNone(O["group_error"](self.store, 2, "general"))
+        self.assertIsNone(O["group_error"](self.store, 2, "clienta"))
+        self.assertEqual(O["group_error"](self.store, 3, "general"),
+                         "#3 is not in general, so it never becomes the shared login:"
+                         " claude-swap group general add 3")
+        self.assertEqual(O["group_error"](self.store, 2, "studio"),
+                         "#2 is not in studio (it is in clienta)")
+
+    def test_auth_files_each_login_where_it_is_in_use(self):
+        self.store["active"] = 2
+        self.give(2, login("main"))
+        self.put(2, None)  # the default lane on #2's main login (clienta is its first group)
+        # its main login, with or without --group clienta: the lane's, never cl's
+        for g in (None, "clienta"):
+            self.assertEqual(self.file(2, login(f"m-{g}"), g), (None, False, [(None, "oauth")]))
+            self.assertEqual(self.lane_holds(None)["refreshToken"], f"sk-ant-ort01-m-{g}")
+            self.assertIsNone(self.live_now())
+        # --group general: cl's own, installed now
+        self.assertEqual(self.file(2, login("g"), "general"), ("general", True, []))
+        self.assertEqual(self.live_now()["refreshToken"], "sk-ant-ort01-g")
+        self.assertEqual(self.gslot(2, "general")["refreshToken"], "sk-ant-ort01-g")
+        self.assertEqual(self.lane_holds(None)["refreshToken"], "sk-ant-ort01-m-clienta")
+        # #1, only in general: its main login is cl's, --group general or not
+        self.store["active"] = 1
+        for g in (None, "general"):
+            self.assertEqual(self.file(1, login(f"one-{g}"), g), (None, True, []))
+            self.assertEqual(self.live_now()["refreshToken"], f"sk-ant-ort01-one-{g}")
+        # cl elsewhere: #2's general login waits in the vault
+        self.assertEqual(self.file(2, login("g2"), "general"), ("general", False, []))
+        self.assertEqual(self.gslot(2, "general")["refreshToken"], "sk-ant-ort01-g2")
+        self.assertEqual(self.live_now()["refreshToken"], "sk-ant-ort01-one-general")
+
+    def test_an_edit_waits_while_a_session_may_write_back_the_account_cl_left(self):
+        # tick puts cl's account back over a login written back within
+        # RACE_WINDOW (after_sync): the edit must not change whose login of
+        # #1 cl's is meanwhile, or the write-back would be filed as another
+        self.store["active"] = 4
+        O["mark_live"](self.store, 4, "oauth", NOW, 1)
+        self.assertEqual(O["group_edit_refusal"](self.store, "clienta", [1, 2, 3], NOW + 60),
+                         "cl left #1 under 15 minutes ago, and a session may still write #1's"
+                         " login back: try again in 14 min")
+        self.assertIsNone(O["group_edit_refusal"](self.store, "later", [1], NOW + 60))
+        self.assertIsNone(O["group_edit_refusal"](self.store, "clienta", [1, 2, 3],
+                                                  NOW + O["RACE_WINDOW"]))
+
+    def fns(self, code, stdin=""):
+        """The script's functions (sourced), then code, on a store of its own,
+        with security and claude stubbed (a call to them fails the test)."""
+        self.sh("version")  # saves the store, writes the stubs
+        e = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+        e.update(HOME=os.path.join(self.dir, "home"), CLAUDE_SWAP_STORE=self.store_path,
+                 CLAUDE_SWAP_RUN=os.path.join(self.dir, "run"),
+                 CLAUDE_SWAP_VAULT="claude-swap-tests", NO_COLOR="1",
+                 PATH=os.path.join(self.dir, "bin") + os.pathsep + os.environ.get("PATH", ""))
+        r = subprocess.run(["bash", "-c", 'source "$0" version >/dev/null; ' + code, SCRIPT],
+                           env=e, input=stdin, capture_output=True, text=True, timeout=60)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "touched")),
+                         "it reached the keychain or Claude Code")
+        return r
+
+    STUBS = ('_do_rotate() { echo "rotate $1 ${2:-<none>}"; }; check_store() { :; };'
+             ' _fable_alias() { :; }; cmd_status() { :; }; _deep_check() { :; }; ')
+
+    def test_auto_moves_cl_by_naming_general(self):
+        # in a lane's session a bare number of a seat in general and that
+        # lane's group is refused (rotate_target): auto and af name general
+        r = self.fns(self.STUBS + 'python3() { cat >/dev/null; echo "ROTATE 2"; };'
+                     ' cmd_auto general; cmd_auto fable')
+        self.assertEqual(r.stdout.splitlines(), ["rotate 2 general"] * 2, r.stderr)
+
+    def test_the_menu_names_general_for_an_account_in_general(self):
+        def pick(choice):
+            r = self.fns(self.STUBS + "cmd_interactive", choice + "\n")
+            return r.stdout.strip().splitlines()[-1]
+        self.assertEqual(pick("2"), "rotate 2 general")
+        self.assertEqual(pick("1"), "rotate 1 general")
+        # a seat out of general moves its lane, as up to 1.21
+        self.assertEqual(pick("3"), "rotate 3 <none>")
+        # without general, the same: an account not reserved is cl's
+        self.store["groups"].pop("general")
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+        self.assertEqual((pick("1"), pick("2")), ("rotate 1 general", "rotate 2 <none>"))
+
+    # the commands, on a store of their own (error paths: nothing is moved)
+
+    sh = GroupCommands.sh
+
+    def test_script_claude_swap_n_refuses_a_place_the_seat_is_not_in(self):
+        r = self.sh("3", "general")
+        self.assertEqual((r.returncode, r.stdout.strip()),
+                         (1, "Error: #3 is not in general, so it never becomes the shared login:"
+                             " claude-swap group general add 3"))
+        r = self.sh("1", "clienta")
+        self.assertEqual((r.returncode, r.stdout.strip()),
+                         (1, "Error: #1 is not in clienta: claude-swap group clienta add 1"))
+
+    def test_script_group_general_refuses_moving_a_held_login(self):
+        O["set_group"](self.store, "later", [2, 4])
+        self.store["lanes"] = {"later": {"n": 4, "mode": "oauth", "at": NOW, "from": None,
+                                         "login": "later"}}
+        r = self.sh("group", "general", "rm", "4")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("move the later lane off #4 first: claude-swap 2 later", r.stderr)
+        r = self.sh("group", "clienta", "add", "1")
+        self.assertEqual((r.returncode, r.stderr.strip()),
+                         (1, "Error: switch cl off #1 first: claude-swap 2"))
+        saved = O["load_store"](self.store_path)["groups"]
+        self.assertEqual((saved["general"], saved["clienta"]),
+                         (["a1@x.io", "a2@x.io", "a4@x.io"], ["a2@x.io", "a3@x.io"]))
+
+    @unittest.skipUnless(os.uname().sysname == "Darwin", "claude-swap auth needs macOS")
+    def test_script_auth_group_general_needs_an_account_in_general(self):
+        r = self.sh("auth", "3", "--group", "general")
+        self.assertEqual((r.returncode, r.stdout.strip()),
+                         (1, "Error: #3 is not in general, so it never becomes the shared login:"
+                             " claude-swap group general add 3"))
+
+
+class HeldLogins(Base):
+    """A full login a lane holds stays its one live copy while the groups
+    change around it (1.22): every lane's record names the login it was
+    given, the default lane's too (a move read before an edit commits after
+    it); cl never takes a login a lane holds; and an edit waits while a
+    session may still write back the login of the seat a lane just left.
+    general comes first here (written before clienta), so #2 joining it
+    moves its main login's home to general."""
+    def setUp(self):
+        super().setUp()
+        self.store["accounts"].append({"label": "acc4", "email": "a4@x.io",
+                                       "token": "sk-ant-oat01-setup4",
+                                       "expires": int((NOW + 300 * 86400) * 1000)})
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+        O["migrate_general"](self.store)  # general: #1, #4
+        O["set_group"](self.store, "clienta", [2, 3])
+        self.give(2, login("two", rt_left=25 * 86400))
+        self.give(3, login("three", rt_left=18 * 86400))
+        self.svc = O["run_service"](O["lane_dir"]())
+
+    def move(self, store, n, now):
+        return O["lane_move"](store, n, self.secrets, FakeHttp(), now)
+
+    def lane_holds(self):
+        return O["parse"](self.secrets.read(self.svc))
+
+    def install(self, n, now=NOW):
+        return O["install"](self.store, n, self.secrets, self.live, FakeHttp(), now)
+
+    def write_back(self, tag):
+        """What a session leaves in the lane after refreshing #2's login."""
+        o = login(tag, at_left=8 * H)
+        o["refreshTokenExpiresAt"] = login("two", rt_left=25 * 86400)["refreshTokenExpiresAt"]
+        self.secrets.write(self.svc, O["dump"](o))
+
+    def test_the_groups_are_general_then_clienta(self):
+        self.assertEqual(list(self.store["groups"]), ["general", "clienta"])
+        self.assertEqual(O["main_home"](self.store, 2), "clienta")
+        O["set_group"](self.store, "general", [1, 2, 4])
+        self.assertEqual(O["main_home"](self.store, 2), "general")
+
+    def test_a_move_read_before_an_edit_keeps_the_login_it_put_there(self):
+        stale = json.loads(json.dumps(self.store))  # the move's read, before the edit
+        self.move(stale, 2, NOW)
+        self.assertIsNone(O["group_edit_refusal"](self.store, "general", [1, 2, 4], NOW))
+        O["set_group"](self.store, "general", [1, 2, 4])  # #2's home: general
+        self.store["lane"] = stale["lane"]  # the move's commit (top=("lane",))
+        self.assertEqual(self.store["lane"]["login"], None)
+        self.assertIsNone(O["lane_login"](self.store))  # its main login, as put there
+        # cl never takes a login a lane holds: #2's setup-token meanwhile
+        self.assertEqual(self.install(2),
+                         ("setup", "the reserved sessions hold its full login: cl runs on its"
+                                   " setup-token until they move off #2"))
+        self.assertEqual(self.live_now()["accessToken"], "sk-ant-oat01-setup2")
+        self.assertEqual(self.lane_holds()["refreshToken"], "sk-ant-ort01-two")
+        # what the lane's sessions refresh goes to the main slot; off #2, cl takes it
+        self.write_back("two-r1")
+        ev, ok = O["lane_sync"](self.store, self.secrets, FakeHttp(), NOW + 100)
+        self.assertTrue(ok)
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-two-r1")
+        self.move(self.store, 3, NOW + 200)
+        self.assertEqual(self.lane_holds()["refreshToken"], "sk-ant-ort01-three")
+        self.assertEqual(self.install(2, NOW + 300), ("oauth", None))
+        self.assertEqual(self.live_now()["refreshToken"], "sk-ant-ort01-two-r1")
+
+    def test_the_watch_never_installs_over_and_over_a_login_a_lane_holds(self):
+        self.move(self.store, 2, NOW)
+        O["set_group"](self.store, "general", [1, 2, 4])  # as the race leaves it
+        self.store["active"] = 2
+        O["save_store"](self.store_path, self.store)
+        ev = O["tick"](self.store_path, self.secrets, self.live, FakeHttp(), NOW + 60)
+        self.assertEqual(ev, [])
+        self.assertIsNone(self.live_now())
+        self.assertEqual(self.lane_holds()["refreshToken"], "sk-ant-ort01-two")
+
+    def test_an_edit_waits_while_a_session_may_write_back_the_seat_the_lane_left(self):
+        self.move(self.store, 2, NOW)
+        self.move(self.store, 3, NOW + 60)  # from #2
+        why = ("the clienta lane left #2 under 15 minutes ago, and a session may still write"
+               " #2's login back: try again in 15 min")
+        self.assertEqual(O["group_edit_refusal"](self.store, "general", [1, 2, 4], NOW + 90), why)
+        # an edit that leaves #2's logins where they are goes ahead
+        self.assertIsNone(O["group_edit_refusal"](self.store, "general", [1], NOW + 90))
+        # the write-back is put right, the login saved where it belongs
+        self.write_back("two-r1")
+        ev, ok = O["lane_sync"](self.store, self.secrets, FakeHttp(), NOW + 120)
+        self.assertTrue(ok)
+        self.assertEqual(self.slot_of(2)["refreshToken"], "sk-ant-ort01-two-r1")
+        self.assertEqual(self.lane_holds()["refreshToken"], "sk-ant-ort01-three")
+        # the put-back is a move from #2 again: the window runs from it
+        self.assertEqual(O["group_edit_refusal"](self.store, "general", [1, 2, 4],
+                                                 NOW + 60 + O["RACE_WINDOW"]),
+                         why.replace("in 15 min", "in 1 min"))
+        self.assertIsNone(O["group_edit_refusal"](self.store, "general", [1, 2, 4],
+                                                  NOW + 120 + O["RACE_WINDOW"]))
+
+
+class WatchGroups(Base):
+    """A watch of its own for every group (1.22): on or off, the seats it
+    moves among (all of the group's unless listed) and whether it spends
+    free resets, in the store's watch_groups. A group with nothing there
+    reads as the settings of up to 1.21 meant: general on, spending resets
+    as `watch start` was told; a lane group, its `watch reserved` list."""
+    sh = GroupCommands.sh
+
+    def setUp(self):
+        super().setUp()
+        for n in (4, 5):
+            self.store["accounts"].append({"label": f"acc{n}", "email": f"a{n}@x.io",
+                                           "token": f"sk-ant-oat01-setup{n}",
+                                           "expires": int((NOW + 300 * 86400) * 1000)})
+        for n in (2, 3, 5):
+            self.store["accounts"][n - 1]["reserved"] = True
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["set_group"](self.store, "kokoima", [3, 5])
+
+    def cfg(self, g, auto_reset=False):
+        return O["watch_config"](self.store, g, auto_reset)
+
+    def snap(self):
+        return json.dumps(self.store, sort_keys=True)
+
+    # the settings, and what the ones of up to 1.21 meant
+
+    def test_without_settings_general_is_on_spending_resets_as_watch_start_said(self):
+        self.assertEqual(self.cfg("general"), {"on": True, "seats": None, "resets": False})
+        self.assertEqual(self.cfg("general", True), {"on": True, "seats": None, "resets": True})
+
+    def test_without_settings_a_lane_group_is_its_watch_reserved_list(self):
+        self.assertEqual(self.cfg("clienta", True), {"on": False, "seats": None, "resets": True})
+        self.store["lane_rotate"] = ["a2@x.io", "A3@x.io"]  # the default group's
+        self.store["lane_rotates"] = {"kokoima": ["a5@x.io"]}
+        self.assertEqual(self.cfg("clienta"),
+                         {"on": True, "seats": ["a2@x.io", "A3@x.io"], "resets": False})
+        # one seat was nothing to move among: off
+        self.assertEqual(self.cfg("kokoima"), {"on": False, "seats": None, "resets": False})
+        self.store["lane_rotates"]["kokoima"].append("a3@x.io")
+        self.assertEqual(self.cfg("kokoima", True),
+                         {"on": True, "seats": ["a5@x.io", "a3@x.io"], "resets": True})
+        self.assertEqual(self.cfg("nope"), {"on": False, "seats": None, "resets": False})
+        # the one group of a store without groups: lane_rotate, as up to 1.20
+        self.store.pop("groups")
+        self.assertEqual(self.cfg("reserved")["seats"], ["a2@x.io", "A3@x.io"])
+
+    def test_a_stored_setting_wins_and_what_it_leaves_out_is_the_old_one(self):
+        self.store["lane_rotate"] = ["a2@x.io", "a3@x.io"]
+        self.store["watch_groups"] = {
+            "general": {"on": False, "seats": ["a1@x.io"], "resets": True},
+            "clienta": {"on": False},
+            "kokoima": {"on": True, "seats": None, "resets": False}}
+        self.assertEqual(self.cfg("general"), {"on": False, "seats": ["a1@x.io"], "resets": True})
+        self.assertEqual(self.cfg("clienta", True),
+                         {"on": False, "seats": ["a2@x.io", "a3@x.io"], "resets": True})
+        self.assertEqual(self.cfg("kokoima", True), {"on": True, "seats": None, "resets": False})
+
+    # the seats
+
+    def test_watch_seats_are_the_groups_live_seats_or_the_listed_ones(self):
+        self.assertEqual(O["watch_seats"](self.store, "general"), [1, 4])
+        self.assertEqual(O["watch_seats"](self.store, "clienta"), [2, 3])
+        self.assertEqual(O["watch_seats"](self.store, "kokoima"), [3, 5])
+        self.store["watch_groups"] = {"general": {"seats": ["A4@x.io", "a2@x.io"]},
+                                      "kokoima": {"seats": ["a5@x.io", "a1@x.io"]}}
+        # only the group's own, live ones, whatever the list says
+        self.assertEqual(O["watch_seats"](self.store, "general"), [4])
+        self.assertEqual(O["watch_seats"](self.store, "kokoima"), [5])
+        self.store["accounts"][3]["disabled"] = True
+        self.assertEqual(O["watch_seats"](self.store, "general"), [])
+        self.store["accounts"][3]["disabled"] = False
+        # by email: the numbers follow the store's order
+        self.store["accounts"].reverse()
+        self.assertEqual(O["watch_seats"](self.store, "general"), [2])
+        self.assertEqual(O["watch_seats"](self.store, "kokoima"), [1])
+        self.assertEqual(O["watch_seats"](self.store, "clienta"), [3, 4])
+
+    def test_watch_seats_of_general_follow_its_group(self):
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [1, 3, 4])  # #3 in general and in two lane groups
+        self.assertEqual(O["watch_seats"](self.store, "general"), [1, 3, 4])
+        self.assertEqual(O["watch_seats"](self.store, "kokoima"), [3, 5])
+
+    def test_rotation_is_the_groups_watch_seats_while_it_is_on(self):
+        self.store["watch_groups"] = {"clienta": {"on": True, "seats": None},
+                                      "kokoima": {"on": True, "seats": ["a5@x.io", "a3@x.io"]}}
+        self.assertEqual(O["rotation"](self.store, None), [2, 3])
+        self.assertEqual(O["rotation"](self.store, "clienta"), [2, 3])
+        self.assertEqual(O["rotation"](self.store, "kokoima"), [3, 5])
+        self.store["watch_groups"]["kokoima"]["on"] = False
+        self.store["lane_rotates"] = {"kokoima": ["a3@x.io", "a5@x.io"]}  # the stored one rules
+        self.assertEqual(O["rotation"](self.store, "kokoima"), [])
+
+    # what the watch does with each place
+
+    def test_what_the_watch_does_with_the_shared_login(self):
+        self.assertEqual(O["general_watch"](self.store, True), (True, None, True))
+        self.store["watch_groups"] = {"general": {"on": True, "seats": ["a4@x.io", "a1@x.io"],
+                                                  "resets": False}}
+        self.assertEqual(O["general_watch"](self.store, True), (True, [1, 4], False))
+        self.store["watch_groups"]["general"]["on"] = False
+        self.assertFalse(O["general_watch"](self.store, True)[0])
+
+    def test_what_the_watch_does_with_each_lane(self):
+        self.store["lane_rotate"] = ["a2@x.io", "a3@x.io"]
+        self.assertEqual(O["lane_watch"](self.store, None, True), ([2, 3], True))
+        self.assertEqual(O["lane_watch"](self.store, "kokoima", True), ([], True))
+        self.store["watch_groups"] = {"kokoima": {"on": True, "seats": None, "resets": False},
+                                      "clienta": {"on": False}}
+        self.assertEqual(O["lane_watch"](self.store, "kokoima", True), ([3, 5], False))
+        self.assertEqual(O["lane_watch"](self.store, None, True), ([], True))
+
+    # the commands
+
+    def test_watch_group_sets_one_thing_and_writes_the_group_whole(self):
+        self.assertIsNone(O["watch_group"](self.store, "kokoima", ["on"]))
+        self.assertEqual(self.store["watch_groups"],
+                         {"kokoima": {"on": True, "seats": None, "resets": False}})
+        self.assertIsNone(O["watch_group"](self.store, "kokoima", ["seats", "5", "3", "5"]))
+        self.assertEqual(self.store["watch_groups"]["kokoima"]["seats"], ["a5@x.io", "a3@x.io"])
+        self.assertIsNone(O["watch_group"](self.store, "kokoima", ["resets", "on"]))
+        self.assertIsNone(O["watch_group"](self.store, "kokoima", ["off"]))
+        self.assertEqual(self.store["watch_groups"]["kokoima"],
+                         {"on": False, "seats": ["a5@x.io", "a3@x.io"], "resets": True})
+        self.assertIsNone(O["watch_group"](self.store, "kokoima", ["seats", "all"]))
+        self.assertIsNone(self.store["watch_groups"]["kokoima"]["seats"])
+        # a group's first setting starts from what it was: here its list of 1.21
+        self.store["lane_rotate"] = ["a2@x.io", "a3@x.io"]
+        self.assertIsNone(O["watch_group"](self.store, "clienta", ["resets", "off"], True))
+        self.assertEqual(self.store["watch_groups"]["clienta"],
+                         {"on": True, "seats": ["a2@x.io", "a3@x.io"], "resets": False})
+        self.assertIsNone(O["watch_group"](self.store, "general", ["off"], True))
+        self.assertEqual(self.store["watch_groups"]["general"],
+                         {"on": False, "seats": None, "resets": True})
+        self.assertIsNone(O["watch_group"](self.store, "general", ["seats", "4", "1"]))
+        self.assertEqual(self.store["watch_groups"]["general"]["seats"], ["a4@x.io", "a1@x.io"])
+
+    def test_watch_group_writes_nothing_that_changes_nothing(self):
+        before = self.snap()
+        for g, args, auto in (("general", ["on"], False), ("general", ["resets", "on"], True),
+                              ("clienta", ["off"], False), ("kokoima", ["seats", "all"], False)):
+            self.assertIsNone(O["watch_group"](self.store, g, args, auto))
+        self.assertEqual(self.snap(), before)
+
+    def test_watch_group_refuses_and_changes_nothing(self):
+        before = self.snap()
+        usage = O["WATCH_USAGE"]
+        for g, args, why in (
+                ("nope", ["on"], "Error: there is no group nope"),
+                ("reserved", ["on"], "Error: there is no group reserved"),
+                ("kokoima", ["maybe"], usage),
+                ("kokoima", ["on", "off"], usage),
+                ("kokoima", ["resets"], usage),
+                ("kokoima", ["resets", "yes"], usage),
+                ("kokoima", ["seats"], usage),
+                ("kokoima", ["seats", "3"], "Say at least two seats of kokoima, or all"),
+                ("kokoima", ["seats", "3", "3"], "Say at least two seats of kokoima, or all"),
+                ("kokoima", ["seats", "2", "3"], "Error: #2 is not in kokoima (its seats: #3, #5)"),
+                ("kokoima", ["seats", "9", "3"], "Error: account 9 does not exist (valid: 1-5)"),
+                ("kokoima", ["seats", "x", "3"], "Error: account x does not exist (valid: 1-5)"),
+                ("general", ["seats", "1", "2"], "Error: #2 is not in general (its seats: #1, #4)")):
+            self.assertEqual(O["watch_group"](self.store, g, args), why, (g, args))
+        self.store["accounts"][4]["disabled"] = True
+        self.assertEqual(O["watch_group"](self.store, "kokoima", ["seats", "3", "5"]),
+                         "Error: account 5 is disabled or has no token")
+        del self.store["accounts"][4]["disabled"]
+        self.assertEqual(self.snap(), before)
+
+    def test_watch_start_turns_general_on_spending_resets_as_told(self):
+        before = self.snap()
+        O["watch_start"](self.store, True)  # what it already meant: nothing to write
+        O["watch_start"](self.store, False)
+        self.assertEqual(self.snap(), before)
+        self.store["watch_groups"] = {"general": {"on": False, "seats": ["a4@x.io", "a1@x.io"],
+                                                  "resets": True}}
+        O["watch_start"](self.store, False)
+        self.assertEqual(self.store["watch_groups"]["general"],
+                         {"on": True, "seats": ["a4@x.io", "a1@x.io"], "resets": False})
+        O["watch_start"](self.store, True)
+        self.assertTrue(self.store["watch_groups"]["general"]["resets"])
+
+    def test_watch_reserved_sets_a_groups_watch_once_it_has_one(self):
+        # none yet: the list of 1.21, which is what the group's watch reads
+        self.assertEqual(O["watch_reserved"](self.store, ["kokoima", "5", "3"]), ("kokoima", None))
+        self.assertNotIn("watch_groups", self.store)
+        self.assertEqual(self.cfg("kokoima")["seats"], ["a5@x.io", "a3@x.io"])
+        self.store["watch_groups"] = {"kokoima": {"on": False, "seats": None, "resets": True},
+                                      "clienta": {"on": False, "seats": None, "resets": True}}
+        O["watch_reserved"](self.store, ["kokoima", "3", "5"])
+        self.assertEqual(self.store["watch_groups"]["kokoima"],
+                         {"on": True, "seats": ["a3@x.io", "a5@x.io"], "resets": True})
+        self.assertEqual(self.store["lane_rotates"], {"kokoima": ["a3@x.io", "a5@x.io"]})
+        O["watch_reserved"](self.store, ["kokoima", "off"])
+        self.assertEqual(self.store["watch_groups"]["kokoima"],
+                         {"on": False, "seats": ["a3@x.io", "a5@x.io"], "resets": True})
+        # no group named: the default one's
+        O["watch_reserved"](self.store, ["3", "2"])
+        self.assertEqual(self.store["watch_groups"]["clienta"],
+                         {"on": True, "seats": ["a3@x.io", "a2@x.io"], "resets": True})
+        self.assertEqual(O["rotation"](self.store, None), [2, 3])
+
+    def test_a_group_or_an_account_removed_leaves_the_watch_too(self):
+        self.store["watch_groups"] = {
+            "kokoima": {"on": True, "seats": ["a3@x.io", "a5@x.io"], "resets": True},
+            "clienta": {"on": True, "seats": ["A3@x.io", "a2@x.io"], "resets": False},
+            "general": {"on": True, "seats": None, "resets": True}}
+        O["set_group"](self.store, "kokoima", [])
+        self.assertEqual(list(self.store["watch_groups"]), ["clienta", "general"])
+        O["remove_account"](self.store, 3)
+        self.assertEqual(self.store["watch_groups"]["clienta"]["seats"], ["a2@x.io"])
+        self.assertIsNone(self.store["watch_groups"]["general"]["seats"])
+
+    # what watch status shows
+
+    def state(self, **kw):
+        s = {"model": "fable", "auto_reset": True, "active": 1, "manual": True,
+             "last_time": "10:00", "last": "5h 3%", "decision": "#1 goes first",
+             "lane_decision": "reserved sessions on #2 (the watch does not move them)",
+             "lane_decisions": {"kokoima": "reserved sessions (kokoima): #3 goes first"}}
+        s.update(kw)
+        return s
+
+    def test_watch_status_reads_as_up_to_1_21_without_general_or_watch_settings(self):
+        self.assertEqual(O["watch_lines"](self.store, self.state()), [
+            "  model fable · spends free resets · watching #1 (picked by hand)"
+            " · last probe 10:00 (5h 3%)",
+            "  #1 goes first",
+            "  reserved sessions on #2 (the watch does not move them)",
+            "  reserved sessions (kokoima): #3 goes first"])
+
+    def test_watch_status_has_a_line_per_group(self):
+        self.store["watch_groups"] = {"kokoima": {"on": True, "seats": None, "resets": False}}
+        s = self.state(lane_decisions={"kokoima": "reserved sessions (kokoima): #3 goes first",
+                                       "gone": "reserved sessions (gone) on #9"})
+        self.assertEqual(O["watch_lines"](self.store, s), [
+            "  model fable · last probe 10:00 (5h 3%)",
+            "  general: watch on · every seat · spends free resets · watching #1"
+            " (picked by hand) — #1 goes first",
+            "  clienta: watch off — reserved sessions on #2 (the watch does not move them)",
+            "  kokoima: watch on · every seat · no free resets"
+            " — reserved sessions (kokoima): #3 goes first",
+            "  reserved sessions (gone) on #9",
+            "  watch start turns general's watch on, and its free resets on with"
+            " --auto-reset, off without it"])
+        self.store["watch_groups"].update(
+            general={"on": False},
+            kokoima={"on": True, "seats": ["a5@x.io", "a3@x.io"], "resets": True})
+        self.store["accounts"][4]["disabled"] = True
+        lines = O["watch_lines"](self.store, self.state(decision="the shared login is left"
+                                                               " where it is", lane_decisions={}))
+        self.assertEqual(lines[1:], [
+            "  general: watch off — the shared login is left where it is",
+            "  clienta: watch off — reserved sessions on #2 (the watch does not move them)",
+            "  kokoima: watch on · #3 · spends free resets · fewer than two live seats:"
+            " nothing to move",
+            "  watch start turns general's watch on, and its free resets on with"
+            " --auto-reset, off without it"])
+
+    # the script, on a store, a run dir and a home of its own
+
+    def put_state(self, **s):
+        home = os.path.join(self.dir, "home", ".claude")
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, "claude-swap-watch.state"), "w") as f:
+            json.dump(s, f)
+
+    def test_script_watch_group_sets_and_tells_its_watch(self):
+        self.put_state(auto_reset=True)
+        r = self.sh("watch", "kokoima", "on")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout, "kokoima: watch on · every seat · spends free resets\n"
+                                   "The watch is not running: claude-swap watch start\n")
+        disk = O["load_store"](self.store_path)
+        self.assertEqual(disk["watch_groups"],
+                         {"kokoima": {"on": True, "seats": None, "resets": True}})
+        self.store = disk
+        r = self.sh("watch", "general", "resets", "off")
+        self.assertEqual(r.stdout.splitlines()[0], "general: watch on · every seat · no free resets")
+        self.assertEqual(O["load_store"](self.store_path)["watch_groups"]["general"],
+                         {"on": True, "seats": None, "resets": False})
+        self.store = O["load_store"](self.store_path)
+        r = self.sh("watch", "kokoima")  # only shown
+        self.assertEqual(r.stdout.splitlines()[0], "kokoima: watch on · every seat · spends free resets")
+
+    def test_script_watch_group_refusals(self):
+        r = self.sh("watch", "nope", "on")
+        self.assertEqual((r.returncode, r.stderr.strip()), (1, "Error: there is no group nope"))
+        r = self.sh("watch", "kokoima", "seats", "3")
+        self.assertEqual((r.returncode, r.stderr.strip()),
+                         (1, "Say at least two seats of kokoima, or all"))
+        r = self.sh("watch", "kokoima", "sideways")
+        self.assertEqual((r.returncode, r.stderr.strip()), (1, O["WATCH_USAGE"]))
+        self.assertNotIn("watch_groups", O["load_store"](self.store_path))
+
+    def test_script_watch_status_has_a_line_per_group(self):
+        self.store["watch_groups"] = {"kokoima": {"on": True, "seats": None, "resets": False}}
+        self.put_state(**self.state(manual=False))
+        r = self.sh("watch", "status")
+        self.assertEqual(r.stdout,
+                         "Watch not running.\n"
+                         "  model fable · last probe 10:00 (5h 3%)\n"
+                         "  general: watch on · every seat · spends free resets · watching #1"
+                         " — #1 goes first\n"
+                         "  clienta: watch off — reserved sessions on #2 (the watch does not"
+                         " move them)\n"
+                         "  kokoima: watch on · every seat · no free resets — reserved sessions"
+                         " (kokoima): #3 goes first\n"
+                         "  watch start turns general's watch on, and its free resets on with"
+                         " --auto-reset, off without it\n")
+
+
+class GeneralShown(Base):
+    """What check, status, group, auth and watch status show once general is
+    a group (1.22): every group by its name and how its sessions start, each
+    group's watch on or off (and its seats), the accounts in no group at
+    all. A store without groups.general reads as up to 1.21: these helpers
+    give the same text there (and the script's output stays the same)."""
+    sh = GroupCommands.sh
+
+    def setUp(self):
+        super().setUp()
+        for n in (4, 5):
+            self.store["accounts"].append({"label": f"acc{n}", "email": f"a{n}@x.io",
+                                           "token": f"sk-ant-oat01-setup{n}",
+                                           "expires": int((NOW + 300 * 86400) * 1000)})
+        for n in (2, 3, 5):
+            self.store["accounts"][n - 1]["reserved"] = True
+        O["set_group"](self.store, "clienta", [2, 3])
+        O["set_group"](self.store, "kokoima", [3, 5])
+        self.plain = json.loads(json.dumps(self.store))  # up to 1.21: no general
+
+    def general(self):
+        """general written, with #2 (a seat of clienta) in it too."""
+        O["migrate_general"](self.store)
+        O["set_group"](self.store, "general", [1, 2, 4])
+
+    def on(self, g, n, mode="setup", store=None):
+        s = store or self.store
+        O["set_lane_rec"](s, g, O["lane_record"](s, g, n, mode, NOW, None,
+                                                 O["login_group"](s, n, g)))
+
+    def unlisted(self):
+        """#6: out of general and in no lane group."""
+        self.store["accounts"].append({"label": "acc6", "email": "a6@x.io",
+                                       "token": "sk-ant-oat01-setup6", "reserved": True,
+                                       "expires": int((NOW + 300 * 86400) * 1000)})
+
+    # how each group's sessions start, and the group listing
+
+    def test_how_each_groups_sessions_start(self):
+        self.general()
+        self.assertEqual([O["group_starter"](self.store, g)
+                          for g in ("general", "clienta", "kokoima")],
+                         ["cl", "clt", "claude-swap run --group kokoima"])
+
+    def test_group_listing_without_general_is_as_up_to_1_21(self):
+        self.on(None, 2, store=self.plain)
+        self.assertEqual(O["group_lines"](self.plain),
+                         ["clienta (default): #2 a2@x.io  #3 a3@x.io · lane on #2",
+                          "kokoima: #3 a3@x.io  #5 a5@x.io"])
+        self.assertEqual(O["group_lines"]({"accounts": self.store["accounts"][:1]}),
+                         ["No reserved seats yet (claude-swap add --reserved)."])
+
+    def test_group_listing_with_general_tells_how_each_starts(self):
+        self.general()
+        self.unlisted()
+        self.on("kokoima", 5)
+        self.assertEqual(O["group_lines"](self.store), [
+            "general (cl, the shared login): #1 a1@x.io  #2 a2@x.io  #4 a4@x.io · active #1",
+            "clienta (default, clt): #2 a2@x.io  #3 a3@x.io",
+            "kokoima (claude-swap run --group kokoima): #3 a3@x.io  #5 a5@x.io · lane on #5",
+            "not in any group: #6 a6@x.io"])
+        self.assertEqual(O["ungrouped"](self.store), [6])
+        self.store["accounts"][5]["disabled"] = True  # in no group, but not live
+        self.assertEqual(O["group_lines"](self.store)[-1][:7], "kokoima")
+
+    # a group's watch, in words: on or off, and among which seats
+
+    def test_a_groups_watch_in_check_and_status(self):
+        self.general()
+        clause = lambda g: O["watch_clause"](self.store, g)
+        self.assertEqual(clause("general"), "general's watch moves cl among all its accounts")
+        self.assertEqual(clause("clienta"), "clienta's watch is off: claude-swap watch clienta on")
+        self.store["watch_groups"] = {
+            "general": {"on": True, "seats": ["a4@x.io", "a1@x.io"]},
+            "kokoima": {"on": True, "seats": None}}
+        self.assertEqual(clause("general"), "general's watch moves cl among #1, #4 only")
+        self.assertEqual(clause("kokoima"), "kokoima's watch moves them among #3, #5")
+        self.store["accounts"][4]["disabled"] = True
+        self.assertEqual(clause("kokoima"),
+                         "kokoima's watch is on, with fewer than two live seats: it moves nothing")
+        self.store["accounts"][3]["disabled"] = True
+        self.assertEqual(clause("general"),
+                         "general's watch is on, with one live account: no other to switch cl to")
+        self.store["watch_groups"]["general"]["on"] = False
+        self.assertEqual(clause("general"), "general's watch is off: claude-swap watch general on")
+
+    def test_the_seats_marked_watch_in_check(self):
+        self.general()
+        self.assertEqual(O["watch_marked"](self.store, "general"), set())  # every account
+        self.assertEqual(O["watch_marked"](self.store, "clienta"), set())  # off
+        self.store["watch_groups"] = {"general": {"on": True, "seats": ["a4@x.io", "a1@x.io"]},
+                                      "kokoima": {"on": True}}
+        self.assertEqual(O["watch_marked"](self.store, "general"), {1, 4})
+        self.assertEqual(O["watch_marked"](self.store, "kokoima"), {3, 5})
+        self.store["watch_groups"]["general"]["on"] = False
+        self.assertEqual(O["watch_marked"](self.store, "general"), set())
+
+    # check: the heads of the order tables
+
+    def test_order_heads_without_general_are_as_up_to_1_21(self):
+        self.store = self.plain
+        self.assertEqual(O["general_head"](self.store), ("", ""))
+        self.assertEqual(O["order_head"](self.store, "kokoima", True), (
+            "  Reserved order (kokoima)",
+            " — the kokoima reserved sessions (claude-swap run --group kokoima), same rule"
+            " · the watch does not move them: claude-swap watch reserved kokoima <n...>"))
+        self.store["lane_rotate"] = ["a2@x.io", "a3@x.io"]
+        self.assertEqual(O["order_head"](self.store, "clienta", False), (
+            "  Reserved order",
+            " — the reserved sessions (claude-swap run, never the shared login), same rule"
+            " · the watch moves them among #2, #3"))
+
+    def test_order_heads_with_general_say_each_groups_watch(self):
+        self.general()
+        self.store["watch_groups"] = {"kokoima": {"on": True}}
+        self.assertEqual(O["general_head"](self.store),
+                         (" (general, cl)", " · general's watch moves cl among all its accounts"))
+        self.assertEqual(O["order_head"](self.store, "clienta", False), (
+            "  Reserved order (clienta)",
+            " — the clienta reserved sessions (clt), same rule"
+            " · clienta's watch is off: claude-swap watch clienta on"))
+        self.assertEqual(O["order_head"](self.store, "kokoima", True), (
+            "  Reserved order (kokoima)",
+            " — the kokoima reserved sessions (claude-swap run --group kokoima), same rule"
+            " · kokoima's watch moves them among #3, #5"))
+
+    # check: «Free quota» and «left out»
+
+    def test_free_quota_has_general_as_a_group(self):
+        self.assertEqual(O["shared_note"](self.plain), "a seat in two groups counts in both")
+        O["set_group"](self.plain, "kokoima", [5])
+        self.assertIsNone(O["shared_note"](self.plain))
+        self.general()
+        self.assertEqual(O["quota_groups"](self.store),
+                         [("general", [1, 2, 4]), ("clienta", [2, 3]), ("kokoima", [3, 5])])
+        self.assertEqual(O["shared_seats"](self.store), [2, 3])
+        self.assertEqual(O["shared_note"](self.store),
+                         "a seat in more than one group counts in each")
+
+    def test_an_account_in_no_group_at_all_is_left_out_as_such(self):
+        self.unlisted()
+        self.assertEqual(O["left_out_reason"](self.store, 6, None, "default_raven", False),
+                         "in no group")
+        self.general()
+        self.assertEqual(O["left_out_reason"](self.store, 6, None, "default_raven", False),
+                         "not in any group")
+        self.assertEqual(O["order_tables"](self.store),
+                         [("clienta", [2, 3], [6]), ("kokoima", [3, 5], [])])
+
+    # status: Active, a line per lane, the watch
+
+    def test_status_active_line(self):
+        self.assertEqual(O["active_line"](self.plain), "Active: 1 (acc1 / a1@x.io)")
+        self.plain["active"] = 3  # a reserved account (a hand edit): as up to 1.21
+        self.assertEqual(O["active_line"](self.plain), "Active: 3 (acc3 / a3@x.io)")
+        self.plain["active"] = 0
+        self.assertEqual(O["active_line"](self.plain), "Active: none")
+        self.general()
+        self.assertEqual(O["active_line"](self.store), "Active: 1 (acc1 / a1@x.io)")
+        self.store["active"] = 3
+        self.assertEqual(O["active_line"](self.store), "Active: 3 (acc3 / a3@x.io)"
+                         " — not in general (claude-swap group general add 3)")
+
+    def test_status_names_every_lanes_group_and_its_watch_with_general(self):
+        O["set_group"](self.store, "kokoima", [])
+        O["set_group"](self.plain, "kokoima", [])
+        self.on(None, 3, store=self.plain)
+        self.assertEqual(O["lane_lines"](self.plain, []), [(3,
+            "Reserved sessions: 3 (acc3 / a3@x.io) — setup-token, no Claude in Chrome"
+            " · 0 open sessions on it · the watch does not move them"
+            " (claude-swap watch reserved <n...>)")])
+        self.general()
+        self.on(None, 3)
+        self.assertEqual(O["lane_lines"](self.store, []), [(3,
+            "Reserved sessions (clienta): 3 (acc3 / a3@x.io) — setup-token, no Claude in"
+            " Chrome · 0 open sessions on it · clienta's watch is off: claude-swap watch"
+            " clienta on")])
+        self.store["watch_groups"] = {"clienta": {"on": True}}
+        self.assertTrue(O["lane_lines"](self.store, [])[0][1].endswith(
+            " · the watch moves them among #2, #3"))
+        self.store["accounts"][1]["disabled"] = True
+        self.assertTrue(O["lane_lines"](self.store, [])[0][1].endswith(
+            " · clienta's watch is on, with fewer than two live seats: it moves nothing"))
+
+    def test_status_watch_line(self):
+        ws = {"model": "fable", "auto_reset": True, "active": 1, "manual": True,
+              "last": "5h 3%", "last_time": "10:00"}
+        self.assertEqual(O["watch_running"](self.plain, ws, 4242),
+                         "RUNNING (model fable + auto-reset, PID 4242) — watching #1 (picked by"
+                         " hand) — last probe 10:00: 5h 3%")
+        self.assertEqual(O["watch_running"](self.plain, {}, 7), "RUNNING (model ?, PID 7)")
+        self.general()
+        self.assertEqual(O["watch_running"](self.store, ws, 4242),
+                         "RUNNING (model fable, PID 4242) — general: watch on · every seat"
+                         " · spends free resets — watching #1 (picked by hand)"
+                         " — last probe 10:00: 5h 3%")
+        self.store["watch_groups"] = {"general": {"on": False}}
+        self.assertEqual(O["watch_running"](self.store, ws, 4242),
+                         "RUNNING (model fable, PID 4242) — general: watch off"
+                         " — last probe 10:00: 5h 3%")
+
+    # watch status
+
+    def test_watch_brief_of_general_with_one_account(self):
+        self.general()
+        O["set_group"](self.store, "general", [1])
+        self.assertEqual(O["watch_brief"](self.store, "general", True),
+                         "on · every seat · spends free resets · one live account:"
+                         " no other to switch to")
+        O["set_group"](self.store, "general", [])
+        self.assertEqual(O["watch_brief"](self.store, "general"),
+                         "on · every seat · no free resets · no live account")
+        self.store["watch_groups"] = {"kokoima": {"on": True, "seats": None}}
+        self.store["accounts"][4]["disabled"] = True
+        self.assertEqual(O["watch_brief"](self.store, "kokoima"),
+                         "on · every seat · no free resets · fewer than two live seats:"
+                         " nothing to move")
+
+    def test_watch_status_says_off_once_and_how_watch_start_sets_resets(self):
+        self.general()
+        off = "general's watch is off: the shared login is left where it is"
+        s = {"model": "fable", "auto_reset": True, "active": 1, "last_time": "10:00",
+             "last": "5h 3%", "decision": off}
+        self.store["watch_groups"] = {"general": {"on": False}}
+        self.assertEqual(O["watch_lines"](self.store, s), [
+            "  model fable · last probe 10:00 (5h 3%)",
+            "  general: watch off — the shared login is left where it is",
+            "  clienta: watch off",
+            "  kokoima: watch off",
+            "  watch start turns general's watch on, and its free resets on with"
+            " --auto-reset, off without it"])
+        # on again, before the watch looked: no stale "off"
+        self.store["watch_groups"] = {"general": {"on": True}}
+        self.assertEqual(O["watch_lines"](self.store, s)[1],
+                         "  general: watch on · every seat · spends free resets · watching #1")
+
+    # auth
+
+    def test_auth_words(self):
+        self.assertEqual(O["auth_footer"](self.plain), [
+            "  claude-swap auth <n>   authorize account n in its Chrome profile (one click)",
+            "  claude-swap auth all   every paid account without a good login, one after another",
+            "  claude-swap auth <n> --group <g>   a reserved seat's own login for group g's"
+            " lane, when g is not its first group"])
+        self.assertEqual(O["auth_none_left"](self.plain),
+                         "Every paid account already holds a good login.")
+        self.general()
+        self.assertEqual(O["auth_footer"](self.store)[1:], [
+            "  claude-swap auth all   general's paid accounts without a good login, one after"
+            " another",
+            "  claude-swap auth <n> --group <g>   an account's own login for group g, when g"
+            " is not its first group: a lane's, or general's (cl's)"])
+        self.assertEqual(O["auth_none_left"](self.store),
+                         "Every paid account of general already holds a good login.")
+
+    # the script
+
+    def test_script_watch_help_is_no_error(self):
+        for arg, rc in (("help", 0), ("-h", 0), ("--help", 0), ("-x", 1)):
+            r = self.sh("watch", arg)
+            self.assertEqual(r.returncode, rc, arg)
+            self.assertTrue(r.stdout.startswith("Usage: claude-swap watch [start"), arg)
+
+    def test_script_help_tells_how_watch_start_sets_generals_resets(self):
+        out = " ".join(self.sh("help").stdout.split())
+        self.assertIn("without --auto-reset, turns them off", out)
+
+    def test_script_group_lists_general_first_with_how_each_starts(self):
+        self.general()
+        self.unlisted()
+        r = self.sh("group")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout,
+                         "general (cl, the shared login): #1 a1@x.io  #2 a2@x.io  #4 a4@x.io"
+                         " · active #1\n"
+                         "clienta (default, clt): #2 a2@x.io  #3 a3@x.io\n"
+                         "kokoima (claude-swap run --group kokoima): #3 a3@x.io  #5 a5@x.io\n"
+                         "not in any group: #6 a6@x.io\n")
+
+    @unittest.skipUnless(os.uname().sysname == "Darwin", "claude-swap auth needs macOS")
+    def test_script_auth_footer_names_generals_accounts(self):
+        self.general()
+        r = self.sh("auth")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.splitlines()[-2:], O["auth_footer"](self.store)[1:])
+
+    def test_check_and_status_print_what_the_helpers_say(self):
+        # the heredocs only print: their decisions are the helpers above
+        with open(SCRIPT) as f:
+            src = f.read()
+        for call in ("oauth.active_line(store)", "oauth.watch_running(store, ws, wpid)",
+                     "oauth.general_head(store)", "oauth.order_head(store, g, many)",
+                     "oauth.watch_marked(store, oauth.GENERAL)", "engine.general_now(",
+                     "oauth.shared_note(store)", "oauth.group_lines(store)",
+                     "oauth.auth_footer(store)", "oauth.auth_none_left(store)"):
+            self.assertIn(call, src)
 
 
 class SessionsDespiteBadBytes(unittest.TestCase):
