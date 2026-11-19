@@ -906,5 +906,66 @@ class ChromeProfiles(unittest.TestCase):
         self.assertFalse(O["chrome_ready"]({"chrome_profile": "Profile 3"}, self.base))
 
 
+class SaveChanges(unittest.TestCase):
+    """A command that read the store a while ago saves only what it changed,
+    onto the store as it is on disk now: an account added meanwhile, or a
+    field another process wrote, survives."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "store.json")
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def write(self, d):
+        with open(self.path, "w") as f:
+            json.dump(d, f)
+
+    def read(self):
+        with open(self.path) as f:
+            return json.load(f)
+
+    def test_an_account_added_meanwhile_is_kept(self):
+        before = {"active": 1, "accounts": [{"email": "a@x.io", "plan": None}]}
+        self.write(before)
+        after = json.loads(json.dumps(before))
+        after["accounts"][0]["plan"] = "max"
+        self.write({"active": 1, "accounts": [{"email": "a@x.io", "plan": None},
+                                              {"email": "b@x.io"}]})
+        O["save_changes"](self.path, before, after)
+        got = self.read()
+        self.assertEqual([a["email"] for a in got["accounts"]], ["a@x.io", "b@x.io"])
+        self.assertEqual(got["accounts"][0]["plan"], "max")
+
+    def test_only_changed_fields_are_written_and_removals_too(self):
+        before = {"active": 1, "accounts": [{"email": "a@x.io", "plan": "max",
+                                             "sub_checked": 5, "org_id": "o"}]}
+        after = json.loads(json.dumps(before))
+        after["accounts"][0].pop("sub_checked")
+        self.write({"active": 2, "accounts": [{"email": "A@x.io", "plan": "max",
+                                               "sub_checked": 5, "org_id": "o",
+                                               "oauth": {"fp": "new"}}]})
+        O["save_changes"](self.path, before, after)
+        got = self.read()
+        self.assertEqual(got["active"], 2)  # not changed here: the disk wins
+        self.assertNotIn("sub_checked", got["accounts"][0])
+        self.assertEqual(got["accounts"][0]["oauth"], {"fp": "new"})
+
+    def test_an_account_removed_meanwhile_stays_removed(self):
+        before = {"accounts": [{"email": "a@x.io"}, {"email": "b@x.io"}]}
+        after = json.loads(json.dumps(before))
+        after["accounts"][1]["plan"] = "max"
+        self.write({"accounts": [{"email": "a@x.io"}]})
+        O["save_changes"](self.path, before, after)
+        self.assertEqual(self.read()["accounts"], [{"email": "a@x.io"}])
+
+    def test_changed_top_keys_are_written(self):
+        before = {"active": 1, "accounts": []}
+        after = {"active": 3, "accounts": []}
+        self.write({"active": 1, "lane": {"n": 2}, "accounts": [{"email": "c@x.io"}]})
+        O["save_changes"](self.path, before, after)
+        got = self.read()
+        self.assertEqual((got["active"], got["lane"], len(got["accounts"])), (3, {"n": 2}, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

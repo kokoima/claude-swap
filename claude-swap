@@ -22,7 +22,7 @@
 
 set -e
 
-VERSION="1.20.0"
+VERSION="1.20.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -1398,6 +1398,41 @@ def commit(path, store, top=("active", "live")):
     save_store(path, fresh)
 
 
+def save_changes(path, before, after):
+    """Save what changed from `before` (the store as this command read it)
+    to `after` (as it leaves it), and nothing else, onto the store as it is
+    on disk now. A command that runs for a minute (check, keys-sync) must
+    not write back its old copy whole: it would drop an account added in
+    that minute, or undo a login or a lane move another process saved.
+    Accounts are matched by email; one gone from the disk stays gone."""
+    try:
+        fresh = load_store(path)
+    except Exception:
+        return save_store(path, after)
+
+    def key(a):
+        return (a.get("email") or "").strip().lower()
+    old = {key(a): a for a in before.get("accounts", []) if key(a)}
+    new = {key(a): a for a in after.get("accounts", []) if key(a)}
+    for a in fresh.get("accounts", []):
+        k = key(a)
+        b, n = old.get(k, {}), new.get(k)
+        if n is None:
+            continue
+        for f in set(b) | set(n):
+            if f not in n:
+                a.pop(f, None)
+            elif b.get(f, object) != n[f]:
+                a[f] = n[f]
+    for f in set(before) | set(after):
+        if f == "accounts":
+            continue
+        if f not in after:
+            fresh.pop(f, None)
+        elif before.get(f, object) != after[f]:
+            fresh[f] = after[f]
+    save_store(path, fresh)
+
 # ---------- the server ----------
 
 class Dead(Exception):
@@ -2579,6 +2614,7 @@ exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 store_path = sys.argv[1]
 with open(store_path) as f:
     store = json.load(f)
+store_read = json.loads(json.dumps(store))  # what save_changes compares against
 
 accounts = store.get("accounts", [])
 active = store.get("active", 0)
@@ -2912,8 +2948,7 @@ for i, acc in enumerate(accounts):
     results.append(row)
 
 if store_dirty[0]:
-    with open(store_path, "w") as f:
-        json.dump(store, f, indent=2)
+    oauth.save_changes(store_path, store_read, store)
 
 # ---------- cache for read-only consumers (statusline) ----------
 # Written atomically so a half-written file never reaches a reader that
@@ -3955,6 +3990,7 @@ def read_console_key(db):
 store_path = sys.argv[1]
 with open(store_path) as f:
     store = json.load(f)
+store_read = json.loads(json.dumps(store))  # what save_changes compares against
 accounts = store.get("accounts", [])
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -4132,8 +4168,8 @@ for em, (_, prof) in sorted(console_seen.items()):
         print(f"  {prof}: Console login for an email that is not a claude-swap account (ignored)")
 
 if updated:
-    with open(store_path, "w") as f:
-        json.dump(store, f, indent=2)
+    # a scan takes minutes: save what it changed, not the copy it read
+    oauth.save_changes(store_path, store_read, store)
 
 def chrome_profile(email):
     """Chrome profile named after this email: where to log claude.ai back in."""
