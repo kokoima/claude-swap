@@ -22,7 +22,7 @@
 
 set -e
 
-VERSION="1.20.1"
+VERSION="1.20.2"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its account's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -2171,7 +2171,7 @@ def lane_summary(store, sessions=None):
         parts.append(f"the watch moves them among {pool}")
     else:
         parts.append(f"outside the watch's list ({pool}): they stay here until claude-swap <n>")
-    return n, f"{n} ({a.get('label', '?')} / {a.get('email') or '-'}) — " + " · ".join(parts)
+    return n, f"{n} ({' / '.join(dict.fromkeys([a.get('label', '?'), a.get('email') or '-']))}) — " + " · ".join(parts)
 PYEOF
 export CLAUDE_SWAP_OAUTH="$OAUTH_PY"
 
@@ -2460,7 +2460,7 @@ if is_macos:
                     f"no Chrome profile has the extension signed in to {a.get('email')}"))
                    if (store.get("lane") or {}).get("mode") == "oauth"
                    else "setup-token, no Claude in Chrome")
-            print(f"This session: {k} ({a.get('label', '?')} / {a.get('email') or '-'})"
+            print(f"This session: {k} ({' / '.join(dict.fromkeys([a.get('label', '?'), a.get('email') or '-']))})"
                   f" — a reserved session (claude-swap run), on its {how};"
                   " claude-swap <n> moves the reserved sessions, the Active login below"
                   " does not reach them")
@@ -2472,7 +2472,7 @@ if is_macos:
         kind = "reserved, " if a.get("reserved") else ""
         chrome = ("Claude in Chrome ready" if oauth.chrome_ready(a)
                   else f"no Chrome profile has the extension signed in to {a.get('email')}")
-        print(f"This session: {k_own} ({a.get('label', '?')} / {a.get('email') or '-'})"
+        print(f"This session: {k_own} ({' / '.join(dict.fromkeys([a.get('label', '?'), a.get('email') or '-']))})"
               f" — {kind}claude-swap run on its own full login, {chrome};"
               " the Active login below does not reach it")
     elif found and found[1]:
@@ -2480,7 +2480,7 @@ if is_macos:
         if k:
             a = accounts[k - 1]
             kind = "reserved, " if a.get("reserved") else ""
-            print(f"This session: {k} ({a.get('label', '?')} / {a.get('email') or '-'})"
+            print(f"This session: {k} ({' / '.join(dict.fromkeys([a.get('label', '?'), a.get('email') or '-']))})"
                   f" — {kind}claude-swap run on its setup-token, no Claude in Chrome;"
                   " the Active login below does not reach it")
         else:
@@ -2490,7 +2490,7 @@ if is_macos:
 
 if 1 <= active <= len(accounts):
     acc = accounts[active - 1]
-    print(f"Active: {active} ({acc.get('label', '?')} / {acc.get('email') or '-'})")
+    print(f"Active: {active} ({' / '.join(dict.fromkeys([acc.get('label', '?'), acc.get('email') or '-']))})")
 else:
     print(f"Active: none")
 
@@ -2576,18 +2576,18 @@ def plan_next(acc):
             "renews": f"renews {when}"}[kind]
 
 nw = len(str(len(accounts)))
-print(f"  {'#':>{nw + 1}}  {'Label':<20} {'Email':<30} {'Plan':<20} Token")
+print(f"  {'#':>{nw + 1}}  {'Account':<30} {'Plan':<20} Token")
 for i, acc in enumerate(accounts):
     n = i + 1
     marker = "*" if n == active else "▸" if n == lane_n else " "
-    label = acc.get("label", "")[:20]
-    email = (acc.get("email") or "-")[:30]
+    # the email names the account; the label only when there is no email
+    who = (acc.get("email") or acc.get("label") or "-")[:30]
     exp_ms = acc.get("expires", 0)
     if exp_ms > now_ms:
         exp_dt = datetime.fromtimestamp(exp_ms / 1000).strftime("%Y-%m-%d")
     else:
         exp_dt = "EXPIRED"
-    print(f"  {marker}{n:>{nw}}  {label:<20} {email:<30} {plan_next(acc):<20} {exp_dt}")
+    print(f"  {marker}{n:>{nw}}  {who:<30} {plan_next(acc):<20} {exp_dt}")
 if lane_n:
     print(f"  * Active (the shared login, cl) · ▸ reserved sessions (clt)")
 PYEOF
@@ -6248,7 +6248,7 @@ if target < 1 or target > len(accounts):
     sys.exit(1)
 
 acc = accounts[target - 1]
-print(f"Account {target}: {acc.get('label', '?')} / {acc.get('email') or '-'}")
+print(f"Account {target}: {' / '.join(dict.fromkeys([acc.get('label', '?'), acc.get('email') or '-']))}")
 PYEOF
 
   read -r -p "Remove this account? (y/n) " confirm
