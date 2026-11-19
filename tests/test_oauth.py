@@ -967,5 +967,65 @@ class SaveChanges(unittest.TestCase):
         self.assertEqual((got["active"], got["lane"], len(got["accounts"])), (3, {"n": 2}, 1))
 
 
+class Groups(Base):
+    """Groups of reserved seats: by email in the store, the first is the default."""
+    def setUp(self):
+        super().setUp()
+        for n in (2, 3):
+            self.store["accounts"][n - 1]["reserved"] = True
+
+    def test_without_groups_every_reserved_account_is_in_one_implicit_group(self):
+        self.assertEqual(O["groups_of"](self.store), {"reserved": [2, 3]})
+        self.assertEqual(O["default_group"](self.store), "reserved")
+
+    def test_groups_are_kept_by_email_and_survive_a_renumbering(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        O["set_group"](self.store, "kokoima", [3])
+        self.assertEqual(self.store["groups"], {"cobas": ["a2@x.io", "a3@x.io"],
+                                                "kokoima": ["a3@x.io"]})
+        self.store["accounts"].reverse()  # 3,2,1
+        self.assertEqual(O["groups_of"](self.store), {"cobas": [1, 2], "kokoima": [1]})
+
+    def test_the_first_group_is_the_default_and_an_accounts_home(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        O["set_group"](self.store, "kokoima", [3])
+        self.assertEqual(O["default_group"](self.store), "cobas")
+        self.assertEqual(O["groups_for"](self.store, 3), ["cobas", "kokoima"])
+        self.assertEqual(O["home_group"](self.store, 3), "cobas")
+        self.assertIsNone(O["home_group"](self.store, 1))
+
+    def test_only_reserved_live_accounts_count(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        self.store["accounts"][2]["disabled"] = True
+        self.assertEqual(O["groups_of"](self.store), {"cobas": [2]})
+
+    def test_an_empty_list_removes_the_group(self):
+        O["set_group"](self.store, "cobas", [2])
+        O["set_group"](self.store, "cobas", [])
+        self.assertNotIn("groups", self.store)
+
+    def test_resolve_a_seat_in_one_group(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        O["set_group"](self.store, "kokoima", [3])
+        self.assertEqual(O["resolve_group"](self.store, 2), ("cobas", None))
+
+    def test_a_seat_in_two_groups_needs_one_named_or_the_sessions_lane(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        O["set_group"](self.store, "kokoima", [3])
+        g, err = O["resolve_group"](self.store, 3)
+        self.assertIsNone(g)
+        self.assertIn("claude-swap 3 cobas", err)
+        self.assertEqual(O["resolve_group"](self.store, 3, "kokoima"), ("kokoima", None))
+        d = O["lane_dir"](None, "kokoima")
+        self.assertEqual(O["resolve_group"](self.store, 3, None, d), ("kokoima", None))
+
+    def test_a_group_the_seat_is_not_in_is_refused(self):
+        O["set_group"](self.store, "cobas", [2, 3])
+        O["set_group"](self.store, "kokoima", [3])
+        g, err = O["resolve_group"](self.store, 2, "kokoima")
+        self.assertIsNone(g)
+        self.assertIn("not in kokoima", err)
+
+
 if __name__ == "__main__":
     unittest.main()

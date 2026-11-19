@@ -986,6 +986,66 @@ def who(a):
         return lb or "?"
     return em if not lb or lb.lower() == em.lower() else f"{lb} / {em}"
 
+IMPLICIT = "reserved"   # the one group of a store without groups (as up to 1.20)
+GROUP_RE = re.compile(r"[a-z][a-z0-9_-]{0,19}\Z")
+
+def _seat(a):
+    return a.get("reserved") and a.get("token") and not a.get("disabled")
+
+def groups_of(store):
+    """{group: [n...]} in the store's group order; without groups, one implicit
+    group with every reserved account (claude-swap up to 1.20)."""
+    accounts = store.get("accounts", [])
+    g = store.get("groups")
+    if not g:
+        ns = [i for i, a in enumerate(accounts, 1) if _seat(a)]
+        return {IMPLICIT: ns} if ns else {}
+    num = {(a.get("email") or "").strip().lower(): i for i, a in enumerate(accounts, 1)}
+    out = {}
+    for name, emails in g.items():
+        ns = [num[e.lower()] for e in emails
+              if e.lower() in num and _seat(accounts[num[e.lower()] - 1])]
+        out[name] = sorted(set(ns))
+    return out
+
+def default_group(store):
+    g = store.get("groups")
+    return next(iter(g)) if g else IMPLICIT
+
+def groups_for(store, n):
+    return [g for g, ns in groups_of(store).items() if n in ns]
+
+def home_group(store, n):
+    gs = groups_for(store, n)
+    return gs[0] if gs else None
+
+def set_group(store, g, ns):
+    accounts = store.get("accounts", [])
+    groups = dict(store.get("groups") or {})
+    if ns:
+        groups[g] = [(accounts[n - 1].get("email") or "").strip().lower() for n in ns]
+    else:
+        groups.pop(g, None)
+    if groups:
+        store["groups"] = groups
+    else:
+        store.pop("groups", None)
+
+def resolve_group(store, n, g=None, config_dir=None):
+    """Whose lane `claude-swap n` moves -> (group, None) or (None, why)."""
+    gs = groups_for(store, n)
+    if not gs:
+        return None, f"#{n} is in no group of reserved seats (claude-swap group)"
+    if g:
+        return (g, None) if g in gs else (None, f"#{n} is not in {g} (it is in {', '.join(gs)})")
+    if len(gs) == 1:
+        return gs[0], None
+    mine = group_of_dir(store, config_dir) if config_dir else None
+    if mine in gs:
+        return mine, None
+    return None, (f"#{n} is in {' and '.join(gs)}: say which lane moves,"
+                  f" claude-swap {n} {gs[0]}")
+
 def console_slot(email):
     """The vault entry of an account's Console session (keys-sync saves it)."""
     return "console:" + (email or "").lower()
@@ -1970,8 +2030,20 @@ def run_sync(store, secrets, now, base=None):
 
 LANE = "reserved"
 
-def lane_dir(base=None):
-    return os.path.realpath(os.path.join(base or RUN_BASE, LANE))
+def lane_dir(base=None, group=None):
+    """The default group's lane is the one of 1.15 (RUN_BASE/reserved); any
+    other group's is RUN_BASE/lane-<group>."""
+    name = LANE if not group or group == IMPLICIT else f"lane-{group}"
+    return os.path.realpath(os.path.join(base or RUN_BASE, name))
+
+def group_of_dir(store, config_dir, base=None):
+    if not config_dir:
+        return None
+    d = os.path.realpath(config_dir)
+    for g in groups_of(store):
+        if d == lane_dir(base, None if g == default_group(store) else g):
+            return g
+    return None
 
 def lane_of(store):
     """The reserved account the lane is on, while it still is one: n or None."""
@@ -2228,6 +2300,11 @@ cmd_help() {
   echo "  claude-swap reset <n> [full|fable]"
   echo "                           Spend one of account N's free resets, of that kind (default:"
   echo "                           the one that helps now); asks first, cannot be undone"
+  echo "  claude-swap group [g [n ... | off]]"
+  echo "                           Groups of reserved seats (cobas, kokoima...): list them, set"
+  echo "                           one's seats, or remove it; the first is the default group"
+  echo "  claude-swap lane [g]     Where each group's lane is: '<group> <n|-> <oauth|setup|->'"
+  echo "  claude-swap <n> [group]  A reserved seat in two groups says whose lane moves"
   echo "  claude-swap model [name] Show or set the model the sessions use (fable, opus...):"
   echo "                           its own weekly limit counts like the 5h and the week"
   echo "                           ('model fable' is what 'auto fable' and 'watch start fable' did)"
@@ -3710,13 +3787,14 @@ _do_rotate() {
   # full login (Claude in Chrome works) or, without one, its setup-token.
   # Claude Code's keychain item is overwritten, never deleted: running
   # sessions keep serving a deleted item from their cache.
-  python3 - "$STORE" "$1" "$IS_MACOS" <<'PYEOF'
+  python3 - "$STORE" "$1" "$IS_MACOS" "${2:-}" <<'PYEOF'
 import os, sys, time, types
 
 oauth = types.ModuleType("oauth")
 exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
 
 store_path, target, macos = sys.argv[1], sys.argv[2], sys.argv[3] == "true"
+group_arg = sys.argv[4] if len(sys.argv) > 4 else ""
 store = oauth.load_store(store_path)
 accounts = store.get("accounts", [])
 n = int(target) if target.isdigit() else 0
@@ -3727,9 +3805,23 @@ acc = accounts[n - 1]
 if not acc.get("token"):
     print(f"Error: account {n} has no token")
     sys.exit(1)
+if group_arg and not acc.get("reserved"):
+    print(f"Error: account {n} is not reserved: only a reserved seat takes a group"
+          f" (claude-swap {n} {group_arg})")
+    sys.exit(1)
 if acc.get("reserved"):
     # the shared login reaches every session and the watch would move them
     # off it: a reserved account moves the reserved sessions instead
+    if group_arg or store.get("groups"):
+        grp, err = oauth.resolve_group(store, n, group_arg or None,
+                                       os.environ.get("CLAUDE_CONFIG_DIR"))
+        if err:
+            print(f"Error: {err}")
+            sys.exit(1)
+        if grp != oauth.default_group(store):
+            print(f"Error: lanes per group come in 1.21: only {oauth.default_group(store)}"
+                  " has a lane for now")
+            sys.exit(1)
     if not macos:
         print(f"Account {n} is reserved: it never becomes the shared login.")
         print(f"Open a session on it with:  claude-swap run {n} -- <claude args>")
@@ -5088,6 +5180,93 @@ PYEOF
   fi
 }
 
+cmd_group() {
+  # Groups of reserved seats: list them, set one's seats (group <g> <n>...) or
+  # remove it (group <g> off). Kept by email in the store; the first is the
+  # default group, whose lane is the one of 1.15.
+  check_store
+  python3 - "$STORE" "$@" <<'PYEOF'
+import os, sys, types
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+
+store_path, args = sys.argv[1], sys.argv[2:]
+store = oauth.load_store(store_path)
+accounts = store.get("accounts", [])
+
+def listing():
+    groups = oauth.groups_of(store)
+    if not groups:
+        print("No reserved seats yet (claude-swap add --reserved).")
+        return
+    dflt, on = oauth.default_group(store), oauth.lane_of(store)
+    for g, ns in groups.items():
+        seats = "  ".join(f"#{n} {accounts[n - 1].get('email') or '?'}" for n in ns) or "(no live seats)"
+        lane = f" · lane on #{on}" if g == dflt and on else ""
+        print(f"{g}{' (default)' if g == dflt else ''}: {seats}{lane}")
+
+if not args:
+    listing()
+    sys.exit(0)
+
+g, rest = args[0], args[1:]
+if rest == ["off"]:
+    if g not in (store.get("groups") or {}):
+        sys.exit(f"Error: there is no group {g}")
+    if len(store["groups"]) == 1 and any(x[2] for x in oauth.reserved_sessions()):
+        sys.exit(f"Error: {g} is the only group and sessions are open on its lane:"
+                 " close them first")
+    oauth.set_group(store, g, [])
+elif rest:
+    if g == oauth.IMPLICIT or not oauth.GROUP_RE.match(g):
+        sys.exit(f"Error: a group name is a-z, 0-9, - or _, starting with a letter, up to 20"
+                 f" characters, and never '{oauth.IMPLICIT}': {g!r}")
+    picked = []
+    for x in rest:
+        n = int(x) if x.isdigit() else 0
+        if not 1 <= n <= len(accounts):
+            sys.exit(f"Error: account {x} does not exist (valid: 1-{len(accounts)})")
+        a = accounts[n - 1]
+        if not a.get("reserved"):
+            sys.exit(f"Error: account {n} is not reserved (claude-swap reserve {n})")
+        if not (a.get("email") or "").strip():
+            sys.exit(f"Error: account {n} has no email in the store")
+        if n not in picked:
+            picked.append(n)
+    oauth.set_group(store, g, picked)
+else:
+    sys.exit("Usage: claude-swap group [<g> <n> ... | <g> off]")
+oauth.save_store(store_path, store)
+listing()
+PYEOF
+}
+
+cmd_lane() {
+  # One line per group: <group> <n|-> <oauth|setup|->. Only the default group
+  # has a lane so far.
+  check_store
+  python3 - "$STORE" "${1:-}" <<'PYEOF'
+import os, sys, types
+
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+
+store_path, want = sys.argv[1], sys.argv[2]
+store = oauth.load_store(store_path)
+groups = oauth.groups_of(store)
+if want and want not in groups:
+    sys.exit(f"Error: there is no group {want}")
+dflt = oauth.default_group(store)
+for g in groups:
+    if want and g != want:
+        continue
+    n = oauth.lane_of(store) if g == dflt else None
+    mode = (store.get("lane") or {}).get("mode") if n else None
+    print(g, n or "-", mode if mode in ("oauth", "setup") else "-")
+PYEOF
+}
+
 cmd_watch_reserved() {
   # Which reserved accounts the watch may move the reserved sessions among
   # when the one they are on reaches its limit (none: it leaves them alone).
@@ -6407,8 +6586,15 @@ case "${1:-}" in
   "")
     cmd_interactive
     ;;
+  group)
+    shift
+    cmd_group "$@"
+    ;;
+  lane)
+    cmd_lane "${2:-}"
+    ;;
   [0-9]*)
-    _do_rotate "$1"
+    _do_rotate "$1" "${2:-}"
     ;;
   *)
     echo "Unknown command: $1"
