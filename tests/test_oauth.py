@@ -2196,6 +2196,7 @@ class GroupCommands(Base):
         r = self.sh("run", "--group", "nope", "--", "--chrome")
         self.assertEqual((r.returncode, r.stderr.strip()), (1, "Error: there is no group nope"))
 
+    @unittest.skipUnless(os.uname().sysname == "Darwin", "claude-swap auth needs macOS")
     def test_script_auth_checks_the_group_before_any_login(self):
         r = self.sh("auth", "2", "--group", "kokoima")
         self.assertEqual((r.returncode, r.stdout.strip()),
