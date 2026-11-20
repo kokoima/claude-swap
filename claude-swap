@@ -16,6 +16,7 @@
 #   claude-swap auth [n|all] Full login per account (needed by Claude in Chrome)
 #   claude-swap chrome [n]   Open the account's Chrome profile
 #   claude-swap web [start|stop|status]  The dashboard as a web page (127.0.0.1)
+#   claude-swap usage [pace] What the accounts used over time, and the forecast
 #   claude-swap add          Add a new account
 #   claude-swap remove <n>   Remove an account
 #   claude-swap init         First-time setup
@@ -23,7 +24,7 @@
 
 set -e
 
-VERSION="1.24.4"
+VERSION="1.25.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -4547,6 +4548,17 @@ def web_state(store, cache, now, sessions=(), watch=None, credits=None, viewer=N
         "watch": watch_state_view(store, watch)})
 
 
+def usage_groups(store):
+    """The groups the Usage section adds up: general and each lane group, with
+    the seats its watch moves among (its own list when it has one)."""
+    out = []
+    if oauth.general_of(store):
+        out.append({"name": oauth.GENERAL, "seats": oauth.watch_seats(store, oauth.GENERAL)})
+    for g in oauth.groups_of(store):
+        out.append({"name": g, "seats": oauth.watch_seats(store, g)})
+    return out
+
+
 # ---------- the whitelist ----------
 
 def _live_n(store, x):
@@ -4774,7 +4786,10 @@ class App:
             "watch_state": os.path.join(c, "claude-swap-watch.state"),
             "watch_log": os.path.join(c, "claude-swap-watch.log"),
             "watch_plist": os.path.join(home, "Library", "LaunchAgents",
-                                        "com.claude-swap.watch.plist")}
+                                        "com.claude-swap.watch.plist"),
+            "history": os.path.join(c, "claude-swap-usage-history.jsonl")}
+        m = globals().get("meter")  # set by whoever execs this module (1.25)
+        self.history = m.History(self.paths["history"]) if m else None
         self.run, self.popen, self.clock = run, popen, clock
         self.sessions = sessions or oauth.reserved_sessions
         self.log = log or (lambda msg: print(msg, flush=True))
@@ -4955,12 +4970,15 @@ class App:
         if ((h.get("sec-fetch-site") or "").lower() == "cross-site"
                 and not (method == "GET" and url.path == "/")):
             return self._error(403, "a request from another site")
-        routes = {"/": "GET", "/api/state": "GET", "/api/reset-preview": "GET",
+        routes = {"/": "GET", "/api/state": "GET", "/api/reset-preview": "GET", "/api/usage": "GET",
                   "/api/refresh": "POST", "/api/action": "POST"}
         if url.path not in routes:
             return self._error(404, "not found")
         if method != routes[url.path]:
             return self._reply(405, b"", "text/plain", [("Allow", routes[url.path])])
+        if url.path == "/api/usage":
+            q = {k: v[0] for k, v in parse_qs(url.query).items()}
+            return self._json(200, self.usage(store, q.get("view"), q.get("days")))
         m = re.search(rf"(?:^|;)\s*{COOKIE}=([^;]*)", h.get("cookie") or "")
         sid = m.group(1).strip() if m and SID_RE.match(m.group(1).strip()) else None
         if url.path in ("/", "/api/state"):
@@ -5046,6 +5064,38 @@ class App:
                       self.refreshing(), history=history)
         s["csrf"] = self.token(sid, viewer)
         return self._json(200, s, extra)
+
+    def record(self, store=None):
+        """Add what changed in the usage cache to the usage history (the
+        server does it every minute; a Usage request first)."""
+        if self.history is None:
+            return 0
+        try:
+            store = store or oauth.load_store(self.store_path)
+            return self.history.record(_read_json(self.paths["cache"]), store, prune=True,
+                                       now=self.clock())
+        except Exception as e:
+            self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: usage history: {type(e).__name__}")
+            return 0
+
+    def usage(self, store, view=None, days=None):
+        """/api/usage?view=pace: the Usage section's data, from the usage
+        history and what the state says of each account now."""
+        if self.history is None:
+            return {"error": "no usage module"}
+        self.record(store)
+        now = self.clock()
+        try:
+            days = max(1, min(60, int(days or 14)))
+        except ValueError:
+            days = 14
+        view = view or "pace"
+        if view == "pace":
+            st = web_state(store, _read_json(self.paths["cache"]), now)
+            hist = self.history.load(now - (days + 1) * 86400)
+            return _finite(dict(meter.pace_view(st["accounts"], usage_groups(store), hist, now, days),
+                                view=view))
+        return {"error": "unknown view"}
 
     def env(self):
         e = {k: v for k, v in os.environ.items() if k != "CLAUDE_SWAP_WEB"}
@@ -5216,6 +5266,12 @@ def main(store_path, bin_path, version, port, pid_path, home=None):
     def stop(*_):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
+
+    def recorder():  # the usage history, whether anyone looks or not
+        while True:
+            app.record()
+            time.sleep(60)
+    threading.Thread(target=recorder, daemon=True).start()
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] claude-swap web {version} on"
           f" http://127.0.0.1:{port} — "
           + (f"tailnet owner {owner}" if owner else "no tailscale owner: this Mac only"),
@@ -5233,6 +5289,354 @@ def main(store_path, bin_path, version, port, pid_path, home=None):
         except OSError:
             pass
     return 0
+PYEOF
+
+read -r -d '' METER_PY <<'PYEOF' || true
+# claude-swap usage (1.25): what the accounts used over time, for
+# `claude-swap usage` and the web's Usage section. All of it from this Mac:
+#  - the usage history: each time the usage cache changes, a line per account
+#    that moved (or every HEARTBEAT), keyed by email, so that renumbering the
+#    accounts never mixes two of them (~/.claude/claude-swap-usage-history.jsonl);
+#  - the logs (events) and Claude Code's transcripts (tokens).
+# Nothing here reaches the network, and nothing it writes holds a token.
+
+import json, os, re, time
+from datetime import datetime, timedelta
+
+HEARTBEAT = 1800           # an account that did not move is written again after this
+KEEP = 90 * 86400          # the history keeps this much...
+PRUNE_BYTES = 48 << 20     # ...and is rewritten without the older lines past this size
+TAIL_BYTES = 4 << 20       # what is read back to know each account's last line
+NOW_SPAN = 2 * 3600        # "pace now": the rise over this
+MIN_SPAN = 600             # ...measured over at least this
+GAP = 1800                 # ...only between readings this close (a rise over a longer gap is spread over it)
+DROP = 10                  # a fall of more than this many points is a reset, not noise
+HORIZON = 7 * 86400        # how far the forecast looks
+STEP = 3 * 3600            # ...in steps of this
+HOUR, DAY = 3600, 86400
+
+
+def _num(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and abs(v) != float("inf") else None
+
+
+def _round(x, q):
+    v = _num(x)
+    return None if v is None else int(round(v / q) * q)
+
+
+def point(row, pref):
+    """What the history keeps of a usage-cache row: the 5h, the week and the
+    preferred model's own weekly limit (%), when each renews, the plan.
+    None for a row with no figures."""
+    u5, u7 = _num(row.get("u5")), _num(row.get("u7"))
+    if u5 is None and u7 is None:
+        return None
+    m = rf = None
+    for name, v in (row.get("models") or {}).items():
+        if pref and name.lower() == pref.lower() and isinstance(v, dict):
+            m, rf = _num(v.get("pct")), v.get("resets_at")
+    return {"u5": u5, "u7": u7, "m": m, "r5": _round(row.get("r5"), 60),
+            "r7": _round(row.get("r7"), 600), "rf": _round(rf, 600),
+            "p": row.get("plan") if isinstance(row.get("plan"), str) else None}
+
+
+class History:
+    """The usage history file: record() appends what changed in a usage cache,
+    load() reads it back (only what was added since the last load)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.last = None          # email -> its last line (what record compares with)
+        self._pos, self._key, self._by = 0, None, {}
+        self._pruned = 0
+
+    def _tail(self):
+        last = {}
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - TAIL_BYTES))
+                if size > TAIL_BYTES:
+                    f.readline()
+                for line in f:
+                    x = _parse(line)
+                    if x:
+                        last[x["e"]] = x
+        except OSError:
+            pass
+        return last
+
+    def record(self, cache, store, prune=False, now=None):
+        """Append a line for each account of cache (the usage cache) whose
+        figures changed since its last line, or whose last line is HEARTBEAT
+        old. An account is known by the store's email for its number, and only
+        while the store still has the label the cache has (a renumbering in
+        between skips it). -> lines written."""
+        now = time.time() if now is None else now
+        rows = (cache or {}).get("accounts") or []
+        t = _num((cache or {}).get("updated"))
+        if not rows or t is None:
+            return 0
+        if self.last is None:
+            self.last = self._tail()
+        accounts = (store or {}).get("accounts") or []
+        pref = (cache or {}).get("model") or (store or {}).get("model") or "fable"
+        out = []
+        for row in rows:
+            n = row.get("n")
+            if not isinstance(n, int) or not 1 <= n <= len(accounts):
+                continue
+            a = accounts[n - 1]
+            e = (a.get("email") or "").strip().lower()
+            if not e or (row.get("label") and row.get("label") != a.get("label")):
+                continue
+            p = point(row, pref)
+            if p is None:
+                continue
+            prev = self.last.get(e)
+            if prev and prev["t"] >= int(t):
+                continue
+            if prev and int(t) - prev["t"] < HEARTBEAT and all(prev.get(k) == v for k, v in p.items()):
+                continue
+            x = dict(t=int(t), e=e, **p)
+            self.last[e] = x
+            out.append(json.dumps(x, separators=(",", ":")) + "\n")
+        if out:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a") as f:
+                f.write("".join(out))
+        if prune and now - self._pruned > DAY:
+            self._pruned = now
+            self.prune(now)
+        return len(out)
+
+    def prune(self, now=None):
+        """Rewrite the file without the lines older than KEEP, when it is
+        bigger than PRUNE_BYTES or its first line is older than KEEP + a day."""
+        now = time.time() if now is None else now
+        try:
+            size = os.path.getsize(self.path)
+            with open(self.path, "rb") as f:
+                first = _parse(f.readline())
+        except OSError:
+            return False
+        if size <= PRUNE_BYTES and not (first and first["t"] < now - KEEP - DAY):
+            return False
+        cut = now - KEEP
+        tmp = self.path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(self.path, "rb") as src, os.fdopen(fd, "wb") as dst:
+            for line in src:
+                x = _parse(line)
+                if x and x["t"] >= cut:
+                    dst.write(line)
+        os.replace(tmp, self.path)
+        self._key = None
+        return True
+
+    def load(self, since=0):
+        """{email: [lines, oldest first]} from since on. The file is read once;
+        later calls read only what was appended (all of it again if it shrank)."""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return {}
+        if self._key is None or st.st_size < self._pos or st.st_ino != self._key:
+            self._pos, self._by, self._key = 0, {}, st.st_ino
+        if st.st_size > self._pos:
+            with open(self.path, "rb") as f:
+                f.seek(self._pos)
+                data = f.read()
+            end = data.rfind(b"\n") + 1
+            self._pos += end
+            fresh = {}
+            for line in data[:end].splitlines():
+                x = _parse(line)
+                if x:
+                    fresh.setdefault(x["e"], []).append(x)
+            for e, xs in fresh.items():
+                cur = self._by.setdefault(e, [])
+                cur.extend(xs)
+                if len(cur) > len(xs) and cur[-len(xs) - 1]["t"] > xs[0]["t"]:
+                    cur.sort(key=lambda x: x["t"])
+        return {e: [x for x in xs if x["t"] >= since] for e, xs in self._by.items()
+                if xs and xs[-1]["t"] >= since}
+
+
+def _parse(line):
+    try:
+        x = json.loads(line)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(x, dict) or not isinstance(x.get("e"), str) or _num(x.get("t")) is None:
+        return None
+    return x
+
+
+# ---------- what a figure's readings say ----------
+
+def climb(points, key="u7", renew="r7"):
+    """What was used of one figure (the week, the model's limit): its rises,
+    [(from, to, points)] between two readings, over the highest reading since
+    the last renewal or reset, so that a reading going back and forth by one
+    point counts once. Its renewal time moving on starts again from 0; a fall
+    of more than DROP (a reset spent) from where it fell to. The first reading
+    counts nothing."""
+    out, top, ren, prev = [], None, None, None
+    for x in points:
+        v, r = _num(x.get(key)), x.get(renew)
+        if v is None:
+            continue
+        if top is None:
+            top, ren, prev = v, r, x["t"]
+            continue
+        if r is not None and ren is not None and r - ren > HOUR:
+            top = 0.0
+        elif v < top - DROP:
+            top = v
+        if r is not None:
+            ren = r
+        if v > top:
+            out.append((prev, x["t"], v - top))
+            top = v
+        prev = x["t"]
+    return out
+
+
+def _sum(rises, t0, t1=float("inf"), gap=None):
+    """What the rises used between t0 and t1: a rise over a stretch between
+    two readings counts for the part of it inside (spread evenly); with gap,
+    only the rises between readings at most gap apart, whole, by when."""
+    total = 0.0
+    for a, b, d in rises:
+        if gap is not None:
+            if b - a <= gap and t0 < b <= t1:
+                total += d
+        elif b <= a:
+            total += d if t0 < b <= t1 else 0
+        else:
+            total += d * max(0.0, min(b, t1) - max(a, t0)) / (b - a)
+    return total
+
+
+def local_days(now, n):
+    """The starts of the last n local days, oldest first (today last)."""
+    d = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    return [(d - timedelta(days=i)).timestamp() for i in range(n - 1, -1, -1)]
+
+
+def seat_view(a, points, now, days):
+    """One account's pace: what it used of the week in the last 24 h and in
+    each of the days, how fast it climbs now (points an hour, over the last
+    NOW_SPAN) and, at that pace, when the week runs out — before it renews
+    or not."""
+    rises = climb(points, "u7", "r7")
+    mrises = climb(points, "m", "rf")
+    first = points[0]["t"] if points else now
+    span = min(NOW_SPAN, now - first)
+    recent = _sum(rises, now - NOW_SPAN, gap=GAP)
+    pace = recent / (span / HOUR) if span >= MIN_SPAN and recent > 0 else 0.0
+    u7, r7 = _num(a.get("u7")), _num(a.get("r7"))
+    runout = None
+    if pace > 0 and u7 is not None and u7 < 100:
+        runout = now + (100 - u7) / pace * HOUR
+    ends = (a.get("renews") or {}).get("at") if (a.get("renews") or {}).get("kind") == "ends" else None
+    edges = days + [days[-1] + DAY] if days else []
+    return {
+        "n": a.get("n"), "label": a.get("label"), "plan": a.get("plan_name"),
+        "u5": a.get("u5"), "u7": u7, "m": a.get("model_pct"), "r7": r7, "rf": a.get("rf"),
+        "ends": ends, "disabled": bool(a.get("disabled")), "live": bool(a.get("live")),
+        "cl": bool(a.get("cl")), "lanes": a.get("lanes") or [], "groups": a.get("groups") or [],
+        "used24": round(_sum(rises, now - DAY), 1), "m24": round(_sum(mrises, now - DAY), 1),
+        "pace": round(pace, 2), "runout": runout,
+        "cut": bool(runout and r7 and runout < r7 and not (ends and ends < runout)),
+        "daily": [round(_sum(rises, edges[i], edges[i + 1]), 1) for i in range(len(days))],
+        "since": first if points else None,
+        "readings": len(points)}
+
+
+def forecast(seats, rate, now, horizon=HORIZON, step=STEP):
+    """Free quota of a group of seats (in whole accounts' weeks) from now on,
+    if it keeps using `rate` accounts a day: what renews comes back (the week
+    it has used now, at its renewal: a floor, it will have used more by then),
+    a plan that ends takes its free part away. -> {"points": [[t, free]] every
+    step, "dry": when it would hit 0, "back": when a renewal lifts it again,
+    "low": [t, free] its lowest}."""
+    free, events = 0.0, []
+    for s in seats:
+        u7, r7, ends = _num(s.get("u7")), _num(s.get("r7")), _num(s.get("ends"))
+        if u7 is None or s.get("disabled") or not s.get("live"):
+            continue
+        if ends is not None and ends <= now:
+            continue
+        free += max(0.0, 100 - u7) / 100
+        if ends is not None and ends < now + horizon:
+            events.append((ends, -max(0.0, 100 - u7) / 100))
+        if r7 is not None and now < r7 < now + horizon and not (ends is not None and r7 >= ends):
+            events.append((r7, min(100.0, u7) / 100))
+    events.sort()
+    rate = max(0.0, rate or 0.0)
+
+    def at(t):
+        return free - rate * (t - now) / DAY + sum(d for te, d in events if te <= t)
+
+    pts = [[now + i * step, round(at(now + i * step), 2)] for i in range(int(horizon // step) + 1)]
+    dry = back = None
+    low = [now, round(free, 2)]
+    f, t = free, now
+    for te, d in events + [(now + horizon, 0.0)]:
+        f_end = f - rate * (te - t) / DAY
+        if dry is None and f > 0 >= f_end and rate > 0:
+            dry = t + f / rate * DAY
+        if f_end < low[1]:
+            low = [te, round(f_end, 2)]
+        f, t = f_end + d, te
+        if dry is not None and back is None and d > 0 and f > 0:
+            back = te
+    return {"points": pts, "dry": dry, "back": back, "low": low, "free": round(free, 2)}
+
+
+def pace_view(accounts, groups, hist, now, ndays=14):
+    """The Usage section's Pace: per account (seat_view) and per group — its
+    seats' free week now (whole accounts), what they used in the last 24 h
+    and a day on average, each day's use, and the forecast at the last 24 h's
+    rate. groups: [{"name", "seats": [n]}] (a watch's own list when it has
+    one). hist: History.load(), by email."""
+    days = local_days(now, ndays)
+    seats, rises = [], {}
+    for a in accounts:
+        pts = hist.get((a.get("email") or a.get("label") or "").strip().lower(), [])
+        seats.append(seat_view(a, pts, now, days))
+        rises[a.get("n")] = climb(pts, "u7", "r7")
+    by_n = {s["n"]: s for s in seats}
+    starts = [s["since"] for s in seats if s["since"]]
+    since = min(starts) if starts else None
+    out_groups = []
+    for g in groups:
+        mine = [by_n[n] for n in g.get("seats") or [] if n in by_n]
+        firsts = [s["since"] for s in mine if s["since"]]
+        gsince = min(firsts) if firsts else None   # measured from its own seats' history
+        span = min(DAY, now - gsince) if gsince else 0
+        used_span = sum(_sum(rises.get(s["n"], []), now - span) for s in mine) if span else 0
+        rate = used_span / 100 / (span / DAY) if span >= 2 * HOUR else None
+        daily = [round(sum(s["daily"][i] for s in mine) / 100, 2) for i in range(ndays)]
+        span7 = min(7 * DAY, now - gsince) if gsince else 0
+        week = sum(s["daily"][i] for s in mine for i in range(max(0, ndays - 7), ndays))
+        out_groups.append({
+            "name": g["name"], "seats": [s["n"] for s in mine],
+            "used24": round(sum(s["used24"] for s in mine) / 100, 2),
+            "rate": None if rate is None else round(rate, 2), "measured": span, "since": gsince,
+            "avg": round(week / 100 / (span7 / DAY), 2) if span7 >= DAY else None,
+            "daily": daily,
+            "forecast": forecast(mine, rate, now) if rate is not None else
+                        dict(forecast(mine, 0, now), dry=None, points=[])})
+    return {"now": now, "since": since, "days": days, "seats": seats, "groups": out_groups}
 PYEOF
 
 # --- Checks ---
@@ -5327,6 +5731,10 @@ cmd_help() {
   echo "                           a LaunchAgent on macOS (--foreground: in this terminal)."
   echo "                           On the tailnet: tailscale serve --bg --https=N http://127.0.0.1:N"
   echo "                           (the node's owner may use it; the store's web.allow overrides)"
+  echo "  claude-swap usage [pace] [--days N] [--group g] [--all] [--json]"
+  echo "                           What the accounts used over time: per group the week left,"
+  echo "                           a day's use and whether it lasts to the renewals; per"
+  echo "                           account its pace and when it runs out (the web's Usage)"
   echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
   echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's;"
@@ -9945,6 +10353,122 @@ cmd_web() {
   esac
 }
 
+cmd_usage() {
+  # what the accounts used over time (1.25): the usage history, the logs and
+  # the transcripts, as the web's Usage section shows them
+  check_store
+  CLAUDE_SWAP_WEB="$WEB_PY" CLAUDE_SWAP_METER="$METER_PY" python3 - "$STORE" "$@" <<'PYEOF'
+import json, os, sys, time, types
+from datetime import datetime
+
+engine = types.ModuleType("engine")
+exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
+oauth = types.ModuleType("oauth")
+exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+meter = types.ModuleType("meter")
+exec(os.environ.pop("CLAUDE_SWAP_METER"), meter.__dict__)
+web = types.ModuleType("web")
+web.engine, web.oauth, web.meter = engine, oauth, meter
+exec(os.environ.pop("CLAUDE_SWAP_WEB"), web.__dict__)
+
+USAGE = ("Usage: claude-swap usage [pace] [--days N] [--group g] [--all] [--json]\n"
+         "  pace    per group: the week left (in whole accounts), what it used a day and,\n"
+         "          at the last 24 h's pace, whether it lasts until the renewals;\n"
+         "          per account: what it used, how fast it climbs now, when it runs out\n"
+         "  --days N  the days shown (14) · --group g  one group's seats · --all  every\n"
+         "          account (else those that used something in the days shown)")
+store_path, args = sys.argv[1], sys.argv[2:]
+view, days, group, show_all, as_json = "pace", 14, None, False, False
+i = 0
+while i < len(args):
+    a = args[i]
+    if a in ("-h", "--help", "help"):
+        print(USAGE); sys.exit(0)
+    elif a == "pace":
+        view = a
+    elif a == "--days" and i + 1 < len(args) and args[i + 1].isdigit():
+        days = max(1, min(60, int(args[i + 1]))); i += 1
+    elif a == "--group" and i + 1 < len(args):
+        group = args[i + 1]; i += 1
+    elif a == "--all":
+        show_all = True
+    elif a == "--json":
+        as_json = True
+    else:
+        print(f"claude-swap usage: what is {a!r}?\n" + USAGE, file=sys.stderr); sys.exit(1)
+    i += 1
+
+store = oauth.load_store(store_path)
+app = web.App(store_path, "")
+data = app.usage(store, view, days)
+if data.get("error"):
+    print("claude-swap usage: " + data["error"], file=sys.stderr); sys.exit(1)
+if as_json:
+    print(json.dumps(data, indent=1)); sys.exit(0)
+
+tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if tty else s
+DIM, RED, GRN, YEL, BLD = "2", "31", "32", "33", "1"
+DN = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+now = data["now"]
+def when(t):
+    d = datetime.fromtimestamp(t)
+    if d.date() == datetime.fromtimestamp(now).date():
+        return d.strftime("%H:%M")
+    return f"{DN[d.weekday()]} {d.day:02d} {d:%H:%M}"
+def acc(x):
+    return "–" if x is None else f"{x:.1f}"
+def span(s):
+    s = int(s)
+    return f"{s // 86400}d {s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h {s % 3600 // 60:02d}m"
+
+groups = [g for g in data["groups"] if not group or g["name"] == group]
+if group and not groups:
+    print(f"claude-swap usage: no group {group!r} (" + ", ".join(g["name"] for g in data["groups"]) + ")",
+          file=sys.stderr); sys.exit(1)
+since = data.get("since")
+print(c(BLD, "Usage · pace") + "  " + c(DIM, (f"history since {when(since)} ({span(now - since)})" if since
+      else "no history yet") + " — it grows with every reading of check and the watch"))
+print()
+print(c(DIM, f"  {'Group':<10} {'seats':>5}  {'free now':>8}  {'used 24h':>8}  {'a day (7d)':>10}  forecast at the last 24 h's pace"))
+for g in groups:
+    f = g["forecast"]
+    if g["rate"] is None:
+        fc = c(DIM, "not enough history yet (2 h)")
+    elif f.get("dry"):
+        fc = c(RED, f"runs dry {when(f['dry'])}") + (f" · back {when(f['back'])}" if f.get("back") else " · nothing renews before")
+    else:
+        fc = c(GRN, "lasts the week") + (f" · lowest {acc(f['low'][1])} {when(f['low'][0])}" if f.get("low") else "")
+    print(f"  {g['name']:<10} {len(g['seats']):>5}  {acc(f.get('free')):>8}  {acc(g['used24']):>8}  {acc(g['avg']):>10}  {fc}")
+print(c(DIM, "  (whole accounts: 1.0 = one account's week)"))
+print()
+want = set(groups[0]["seats"]) if group else None
+seats = [s for s in data["seats"] if (want is None or s["n"] in want)
+         and (show_all or round(s["used24"]) or any(round(v) for v in s["daily"]) or s["pace"])]
+seats.sort(key=lambda s: (-s["pace"], -s["used24"], s["n"]))
+ds = data["days"][-min(7, len(data["days"])):]
+off = len(data["days"]) - len(ds)
+dh = " ".join(f"{DN[datetime.fromtimestamp(d).weekday()]}{datetime.fromtimestamp(d).day:02d}"[:4].rjust(4) for d in ds)
+W = max([22] + [len(s["label"] or "") for s in seats])
+print(c(DIM, f"  {'#':>3} {'Account':<{W}} {'week':>5} {'24h':>5} {'pace':>8}  {'runs out':<18} {'renews':<12} {dh}"))
+for s in seats:
+    ro = (c(RED, when(s["runout"]) + " cut") if s["cut"] else when(s["runout"])) if s.get("runout") else c(DIM, "–")
+    ro_w = len(when(s["runout"]) + (" cut" if s["cut"] else "")) if s.get("runout") else 1
+    cells = " ".join((f"{round(v):>4}" if round(v) else c(DIM, f"{'·':>4}")) for v in s["daily"][off:])
+    mark = "*" if s["cl"] else ("▸" if s["lanes"] else " ")
+    u7 = "–" if s["u7"] is None else "%d%%" % round(s["u7"])
+    u24 = "+%d" % round(s["used24"]) if round(s["used24"]) else "–"
+    pc = "+%.1f/h" % s["pace"] if s["pace"] else "–"
+    rn = when(s["r7"]) if s.get("r7") else "–"
+    print(f" {mark}{s['n']:>3} {s['label']:<{W}} {u7:>5} {u24:>5} {pc:>8}  {ro}{' ' * max(0, 18 - ro_w)} {rn:<12} {cells}")
+if not seats:
+    print(c(DIM, "  (nothing used in these days)"))
+print(c(DIM, "  week: % used now · 24h, days: points of its week used · pace: points an hour now · "
+      "runs out: at that pace (cut = before it renews) · * cl ▸ a lane"))
+PYEOF
+}
+
 cmd_web_devices() {
   # no arguments: the tailnet's devices and which the list lets in; names or
   # IPs: save them as web.devices; any: remove the list
@@ -9956,8 +10480,12 @@ engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 oauth = types.ModuleType("oauth")
 exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+meter = types.ModuleType("meter")
+exec(os.environ.pop("CLAUDE_SWAP_METER", ""), meter.__dict__)
 web = types.ModuleType("web")
 web.engine, web.oauth = engine, oauth
+if hasattr(meter, "History"):
+    web.meter = meter
 exec(os.environ.pop("CLAUDE_SWAP_WEB"), web.__dict__)
 
 store_path, args = sys.argv[1], sys.argv[2:]
@@ -10055,15 +10583,19 @@ cmd_web_serve() {
     *) bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" ;;
   esac
   mkdir -p "$(dirname "$WEB_PID")"
-  CLAUDE_SWAP_WEB="$WEB_PY" CLAUDE_SWAP_WEB_PAGE="$(_web_page)" exec python3 - "$STORE" "$bin" "$VERSION" "$1" "$WEB_PID" <<'PYEOF'
+  CLAUDE_SWAP_WEB="$WEB_PY" CLAUDE_SWAP_METER="$METER_PY" CLAUDE_SWAP_WEB_PAGE="$(_web_page)" exec python3 - "$STORE" "$bin" "$VERSION" "$1" "$WEB_PID" <<'PYEOF'
 import os, sys, types
 
 engine = types.ModuleType("engine")
 exec(os.environ["CLAUDE_SWAP_ENGINE"], engine.__dict__)
 oauth = types.ModuleType("oauth")
 exec(os.environ["CLAUDE_SWAP_OAUTH"], oauth.__dict__)
+meter = types.ModuleType("meter")
+exec(os.environ.pop("CLAUDE_SWAP_METER", ""), meter.__dict__)
 web = types.ModuleType("web")
 web.engine, web.oauth = engine, oauth
+if hasattr(meter, "History"):
+    web.meter = meter
 exec(os.environ.pop("CLAUDE_SWAP_WEB"), web.__dict__)
 
 store_path, bin_path, version, port, pid_path = sys.argv[1:6]
@@ -10588,6 +11120,33 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
 .vx th.x-sort:hover{color:var(--ink)}
 .vx th .x-arr{color:var(--accent);margin-left:3px}
 .vx th .x-arr2{opacity:.7;font-size:.85em}
+.vx .x-ucards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin:0 0 16px}
+.vx .x-ucard{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:12px 14px;box-shadow:var(--lift)}
+.vx .x-uhd{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.vx .x-uhd b{font:700 19px/1 var(--f-display);letter-spacing:.04em;text-transform:uppercase}
+.vx .x-ufigs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.vx .x-ufigs b{display:block;font:700 22px/1.1 var(--f-mono)}
+.vx .x-ufigs small{color:var(--ink2);font-size:11.5px}
+.vx .x-uline{margin:10px 0 6px;font-size:13px}
+.vx .x-ubox{margin-top:8px}
+.vx .x-ubox>small{display:block;font-size:11px;margin-bottom:3px}
+.vx .x-uch{display:flex;align-items:flex-end;gap:2px;height:50px;border-bottom:1px solid var(--rule)}
+.vx .x-uch.x-wide{gap:1px}
+.vx .x-uch i{flex:1;min-width:2px;border-radius:2px 2px 0 0;background:var(--track)}
+.vx .x-uch i.x-ok{background:var(--ok-fill)}
+.vx .x-uch i.x-warn{background:var(--warn-fill)}
+.vx .x-uch i.x-bad{background:var(--bad-fill)}
+.vx .x-uch i.x-use{background:var(--accent)}
+.vx .x-uax{display:flex;gap:2px;font:10px/1.4 var(--f-mono);color:var(--ink3)}
+.vx .x-uax span{flex:1;text-align:center}
+.vx td.x-num{font:13px var(--f-mono);text-align:right}
+.vx th.x-uhh{text-align:center;font-size:11px;padding:6px 3px}
+.vx th.x-uhh small{display:block;font-size:10.5px;color:var(--ink3)}
+.vx td.x-uh{text-align:center;font:11px var(--f-mono);min-width:30px;padding:4px 2px;border-left:1px solid var(--panel)}
+.vx td.x-h1{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.vx td.x-h2{background:color-mix(in srgb,var(--accent) 30%,transparent)}
+.vx td.x-h3{background:color-mix(in srgb,var(--accent) 50%,transparent)}
+.vx td.x-h4{background:color-mix(in srgb,var(--accent) 75%,transparent);color:var(--on-accent)}
 .vx .x-sortbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 9px;font-size:12.5px}
 .vx .x-sortbar select{font:inherit;padding:3px 6px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--ink)}
 .vx tbody tr:hover td{background:color-mix(in srgb,var(--accent) 5%,var(--panel))}
@@ -10787,7 +11346,7 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
   <p class="banner" id="banner" role="alert" hidden></p>
   <section class="hero card" id="hero" aria-label="Where cl is"><p class="mute">Loading…</p></section>
   <nav class="jump" aria-label="Sections">
-    <a href="#groups">Groups</a><a href="#accounts">Accounts</a><a href="#calendar">Calendar</a><a href="#watch">Watch</a>
+    <a href="#groups">Groups</a><a href="#accounts">Accounts</a><a href="#calendar">Calendar</a><a href="#usage">Usage</a><a href="#watch">Watch</a>
   </nav>
   <section class="bridge card" id="bridge" aria-label="Every account at a glance"></section>
   <section id="warnings" aria-label="Warnings" hidden></section>
@@ -10815,6 +11374,11 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
     <div class="card cal-wrap" id="cal"></div>
     <div class="legend" id="legend"></div>
     <div class="vx" id="alt-cal" hidden></div>
+  </section>
+  <section id="usage">
+    <h2>Usage <small>what the accounts used and where it is heading</small></h2>
+    <div class="vsw" id="sw-use" role="group" aria-label="Show the usage as"></div>
+    <div class="vx" id="alt-use"><p class="faint">Reading…</p></div>
   </section>
   <section id="watch">
     <h2>Watch <small>the daemon that moves cl and the lanes</small></h2>
@@ -11229,7 +11793,7 @@ function render() {
   const focused = document.activeElement && document.activeElement.id;
   ui.pending = false;
   renderTop(); renderHero(); renderBridge(); renderWarnings(); renderQuota();
-  renderGroups(); renderAccounts(); renderCalendar(); renderWatch(); renderFoot();
+  renderGroups(); renderAccounts(); renderCalendar(); renderUsage(); renderWatch(); renderFoot();
   if (focused && $(focused) && document.activeElement !== $(focused)) $(focused).focus({ preventScroll: true });
 }
 
@@ -11719,9 +12283,11 @@ const VIEW_OPTS = {
   grp: [["classic", "Cards"], ["table", "Table"], ["board", "Board"]],
   acc: [["classic", "Classic"], ["table", "Table"], ["all", "All in one"], ["groups", "By group"], ["heat", "Heat"]],
   cal: [["classic", "Days"], ["all", "All in one"], ["timeline", "5h timeline"], ["week", "Week × hour"], ["agenda", "Agenda"]],
+  use: [["pace", "Pace"]],
 };
+const VIEW_DEF = { grp: "classic", acc: "classic", cal: "classic", use: "pace" };
 function readViews() {
-  const out = { grp: "classic", acc: "classic", cal: "classic" };
+  const out = Object.assign({}, VIEW_DEF);
   const q = new URLSearchParams(location.search).get("view") || "";
   for (const part of q.split(/[ +,]/)) {
     const [area, mode] = part.split(".");
@@ -11731,7 +12297,7 @@ function readViews() {
 }
 function writeViews() {
   const q = new URLSearchParams(location.search);
-  const v = Object.keys(VIEW_OPTS).filter((a) => ui.vw[a] !== "classic").map((a) => a + "." + ui.vw[a]).join("+");
+  const v = Object.keys(VIEW_OPTS).filter((a) => ui.vw[a] !== VIEW_DEF[a]).map((a) => a + "." + ui.vw[a]).join("+");
   if (v) q.set("view", v); else q.delete("view");
   const s = q.toString();
   history.replaceState(null, "", location.pathname + (s ? "?" + s : "") + location.hash);
@@ -12228,7 +12794,82 @@ const Views = (() => {
       h("div", { class: "ag" }, out.length ? out : h("p", { class: "faint", text: "Nothing." }))];
   }
 
+
+  // ---------- usage (1.25): from /api/usage, apart from the state ----------
+  const accN = (x) => Math.round(x * 10) / 10;
+  const fmtAcc = (x) => (x == null ? "–" : accN(x).toFixed(1));
+  const atWord = (t) => dayWord(t) + hm(t);
+  function chart(values, opts) {
+    // bars from the bottom, one per value: height by value over the largest,
+    // a class each (opts.cls), a title each (opts.title)
+    const top = Math.max(opts.min || 0.01, ...values.map((v) => Math.abs(v || 0)));
+    return h("div", { class: "uch" + (opts.wide ? " wide" : "") }, values.map((v, i) =>
+      h("i", { class: opts.cls(v, i), title: opts.title(v, i),
+        css: { height: Math.max(v > 0 ? 2 : 1, Math.round((Math.max(0, v || 0) / top) * (opts.h || 48))) + "px" } })));
+  }
+  function groupCard(g, data) {
+    const f = g.forecast || {};
+    const pts = f.points || [];
+    let line;
+    if (g.rate == null) line = h("span", { class: "faint", text: "not enough history yet for a forecast (it needs 2 h)" });
+    else if (f.dry) line = h("span", { class: "t-bad" }, "at this pace it runs dry " + atWord(f.dry),
+      f.back ? " · back " + atWord(f.back) + " (a renewal)" : " · nothing renews before the week is out");
+    else line = h("span", { class: "t-ok" }, "lasts the week at this pace", f.low ? " · lowest " + fmtAcc(f.low[1]) + " on " + atWord(f.low[0]) : "");
+    const days = data.days || [];
+    return h("div", { class: "ucard" },
+      h("div", { class: "uhd" }, h("b", { text: g.name }), h("span", { class: "faint", text: (g.seats || []).length + " seats" })),
+      h("div", { class: "ufigs" },
+        h("div", {}, h("b", { text: fmtAcc(f.free) }), h("small", { text: "free now" })),
+        h("div", {}, h("b", { text: fmtAcc(g.used24) }), h("small", { text: "used in 24 h" })),
+        h("div", {}, h("b", { text: fmtAcc(g.avg) }), h("small", { text: "a day (7 d)" }))),
+      h("p", { class: "uline" }, line),
+      pts.length ? h("div", { class: "ubox" }, h("small", { class: "faint", text: "Free, next 7 days (in accounts)" }),
+        chart(pts.map((p) => p[1]), {
+          cls: (v) => (v <= 0 ? "bad" : v < 1 ? "warn" : "ok"),
+          title: (v, i) => atWord(pts[i][0]) + " · " + fmtAcc(v) + " accounts", wide: true })) : null,
+      h("div", { class: "ubox" }, h("small", { class: "faint", text: "Used a day, last " + days.length + " days (in accounts)" }),
+        chart(g.daily || [], { min: 0.5, cls: () => "use",
+          title: (v, i) => dateStr(days[i]) + " · " + fmtAcc(v) + " accounts" }),
+        h("div", { class: "uax" }, days.map((d, i) => h("span", { text: i % 2 === days.length % 2 ? "" : String(D(d).getDate()) })))));
+  }
+  function heatCell(v) {
+    const r = Math.round(v || 0);
+    const k = !r ? "h0" : r < 10 ? "h1" : r < 25 ? "h2" : r < 50 ? "h3" : "h4";
+    return h("td", { class: "uh " + k, text: r ? String(r) : "" });
+  }
+  function usePace(redo, data) {
+    const days = data.days || [];
+    const want = vu.grp === "all" ? null : (data.groups || []).find((g) => g.name === vu.grp);
+    const seats = (data.seats || []).filter((s) => !(vu.hideOff && (s.disabled || !s.live))
+      && (!want || (want.seats || []).includes(s.n)))
+      .sort((a, b) => (b.pace - a.pace) || (b.used24 - a.used24) || (a.n - b.n));
+    const groups = (data.groups || []).filter((g) => !want || g === want);
+    const since = data.since ? "History since " + dateStr(data.since) + " " + hm(data.since) + " (" + span(data.now - data.since) + ")"
+      : "No history yet";
+    const head = h("tr", {}, h("th", { class: "n stk", text: "#" }), h("th", { class: "stk2", text: "Account" }),
+      h("th", { text: "Week" }), h("th", { text: "Used 24 h" }), h("th", { text: "Pace now" }), h("th", { text: "Runs out" }),
+      h("th", { text: "Renews" }), days.map((d, i) => h("th", { class: "uhh" + (i === days.length - 1 ? " today" : "") },
+        DAYS[D(d).getDay()], h("small", { text: String(D(d).getDate()) }))));
+    const body = seats.map((s) => h("tr", { class: (s.disabled || !s.live ? "off " : "") + (s.cl ? "on-cl" : s.lanes.length ? "on-lane" : "") },
+      h("td", { class: "n stk", text: "#" + s.n }),
+      h("td", { class: "stk2" }, h("div", { class: "acct", title: s.label }, h("b", { text: short(s) }),
+        h("small", { text: domain(s) + " · " + (s.plan || "?") }))),
+      h("td", {}, barCell(s.u7)),
+      h("td", { class: "num" + (Math.round(s.used24) ? "" : " faint"), text: Math.round(s.used24) ? "+" + Math.round(s.used24) : "–" }),
+      h("td", { class: "num" + (s.pace ? "" : " faint"), text: s.pace ? "+" + s.pace.toFixed(1) + "/h" : "–" }),
+      h("td", {}, s.runout ? h("div", { class: "tc" + (s.cut ? " soon" : "") },
+        h("span", { class: "t1" + (s.cut ? " t-bad" : "") }, h("span", { class: "d", text: dayWord(s.runout) }), hm(s.runout)),
+        h("span", { class: "t2", text: s.cut ? "before it renews" : "after it renews" })) : h("span", { class: "faint", text: "–" })),
+      h("td", {}, timeCell(s.r7)),
+      days.map((d, i) => heatCell((s.daily || [])[i]))));
+    return [filters(redo), note(since + ". Each reading of check or the watch adds to it. Week figures are points of that account's week; groups add them up in whole accounts (1.0 = one account's week)."),
+      h("div", { class: "ucards" }, groups.map((g) => groupCard(g, data))),
+      h("p", { class: "note", text: "Per account: what it used of its week, how fast it climbs now and, at that pace, when the week runs out" }),
+      scroll(h("table", { class: "upace" }, h("thead", {}, head), h("tbody", {}, body)))];
+  }
+
   return {
+    use: { pace: usePace },
     grp: { table: grpTable, board: grpBoard },
     acc: { table: accTable, all: accAll, groups: accGroups, heat: accHeat },
     cal: { all: accAll, timeline: calTimeline, week: calWeek, agenda: calAgenda },
@@ -12257,6 +12898,34 @@ function altView(area, redo) {
   host.setAttribute("data-mode", mode);
   [...host.querySelectorAll(".x-scroll,.x-board")].forEach((e, i) => { if (old[i] != null) e.scrollLeft = old[i]; });
   return true;
+}
+
+// ---------- usage: its own data (/api/usage), read again when 2 minutes old ----------
+ui.use = {};
+ui.useBusy = {};
+function renderUsage() {
+  const mode = ui.vw.use;
+  fill($("sw-use"), VIEW_OPTS.use.map(([k, t]) => h("button", { type: "button", "aria-pressed": String(mode === k), text: t,
+    onclick: () => { if (ui.vw.use === k) return; ui.vw.use = k; writeViews(); renderUsage(); } })));
+  const got = ui.use[mode];
+  if (!got || Date.now() - got.at > 120000) loadUsage(mode);
+  const host = $("alt-use");
+  if (!got || (!got.data && !got.err)) return;
+  const fresh = host.getAttribute("data-mode") !== mode;
+  const old = fresh ? [] : [...host.querySelectorAll(".x-scroll")].map((e) => e.scrollLeft);
+  fill(host, got.data ? Views.use[mode](renderUsage, got.data) : null,
+    got.err ? h("p", { class: "t-bad", text: "Could not read the usage: " + got.err }) : null);
+  host.setAttribute("data-mode", mode);
+  [...host.querySelectorAll(".x-scroll")].forEach((e, i) => { if (old[i] != null) e.scrollLeft = old[i]; });
+}
+async function loadUsage(mode) {
+  if (ui.useBusy[mode]) return;
+  ui.useBusy[mode] = true;
+  const r = await call("GET", "/api/usage?view=" + encodeURIComponent(mode));
+  ui.useBusy[mode] = false;
+  const err = r.ok && r.data && r.data.error ? r.data.error : r.ok ? null : r.error;
+  ui.use[mode] = { at: Date.now(), err, data: err ? (ui.use[mode] || {}).data : r.data };
+  if (ui.vw.use === mode && !$("dlg").open) renderUsage();
 }
 
 // ---------- start ----------
@@ -12455,6 +13124,10 @@ case "${1:-}" in
   web)
     shift
     cmd_web "$@"
+    ;;
+  usage)
+    shift
+    cmd_usage "$@"
     ;;
   [0-9]*)
     _do_rotate "$1" "${2:-}"

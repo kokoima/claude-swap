@@ -62,8 +62,10 @@ def load_web():
         exec(block("ENGINE_PY"), engine.__dict__)
         oauth = types.ModuleType("oauth")
         exec(block("OAUTH_PY"), oauth.__dict__)
+        meter = types.ModuleType("meter")
+        exec(block("METER_PY"), meter.__dict__)
         web = types.ModuleType("web")
-        web.engine, web.oauth = engine, oauth
+        web.engine, web.oauth, web.meter = engine, oauth, meter
         exec(block("WEB_PY"), web.__dict__)
     return web
 

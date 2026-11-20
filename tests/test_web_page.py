@@ -27,7 +27,7 @@ import test_web as tw  # its fixtures; a module, so its tests are not collected 
 
 W = tw.W
 NODE = shutil.which("node")
-ROUTES = {"/api/state", "/api/refresh", "/api/action", "/api/reset-preview"}
+ROUTES = {"/api/state", "/api/refresh", "/api/action", "/api/reset-preview", "/api/usage"}
 
 
 def page_source():
