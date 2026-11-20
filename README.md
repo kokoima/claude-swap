@@ -439,8 +439,12 @@ switch above them. Groups: *Cards* (with the watch's controls), *Table*,
 bar with its % and when it resets; sortable, it slides sideways on a
 phone), *By group* (in each watch's order) and *Heat*. Calendar: *Days*,
 *5h timeline* (the next 24 hours, each 5h window up to the hour it starts
-again), *Week × hour* and *Agenda*. The choice is kept in the address
-(`?view=acc.table+cal.timeline`), so a bookmark opens the page that way.
+again), *Week × hour* and *Agenda*. *All in one* (1.24.1, in both the
+accounts and the calendar switches) puts everything per account in one
+table: the bars and when each limit starts again, the plan, the 5h window
+over the next 24 hours and the renewals of the next 8 days. The choice is
+kept in the address (`?view=acc.table+cal.all`), so a bookmark opens the
+page that way.
 
 **On the tailnet** — the server listens on 127.0.0.1 only. Publish it with
 Tailscale Serve, **in HTTP mode, never Funnel**:

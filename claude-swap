@@ -23,7 +23,7 @@
 
 set -e
 
-VERSION="1.24.0"
+VERSION="1.24.1"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -10746,6 +10746,24 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
 .vx .x-acts{display:flex;gap:6px}
 .vx .x-filters>.faint{font-size:12px}
 .vx tr.x-band h3{font-size:19px}
+.vx tr.x-sup th{font-size:10.5px;color:var(--ink3);border-bottom:0;padding-top:6px;padding-bottom:0}
+.vx th.x-g0,.vx td.x-g0{border-left:1px solid var(--rule)}
+.vx th.x-day,.vx td.x-day{text-align:center;min-width:56px;font:12px/1.2 var(--f-mono)}
+.vx thead th.x-day{font:700 12.5px/1 var(--f-display)}
+.vx th.x-day small{display:block;font:600 11px/1.2 var(--f-mono);letter-spacing:0;color:var(--ink3);margin-top:2px}
+.vx .x-today{background:color-mix(in srgb,var(--accent) 7%,var(--panel))}
+.vx thead th.x-today{color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--inset))}
+.vx td.x-stc,.vx th.x-stc{padding:4px 8px}
+.vx .x-st{position:relative;height:30px;overflow:hidden}
+.vx .x-st.x-sth{height:15px}
+.vx .x-st .x-hl{top:0;font-size:10.5px;transform:translateX(-50%)}
+.vx .x-st .x-win{top:5px;height:20px;padding:0 4px}
+.vx .x-st .x-win b{font-size:11px}
+.vx .x-st .x-endlbl{top:8px;font-size:11.5px;transform:translateX(3px)}
+.vx .x-st .x-mk{top:2px;padding:1px 3px;font-size:10px}
+.vx .x-st .x-mk.x-fb{top:15px}
+.vx .x-st .x-freebar{top:9px;font-size:10.5px;padding-left:0}
+.vx .x-st .x-nowl::before{content:none}
 </style>
 </head>
 <body>
@@ -11689,8 +11707,8 @@ function renderFoot() {
 // (accountActions), with the same questions first.
 const VIEW_OPTS = {
   grp: [["classic", "Cards"], ["table", "Table"], ["board", "Board"]],
-  acc: [["classic", "Classic"], ["table", "Table"], ["groups", "By group"], ["heat", "Heat"]],
-  cal: [["classic", "Days"], ["timeline", "5h timeline"], ["week", "Week × hour"], ["agenda", "Agenda"]],
+  acc: [["classic", "Classic"], ["table", "Table"], ["all", "All in one"], ["groups", "By group"], ["heat", "Heat"]],
+  cal: [["classic", "Days"], ["all", "All in one"], ["timeline", "5h timeline"], ["week", "Week × hour"], ["agenda", "Agenda"]],
 };
 function readViews() {
   const out = { grp: "classic", acc: "classic", cal: "classic" };
@@ -11853,6 +11871,84 @@ const Views = (() => {
     return [filters(redo), note("Tap a heading to sort (again to reverse). # and the account stay put while you slide sideways. Times: today just the hour; underneath, how long until."),
       scroll(h("table", {}, h("thead", {}, head), h("tbody", {}, rows.map((a) => h("tr", { class: rowCls(a) },
         cols.map((x) => h("td", { class: x.td || "" }, x.cell(a)))))))) ];
+  }
+
+  // ---------- everything in one table: the accounts' figures and both calendars ----------
+  const SPX = 12, SHOURS = 26;
+  const stripStart = () => Math.floor(nowS() / 3600) * 3600 - 3600;
+  function stripHead() {
+    const start = stripStart(), x = (t) => ((t - start) / 3600) * SPX;
+    return h("div", { class: "st sth", css: { width: SHOURS * SPX + "px" } }, Array.from({ length: SHOURS + 1 }, (_, i) => {
+      const t = start + i * 3600, hr = D(t).getHours();
+      return hr % 3 === 0 ? h("span", { class: "hl" + (hr === 0 ? " mid" : ""), css: { left: x(t) + "px" }, text: pad2(hr) }) : null;
+    }), h("span", { class: "nowl", css: { left: x(nowS()) + "px" } }));
+  }
+  function strip(a) {
+    const now = nowS(), start = stripStart(), end = start + SHOURS * 3600, x = (t) => ((t - start) / 3600) * SPX;
+    const kids = [];
+    for (let i = 0; i <= SHOURS; i++) {
+      const t = start + i * 3600, hr = D(t).getHours();
+      if (hr % 3 === 0) kids.push(h("span", { class: "hr" + (hr === 0 ? " mid" : ""), css: { left: x(t) + "px" } }));
+    }
+    if (a.r5 && a.r5 > now) {
+      const s = Math.max(a.r5 - 5 * 3600, start), e = Math.min(a.r5, end);
+      kids.push(h("div", { class: "win " + level(a.u5), vars: { "--p": clamp(a.u5) }, css: { left: x(s) + "px", width: Math.max(4, x(e) - x(s)) + "px" },
+        title: "5h window: " + pct(a.u5) + " used, starts again at " + hm(a.r5) }, h("i")));
+      kids.push(h("span", { class: "endlbl t-" + level(a.u5), css: { left: x(e) + "px" }, text: hm(a.r5) + " · " + pct(a.u5) }));
+    } else if (!a.disabled && a.live) {
+      kids.push(h("span", { class: "freebar", css: { left: x(now) + 6 + "px" }, text: "no 5h window", title: "a fresh 5h window starts with the first message" }));
+    }
+    if (a.r7 && a.r7 > start && a.r7 < end) kids.push(h("span", { class: "mk w7", css: { left: x(a.r7) + "px" }, title: "the week starts again at " + hm(a.r7), text: "wk" }));
+    if (a.rf && !sameT(a.rf, a.r7) && a.rf > start && a.rf < end) kids.push(h("span", { class: "mk fb", css: { left: x(a.rf) + "px" }, title: modelName() + " starts again at " + hm(a.rf), text: "Fb" }));
+    const r = a.renews || {};
+    if (r.kind === "ends" && r.at > start && r.at < end) kids.push(h("span", { class: "mk end", css: { left: x(r.at) + "px" }, title: "the plan ends at " + hm(r.at), text: "✕" }));
+    kids.push(h("span", { class: "nowl", css: { left: x(now) + "px" } }));
+    return h("div", { class: "st", css: { width: SHOURS * SPX + "px" } }, kids);
+  }
+  function accAll(redo) {
+    const M = modelName();
+    const days = (S.calendar && S.calendar.days) || [];
+    const now = nowS();
+    const r5s = (a) => (a.r5 && a.r5 > nowS() ? a.r5 : 9e12);
+    const cols = [
+      { k: "n", t: "#", th: "n stk", td: "n stk", sort: (a) => a.n, cell: (a) => "#" + a.n },
+      { k: "acct", t: "Account", th: "stk2", td: "stk2", sort: (a) => a.label, cell: acctCell },
+      { k: "on", t: "On it", cell: onPills },
+      { k: "u5", t: "5h", g: 1, sort: (a) => a.u5 ?? -1, cell: (a) => barCell(a.u5) },
+      { k: "r5", t: "5h resets", sort: r5s, cell: r5Cell },
+      { k: "u7", t: "Week", sort: (a) => a.u7 ?? -1, cell: (a) => barCell(a.u7) },
+      { k: "r7", t: "Week renews", sort: (a) => a.r7 ?? 9e12, cell: (a) => timeCell(a.r7) },
+      { k: "m", t: M, sort: (a) => a.model_pct ?? -1, cell: (a) => barCell(a.model_pct) },
+      { k: "rf", t: M + " renews", sort: (a) => a.rf ?? 9e12, cell: rfCell },
+      { k: "rst", t: "Free resets", g: 1, sort: (a) => -((a.resets && (a.resets.full || 0) + (a.resets.model || 0)) || 0), cell: resetsCell },
+      { k: "bill", t: "Plan", sort: (a) => (a.renews && a.renews.at) || 9e12, cell: renewsCell },
+      { k: "chr", t: "Chrome login", sort: (a) => (a.login && a.login.left) || 9e12, cell: chromeCell },
+      { k: "grp", t: "Groups", cell: (a) => (a.groups || []).map((g) => pill("", g)) },
+      { k: "strip", t: stripHead(), g: 1, th: "stc", td: "stc", sort: r5s, cell: strip },
+    ].concat(days.map((d, i) => {
+      const today = dayKey(d.start) === dayKey(now) ? " today" : "";
+      return { k: "d" + i, g: i === 0 ? 1 : 0, th: "day" + today, td: "day" + today,
+        t: [DAYS[D(d.start).getDay()], h("small", { text: String(D(d.start).getDate()) })],
+        cell: (a) => calCell((a.calendar || [])[i]) };
+    }), [{ k: "act", t: "", g: 1, cell: acts }]);
+    const cls = (x, base) => ((base || "") + (x.g ? " g0" : "")).trim();
+    const c = cols.find((x) => x.k === vu.sort.k && x.sort) || cols[0];
+    const rows = shown().slice().sort((x, y) => { const a = c.sort(x), b = c.sort(y); return (a < b ? -1 : a > b ? 1 : x.n - y.n) * vu.sort.dir; });
+    const sup = h("tr", { class: "sup" }, h("th", { class: "n stk" }), h("th", { class: "stk2" }), h("th"),
+      h("th", { colspan: 6, class: "g0", text: "Limits now · when each starts again" }),
+      h("th", { colspan: 4, class: "g0", text: "Plan" }),
+      h("th", { class: "g0", text: "5h windows · next 24 h" }),
+      days.length ? h("th", { colspan: days.length, class: "g0", text: "Renewals · next 8 days" }) : null, h("th", { class: "g0" }));
+    const head = h("tr", {}, cols.map((x) => h("th", { class: cls(x, x.th) + (x.sort ? " sort" : ""),
+      onclick: x.sort ? () => { vu.sort = { k: x.k, dir: vu.sort.k === x.k ? -vu.sort.dir : 1 }; redo(); } : null },
+      x.t, vu.sort.k === x.k ? h("span", { class: "arr", text: vu.sort.dir > 0 ? "▲" : "▼" }) : null)));
+    const legend = h("div", { class: "legend" }, h("span", { class: "faint", text: "Days:" }),
+      h("span", { class: "t-warn", text: "17:00 weekly renewal" }), h("span", { class: "t-mag", text: "17:00 " + M + " renewal" }),
+      h("span", { class: "t-cyan", text: "↓ downgrade" }), h("span", { class: "t-bad", text: "✕ plan ends" }), h("span", { text: "— no plan" }),
+      h("span", { class: "faint", text: "· 24 h: the bar is the running 5h window; wk / Fb / ✕ mark the week, " + M + " and a plan end" }));
+    return [filters(redo), note("Everything per account in one table: the limits and when each starts again, the plan, the 5h window over the next 24 hours and the renewals of the next 8 days. Slide sideways; # and the account stay put. Tap a heading to sort."),
+      legend, scroll(h("table", { class: "all" }, h("thead", {}, sup, head), h("tbody", {}, rows.map((a) => h("tr", { class: rowCls(a) },
+        cols.map((x) => h("td", { class: cls(x, x.td) }, x.cell(a))))))))];
   }
 
   // ---------- accounts: a block per group, in its watch's order ----------
@@ -12098,8 +12194,8 @@ const Views = (() => {
 
   return {
     grp: { table: grpTable, board: grpBoard },
-    acc: { table: accTable, groups: accGroups, heat: accHeat },
-    cal: { timeline: calTimeline, week: calWeek, agenda: calAgenda },
+    acc: { table: accTable, all: accAll, groups: accGroups, heat: accHeat },
+    cal: { all: accAll, timeline: calTimeline, week: calWeek, agenda: calAgenda },
   };
 })();
 
