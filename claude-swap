@@ -24,7 +24,7 @@
 
 set -e
 
-VERSION="1.25.0"
+VERSION="1.25.5"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -4067,6 +4067,7 @@ PREVIEW_TIMEOUT = 60
 PREVIEW_TTL = 900       # a grant a preview showed may be spent within this
 OUTPUT_MAX = 8000
 LOG_LINES = 30
+TOKENS_EVERY = 300      # the token index is brought up to date this often
 CONFIRM = ("si", "sí")  # what the owner types before a reset is spent
 DAY_NAMES = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 N_RE = re.compile(r"[1-9][0-9]{0,3}\Z")
@@ -4787,7 +4788,12 @@ class App:
             "watch_log": os.path.join(c, "claude-swap-watch.log"),
             "watch_plist": os.path.join(home, "Library", "LaunchAgents",
                                         "com.claude-swap.watch.plist"),
-            "history": os.path.join(c, "claude-swap-usage-history.jsonl")}
+            "history": os.path.join(c, "claude-swap-usage-history.jsonl"),
+            "web_log": os.path.join(c, "claude-swap-web.log"),
+            "tokens": os.path.join(c, "claude-swap-tokens.json"),
+            "transcripts": os.path.join(c, "projects"),
+            "projects_config": os.path.join(c, "projects-config.json")}
+        self.home = home
         m = globals().get("meter")  # set by whoever execs this module (1.25)
         self.history = m.History(self.paths["history"]) if m else None
         self.run, self.popen, self.clock = run, popen, clock
@@ -5078,6 +5084,17 @@ class App:
             self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: usage history: {type(e).__name__}")
             return 0
 
+    def index_tokens(self, budget=None):
+        """Read what the transcripts added (the server: every TOKENS_EVERY)."""
+        m = globals().get("meter")
+        if m is None:
+            return None
+        try:
+            return m.Tokens(self.paths["tokens"], self.paths["transcripts"]).update(budget=budget)
+        except Exception as e:
+            self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: token index: {type(e).__name__}")
+            return None
+
     def usage(self, store, view=None, days=None):
         """/api/usage?view=pace: the Usage section's data, from the usage
         history and what the state says of each account now."""
@@ -5094,6 +5111,15 @@ class App:
             st = web_state(store, _read_json(self.paths["cache"]), now)
             hist = self.history.load(now - (days + 1) * 86400)
             return _finite(dict(meter.pace_view(st["accounts"], usage_groups(store), hist, now, days),
+                                view=view))
+        if view == "tokens":
+            tk = meter.Tokens(self.paths["tokens"], self.paths["transcripts"])
+            if not os.path.exists(self.paths["tokens"]):
+                return {"view": view, "indexing": True, "now": now}
+            namer = meter.project_namer(self.paths["projects_config"], self.home)
+            return _finite(dict(meter.tokens_view(tk.load(), now, days, namer), view=view))
+        if view == "events":
+            return _finite(dict(meter.events_view(self.paths["watch_log"], self.paths["web_log"], now, days),
                                 view=view))
         return {"error": "unknown view"}
 
@@ -5272,6 +5298,12 @@ def main(store_path, bin_path, version, port, pid_path, home=None):
             app.record()
             time.sleep(60)
     threading.Thread(target=recorder, daemon=True).start()
+
+    def indexer():  # the token index: the first pass reads every transcript (minutes)
+        while True:
+            app.index_tokens()
+            time.sleep(TOKENS_EVERY)
+    threading.Thread(target=indexer, daemon=True).start()
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] claude-swap web {version} on"
           f" http://127.0.0.1:{port} — "
           + (f"tailnet owner {owner}" if owner else "no tailscale owner: this Mac only"),
@@ -5637,6 +5669,494 @@ def pace_view(accounts, groups, hist, now, ndays=14):
             "forecast": forecast(mine, rate, now) if rate is not None else
                         dict(forecast(mine, 0, now), dry=None, points=[])})
     return {"now": now, "since": since, "days": days, "seats": seats, "groups": out_groups}
+
+# ---------- events: what the watch and the web did, from their logs ----------
+# The numbers are the accounts' at the time: a renumbering since changes them
+# (the lines that name the account say whose it was).
+
+EV_BYTES = 8 << 20          # only the logs' ends are read
+EV_MAX = 400                # the newest events listed
+TS = re.compile(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (.*)")
+EV_RULES = [
+    ("cl", re.compile(r"switch #(?P<a>\d+) -> #(?P<b>\d+) (?P<who>[^:]+): (?P<why>.*)")),
+    ("cl-hand", re.compile(r"#(?P<b>\d+) picked by hand")),
+    ("lane", re.compile(r"reserved sessions(?: \((?P<g>[^)]+)\))? #(?P<a>\d+) -> #(?P<b>\d+) (?P<who>[^:]+): (?P<why>.*)")),
+    ("lane-hand", re.compile(r"reserved sessions(?: \((?P<g>[^)]+)\))? on #(?P<b>\d+) by hand")),
+    ("reset", re.compile(r"reset done: #(?P<b>\d+) now (?P<why>.*)")),
+    ("reset-failed", re.compile(r"reset on #(?P<b>\d+) reported done but (?P<why>.*)")),
+    ("wall", re.compile(r"(?P<why>.*every (?:account|seat) (?:is )?at its limit.*)")),
+    ("watch", re.compile(r"(?P<why>watch (?:started|stopped).*)")),
+    ("web", re.compile(r"web: (?P<who>\S+@\S+) runs claude-swap (?P<why>.*)")),
+]
+EV_KINDS = [("cl", "cl moved by the watch"), ("cl-hand", "cl picked by hand"),
+            ("lane", "a lane moved by the watch"), ("lane-hand", "a lane moved by hand"),
+            ("reset", "free resets spent"), ("reset-failed", "resets that did not work"),
+            ("wall", "every account at its limit"), ("watch", "watch started or stopped"),
+            ("web", "actions from the web page")]
+
+
+def _log_tail(path, since):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - EV_BYTES))
+            if size > EV_BYTES:
+                f.readline()
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        m = TS.match(line)
+        if not m:
+            continue
+        try:
+            t = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, OverflowError):
+            continue
+        if t >= since:
+            out.append((t, m.group(2)))
+    return out
+
+
+def events(watch_log, web_log, since):
+    """The watch's and the web's events since `since`, oldest first:
+    [{"t", "kind", "a", "b", "g", "who", "why"}]. A move by hand is the first
+    line that finds the lane (cl) on a seat it was not on before."""
+    out, hand = [], {}
+    for src in (watch_log, web_log):
+        for t, msg in _log_tail(src, since):
+            for kind, rx in EV_RULES:
+                m = rx.match(msg)
+                if not m:
+                    continue
+                d = m.groupdict()
+                ev = {"t": t, "kind": kind, "a": _int(d.get("a")), "b": _int(d.get("b")),
+                      "g": d.get("g"), "who": (d.get("who") or "").strip() or None,
+                      "why": (d.get("why") or "").strip()[:200] or None}
+                if kind in ("cl", "lane"):
+                    hand[(kind, d.get("g"))] = ev["b"]
+                if kind in ("cl-hand", "lane-hand"):
+                    key = (kind.split("-")[0], d.get("g"))
+                    if hand.get(key) == ev["b"]:
+                        break
+                    ev["a"], hand[key] = hand.get(key), ev["b"]
+                out.append(ev)
+                break
+    out.sort(key=lambda e: e["t"])
+    return out
+
+
+def _int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def events_view(watch_log, web_log, now, ndays=14):
+    """The Usage section's Events: each kind's count a day and the newest
+    events (EV_MAX), newest first."""
+    days = local_days(now, ndays)
+    evs = events(watch_log, web_log, days[0])
+    edges = days + [days[-1] + DAY]
+    counts = {k: [0] * ndays for k, _ in EV_KINDS}
+    for e in evs:
+        for i in range(ndays):
+            if edges[i] <= e["t"] < edges[i + 1]:
+                counts[e["kind"]][i] += 1
+                break
+    return {"now": now, "days": days, "kinds": [{"key": k, "label": lab} for k, lab in EV_KINDS],
+            "counts": counts, "events": list(reversed(evs))[:EV_MAX], "total": len(evs)}
+
+
+def ev_text(e):
+    """One event in words (the page has its own copy)."""
+    g = f" ({e['g']})" if e.get("g") else ""
+    k = e["kind"]
+    if k in ("cl", "lane"):
+        return (("cl" if k == "cl" else "lane" + g) + f" #{e['a']} → #{e['b']}"
+                + (f" {e['who']}" if e.get("who") else "") + (f" — {e['why']}" if e.get("why") else ""))
+    if k in ("cl-hand", "lane-hand"):
+        return (("cl" if k == "cl-hand" else "lane" + g)
+                + (f" #{e['a']} → #{e['b']}" if e.get("a") else f" on #{e['b']}") + " by hand")
+    if k == "reset":
+        return f"reset spent on #{e['b']} — now {e.get('why') or ''}"
+    if k == "reset-failed":
+        return f"reset on #{e['b']} did not work — {e.get('why') or ''}"
+    if k == "web":
+        return f"{e.get('who') or ''} ran claude-swap {e.get('why') or ''}"
+    return e.get("why") or k
+
+
+# ---------- tokens: Claude Code's transcripts (~/.claude/projects/**/*.jsonl) ----------
+# Each answer of the model is a line with its usage, written once per content
+# block (the same usage each time: counted once, by message id, per file). An
+# index keeps the sums an hour × model, a day × folder × model and per session,
+# and how far each file was read, so only what was added is read again.
+# A copy of a message in another file (a resumed session) counts twice: rare.
+
+TOK_KEEP = 90 * 86400
+TOK_READ = 8 << 20                      # read at most this much of a file per chunk
+TOK_N = 7                               # in, out, thinking, cache write 5m, cache write 1h, cache read, answers
+HEAD, TAIL = 4096, 8192                 # where in a line its fields are looked for
+PRICES = [  # $ a million tokens: input, output, cache read; a cache write is 1.25x (5 min) or 2x (1 h) the input
+    ("claude-fable-5-2", 8, 40, 0.20), ("claude-mythos-5-2", 8, 40, 0.20),
+    ("claude-fable-5-1", 10, 50, 0.25), ("claude-mythos-5-1", 10, 50, 0.25),
+    ("claude-fable-5", 10, 50, 1.0), ("claude-mythos-5", 10, 50, 1.0),
+    ("claude-opus-5-5", 4, 20, 0.20), ("claude-opus-5", 5, 25, 0.5), ("claude-opus-4", 5, 25, 0.5),
+    ("claude-sonnet-5-5", 2, 10, 0.10), ("claude-sonnet-5", 2, 10, 0.2), ("claude-sonnet-4", 3, 15, 0.3),
+    ("claude-haiku-5-5", 0.1, 0.5, 0.01), ("claude-haiku-4", 1, 5, 0.1)]
+_RX = {k: re.compile(v) for k, v in {
+    "model": rb'"model":"([^"]+)"', "id": rb'"id":"(msg_[^"]+)"', "ts": rb'"timestamp":"([^"]+)"',
+    "sid": rb'"sessionId":"([^"]+)"', "cwd": rb'"cwd":"((?:[^"\\]|\\.)*)"',
+    "title": rb'"customTitle":"((?:[^"\\]|\\.)*)"'}.items()}
+
+
+def price(model):
+    """(input, output, cache read) $ a million tokens for a model id, or None."""
+    for prefix, i, o, r in PRICES:
+        if (model or "").startswith(prefix):
+            return i, o, r
+    return None
+
+
+def cost(model, v):
+    """What v (TOK_N figures) would cost on the API, in $ (None: an unknown model)."""
+    p = price(model)
+    if p is None:
+        return None
+    i, o, r = p
+    return (v[0] * i + v[1] * o + v[3] * i * 1.25 + v[4] * i * 2 + v[5] * r) / 1e6
+
+
+def _usage_obj(line):
+    i = line.rfind(b'"usage":{')
+    if i < 0:
+        return None
+    j, depth = i + 8, 0
+    for k in range(j, min(len(line), j + 4000)):
+        c = line[k]
+        if c == 123:
+            depth += 1
+        elif c == 125:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(line[j:k + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _find(rx, line, head):
+    """A field of a line: looked for at its start, then its end, then all of it
+    (its place moved between Claude Code versions)."""
+    return rx.search(head) or rx.search(line, max(0, len(line) - TAIL)) or rx.search(line)
+
+
+def _str(m):
+    try:
+        return json.loads(b'"' + m.group(1) + b'"')
+    except ValueError:
+        return m.group(1).decode("utf-8", "replace")
+
+
+def _ts(s):
+    try:
+        return datetime.fromisoformat(s.decode().replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _add(d, key, v):
+    cur = d.get(key)
+    if cur is None:
+        d[key] = list(v)
+    else:
+        for i in range(TOK_N):
+            cur[i] += v[i]
+
+
+class Tokens:
+    """The token index (a JSON file): update() reads what the transcripts
+    added since, view() sums it for the Usage section."""
+
+    def __init__(self, path, root):
+        self.path, self.root = path, root
+        self.lock = path + ".lock"
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                ix = json.load(f)
+            if ix.get("v") == 3:
+                return ix
+        except (OSError, ValueError):
+            pass
+        return {"v": 3, "files": {}, "hours": {}, "days": {}, "sessions": {}, "updated": None}
+
+    def update(self, now=None, budget=None):
+        """Read what each transcript added since the last update (all of them
+        the first time: minutes for gigabytes), under a lock (another update
+        running: nothing). budget: stop after this many seconds and carry on
+        next time. -> the index, or None when another update holds the lock."""
+        now = time.time() if now is None else now
+        try:
+            os.mkdir(self.lock)
+        except FileExistsError:
+            try:
+                if now - os.path.getmtime(self.lock) < 1800:
+                    return None
+                os.rmdir(self.lock)
+                os.mkdir(self.lock)
+            except OSError:
+                return None
+        try:
+            ix = self.load()
+            start, seen = time.time(), set()
+            for dirpath, _, names in os.walk(self.root):
+                for name in names:
+                    if not name.endswith(".jsonl"):
+                        continue
+                    p = os.path.join(dirpath, name)
+                    rel = os.path.relpath(p, self.root)
+                    seen.add(rel)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    if st.st_mtime < now - TOK_KEEP:
+                        continue
+                    f = ix["files"].get(rel)
+                    if f and f[0] == st.st_size and f[1] == st.st_mtime_ns:
+                        continue
+                    if budget is not None and time.time() - start > budget:
+                        continue
+                    self._read(ix, p, rel, st, f)
+            ix["files"] = {k: v for k, v in ix["files"].items() if k in seen}
+            self._prune(ix, now)
+            ix["updated"] = now
+            tmp = self.path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as out:
+                json.dump(ix, out, separators=(",", ":"))
+            os.replace(tmp, self.path)
+            return ix
+        finally:
+            try:
+                os.rmdir(self.lock)
+            except OSError:
+                pass
+
+    def _read(self, ix, p, rel, st, f):
+        pos = f[2] if f and f[2] <= st.st_size else (st.st_size if f else 0)
+        ids = dict.fromkeys(f[3]) if f and len(f) > 3 else {}
+        sub = "/subagents/" in rel.replace(os.sep, "/")
+        try:
+            fh = open(p, "rb")
+        except OSError:
+            return
+        with fh:
+            fh.seek(pos)
+            while pos < st.st_size:
+                data = fh.read(min(TOK_READ, st.st_size - pos))
+                if not data:
+                    break
+                end = data.rfind(b"\n") + 1
+                if end == 0:
+                    if len(data) < TOK_READ:
+                        break           # a line still being written
+                    fh.seek(pos)        # a line longer than a chunk: read it whole
+                    line = fh.readline()
+                    pos += len(line)
+                    self._line(ix, line, ids, sub)
+                    continue
+                for line in data[:end].split(b"\n"):
+                    self._line(ix, line, ids, sub)
+                pos += end
+                fh.seek(pos)
+        ix["files"][rel] = [st.st_size, st.st_mtime_ns, pos, list(ids)[-40:]]
+
+    def _line(self, ix, line, ids, sub):
+        # an answer's line: its id, model, folder and session near the start,
+        # its usage and time at the end, a long content in between: only the
+        # ends are searched (a line can be megabytes)
+        head = line[:HEAD]
+        if b'"custom-title"' in head:
+            m, s = _RX["title"].search(line), _RX["sid"].search(line)
+            if m and s:
+                ix["sessions"].setdefault(s.group(1).decode(), {"m": {}})["name"] = _str(m)[:80]
+            return
+        if b'"role":"assistant"' not in head or b'"api-request-blob"' in head[:120]:
+            return
+        mid = _RX["id"].search(head) or _RX["id"].search(line)
+        if not mid:
+            return
+        key = mid.group(1).decode()
+        if key in ids:
+            return
+        ids[key] = 1
+        if len(ids) > 400:   # the copies of an answer come together: keep the latest ids only
+            for x in list(ids)[:200]:
+                del ids[x]
+        u = _usage_obj(line)
+        mm = _RX["model"].search(head) or _RX["model"].search(line)
+        ts = _RX["ts"].search(line, max(0, len(line) - TAIL)) or _RX["ts"].search(line)
+        if not u or not mm or not ts:
+            return
+        model = mm.group(1).decode()
+        if model.startswith("<"):
+            return
+        t = _ts(ts.group(1))
+        if t is None:
+            return
+        cc = u.get("cache_creation") or {}
+        cw = u.get("cache_creation_input_tokens") or 0
+        c1h = cc.get("ephemeral_1h_input_tokens") or 0
+        c5 = cc.get("ephemeral_5m_input_tokens", cw - c1h) or 0
+        v = [u.get("input_tokens") or 0, u.get("output_tokens") or 0,
+             (u.get("output_tokens_details") or {}).get("thinking_tokens") or 0,
+             c5, c1h, u.get("cache_read_input_tokens") or 0, 1]
+        hour = str(int(t // 3600 * 3600))
+        _add(ix["hours"].setdefault(hour, {}), model, v)
+        cwdm = _find(_RX["cwd"], line, head)
+        cwd = _str(cwdm) if cwdm else "?"
+        day = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+        _add(ix["days"].setdefault(day, {}).setdefault(cwd, {}), model, v)
+        sm = _find(_RX["sid"], line, head)
+        if sm:
+            s = ix["sessions"].setdefault(sm.group(1).decode(), {"m": {}})
+            s.setdefault("cwd", cwd)
+            s["first"] = min(s.get("first") or t, t)
+            s["last"] = max(s.get("last") or t, t)
+            _add(s["m"], model, v)
+            _add(s.setdefault("d", {}).setdefault(day, {}), model, v)
+            if sub:
+                _add(s.setdefault("sub", {}), model, v)
+                _add(s.setdefault("sd", {}).setdefault(day, {}), model, v)
+
+    def _prune(self, ix, now):
+        cut = now - TOK_KEEP
+        ix["hours"] = {h: v for h, v in ix["hours"].items() if int(h) >= cut}
+        dcut = datetime.fromtimestamp(cut).strftime("%Y-%m-%d")
+        ix["days"] = {d: v for d, v in ix["days"].items() if d >= dcut}
+        ix["sessions"] = {k: v for k, v in ix["sessions"].items() if (v.get("last") or now) >= cut}
+        for s in ix["sessions"].values():
+            for k in ("d", "sd"):
+                if s.get(k):
+                    s[k] = {d: x for d, x in s[k].items() if d >= dcut}
+
+
+def project_namer(config_path, home):
+    """A folder's project name: the nearest mapped folder above it in
+    claude-snapshot's projects-config.json ({"mappings": {path: name}}; the
+    home only exactly), else the folder's own name."""
+    try:
+        with open(config_path) as f:
+            maps = (json.load(f) or {}).get("mappings") or {}
+    except (OSError, ValueError, AttributeError):
+        maps = {}
+    maps = {os.path.normpath(k): v for k, v in maps.items() if isinstance(v, str)}
+    home = os.path.normpath(home)
+
+    def name(cwd):
+        if not cwd or cwd == "?":
+            return "?"
+        p = os.path.normpath(cwd)
+        if p in maps:
+            return maps[p]
+        q = p
+        while True:
+            q2 = os.path.dirname(q)
+            if q2 == q:
+                break
+            q = q2
+            if q in maps and q != home:
+                return maps[q]
+        return os.path.basename(p) or p
+    return name
+
+
+def _sum_models(by_model):
+    tot = [0] * TOK_N
+    usd, unknown = 0.0, 0
+    for model, v in by_model.items():
+        for i in range(TOK_N):
+            tot[i] += v[i]
+        c = cost(model, v)
+        if c is None:
+            unknown += v[6]
+        else:
+            usd += c
+    return tot, usd, unknown
+
+
+def tokens_view(ix, now, ndays=14, namer=None):
+    """The Usage section's Tokens, over the last ndays: per model, per day
+    (and model), the last 48 hours, per project and the costliest sessions;
+    tokens and what they would cost on the API at list prices."""
+    namer = namer or (lambda c: c)
+    days = local_days(now, ndays)
+    keys = [datetime.fromtimestamp(d).strftime("%Y-%m-%d") for d in days]
+    models, daily, projects = {}, [], {}
+    for k in keys:
+        day = ix.get("days", {}).get(k) or {}
+        bym = {}
+        for cwd, mv in day.items():
+            pname = namer(cwd)
+            for model, v in mv.items():
+                _add(models, model, v)
+                _add(bym, model, v)
+                _add(projects.setdefault(pname, {}), model, v)
+        tot, usd, _ = _sum_models(bym)
+        daily.append({"tokens": tot, "usd": round(usd, 2),
+                      "models": {m: round(cost(m, v) or 0, 2) for m, v in bym.items()}})
+    h0 = int(now // 3600 * 3600) - 47 * 3600
+    hours = []
+    for i in range(48):
+        bym = ix.get("hours", {}).get(str(h0 + i * 3600)) or {}
+        tot, usd, _ = _sum_models(bym)
+        hours.append({"t": h0 + i * 3600, "tokens": tot, "usd": round(usd, 2)})
+    tot, usd, unknown = _sum_models(models)
+    since = days[0]
+    sess, want = [], set(keys)
+    for sid, s in (ix.get("sessions") or {}).items():
+        if (s.get("last") or 0) < since or not s.get("d"):
+            continue
+        mine, msub = {}, {}
+        for d, mv in s["d"].items():
+            if d in want:
+                for model, v in mv.items():
+                    _add(mine, model, v)
+        for d, mv in (s.get("sd") or {}).items():
+            if d in want:
+                for model, v in mv.items():
+                    _add(msub, model, v)
+        if not mine:
+            continue
+        st, su, _ = _sum_models(mine)
+        sb = _sum_models(msub)[1]
+        sess.append({"id": sid[:8], "name": s.get("name"), "project": namer(s.get("cwd")),
+                     "first": s.get("first"), "last": s.get("last"), "tokens": st,
+                     "usd": round(su, 2), "sub_usd": round(sb, 2),
+                     "models": sorted(mine, key=lambda m: -(cost(m, mine[m]) or 0))})
+    sess.sort(key=lambda x: -x["usd"])
+    proj = []
+    for name, mv in projects.items():
+        pt, pu, _ = _sum_models(mv)
+        proj.append({"name": name, "tokens": pt, "usd": round(pu, 2)})
+    proj.sort(key=lambda x: -x["usd"])
+    reads = tot[5] + tot[3] + tot[4] + tot[0]
+    return {
+        "now": now, "days": days, "updated": ix.get("updated"),
+        "total": {"tokens": tot, "usd": round(usd, 2), "unknown": unknown,
+                  "cache_hit": round(tot[5] / reads, 3) if reads else None},
+        "models": sorted(({"model": m, "tokens": v, "usd": round(cost(m, v) or 0, 2), "priced": price(m) is not None}
+                          for m, v in models.items()), key=lambda x: -x["usd"]),
+        "daily": daily, "hours": hours, "projects": proj[:25], "sessions": sess[:30],
+        "fields": ["in", "out", "thinking", "cache write 5m", "cache write 1h", "cache read", "answers"]}
 PYEOF
 
 # --- Checks ---
@@ -5731,10 +6251,12 @@ cmd_help() {
   echo "                           a LaunchAgent on macOS (--foreground: in this terminal)."
   echo "                           On the tailnet: tailscale serve --bg --https=N http://127.0.0.1:N"
   echo "                           (the node's owner may use it; the store's web.allow overrides)"
-  echo "  claude-swap usage [pace] [--days N] [--group g] [--all] [--json]"
+  echo "  claude-swap usage [pace|events|tokens] [--days N] [--group g] [--all] [--json]"
   echo "                           What the accounts used over time: per group the week left,"
   echo "                           a day's use and whether it lasts to the renewals; per"
-  echo "                           account its pace and when it runs out (the web's Usage)"
+  echo "                           account its pace and when it runs out; events: moves, resets"
+  echo "                           and walls a day, from the logs; tokens: per model, project and"
+  echo "                           session from the transcripts, at API prices (the web's Usage)"
   echo "  claude-swap disable <n>  Mark account as disabled (skipped by check/auto/keys-sync)"
   echo "  claude-swap enable <n>   Re-enable a disabled account"
   echo "  claude-swap reserve <n>  Keep account N for sessions of its own (never the watch's;"
@@ -10371,10 +10893,14 @@ web = types.ModuleType("web")
 web.engine, web.oauth, web.meter = engine, oauth, meter
 exec(os.environ.pop("CLAUDE_SWAP_WEB"), web.__dict__)
 
-USAGE = ("Usage: claude-swap usage [pace] [--days N] [--group g] [--all] [--json]\n"
+USAGE = ("Usage: claude-swap usage [pace|events|tokens] [--days N] [--group g] [--all] [--json]\n"
          "  pace    per group: the week left (in whole accounts), what it used a day and,\n"
          "          at the last 24 h's pace, whether it lasts until the renewals;\n"
          "          per account: what it used, how fast it climbs now, when it runs out\n"
+         "  events  what the watch and the web did: moves of cl and the lanes (by the\n"
+         "          watch or by hand), resets and how they went, walls, starts, a day each\n"
+         "  tokens  Claude Code's transcripts: tokens per model, day, project and session, the\n"
+         "          cache's share and what they would cost on the API at list prices\n"
          "  --days N  the days shown (14) · --group g  one group's seats · --all  every\n"
          "          account (else those that used something in the days shown)")
 store_path, args = sys.argv[1], sys.argv[2:]
@@ -10384,7 +10910,7 @@ while i < len(args):
     a = args[i]
     if a in ("-h", "--help", "help"):
         print(USAGE); sys.exit(0)
-    elif a == "pace":
+    elif a in ("pace", "events", "tokens"):
         view = a
     elif a == "--days" and i + 1 < len(args) and args[i + 1].isdigit():
         days = max(1, min(60, int(args[i + 1]))); i += 1
@@ -10400,6 +10926,13 @@ while i < len(args):
 
 store = oauth.load_store(store_path)
 app = web.App(store_path, "")
+if view == "tokens":
+    if not os.path.exists(app.paths["tokens"]):
+        print("Reading Claude Code's transcripts for the first time (a few minutes for gigabytes)…", file=sys.stderr)
+    if app.index_tokens() is None and not os.path.exists(app.paths["tokens"]):
+        print("claude-swap usage: another process is reading the transcripts; try again in a few minutes",
+              file=sys.stderr)
+        sys.exit(1)
 data = app.usage(store, view, days)
 if data.get("error"):
     print("claude-swap usage: " + data["error"], file=sys.stderr); sys.exit(1)
@@ -10423,6 +10956,59 @@ def span(s):
     s = int(s)
     return f"{s // 86400}d {s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h {s % 3600 // 60:02d}m"
 
+def big(n):
+    n = float(n or 0)
+    for u, d in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= d:
+            return f"{n / d:.1f}{u}"
+    return f"{int(n)}"
+if view == "tokens":
+    tt = data["total"]
+    tk = tt["tokens"]
+    print(c(BLD, "Usage · tokens") + "  " + c(DIM, f"the last {len(data['days'])} days of Claude Code's transcripts"
+          " — $ at API list prices, not what the plans charge"))
+    print()
+    print(f"  {c(BLD, '$' + format(tt['usd'], ',.0f'))} at API prices · {big(sum(tk[:6]) - tk[2])} tokens"
+          f" · cache {round((tt['cache_hit'] or 0) * 100)}% of the input · {tk[6]:,} answers")
+    print()
+    print(c(DIM, f"  {'Model':<22} {'input':>7} {'output':>7} {'(think)':>8} {'cache w':>8} {'cache r':>8} {'answers':>8} {'$':>9}"))
+    for x in data["models"]:
+        v = x["tokens"]
+        print(f"  {x['model']:<22} {big(v[0]):>7} {big(v[1]):>7} {big(v[2]):>8} {big(v[3] + v[4]):>8} {big(v[5]):>8}"
+              f" {v[6]:>8,} {(format(x['usd'], ',.2f') if x['priced'] else '?'):>9}")
+    print()
+    ds = data["days"][-min(7, len(data["days"])):]
+    off = len(data["days"]) - len(ds)
+    print(c(DIM, "  A day ($): ") + "  ".join(
+        f"{DN[datetime.fromtimestamp(d).weekday()]}{datetime.fromtimestamp(d).day:02d} {data['daily'][off + i]['usd']:,.0f}"
+        for i, d in enumerate(ds)))
+    print()
+    print(c(DIM, f"  {'Project':<24} {'tokens':>8} {'$':>9}"))
+    for x in data["projects"][:10]:
+        print(f"  {x['name'][:24]:<24} {big(sum(x['tokens'][:6]) - x['tokens'][2]):>8} {x['usd']:>9,.2f}")
+    print()
+    print(c(DIM, f"  {'Session':<26} {'project':<14} {'last':<12} {'$':>9} {'agents':>8}"))
+    for s in data["sessions"][:12]:
+        print(f"  {(s['name'] or s['id'])[:26]:<26} {s['project'][:14]:<14} {when(s['last']):<12} {s['usd']:>9,.2f}"
+              f" {s['sub_usd']:>8,.2f}")
+    sys.exit(0)
+if view == "events":
+    ds = data["days"][-min(7, len(data["days"])):]
+    off = len(data["days"]) - len(ds)
+    dh = " ".join(f"{DN[datetime.fromtimestamp(d).weekday()]}{datetime.fromtimestamp(d).day:02d}".rjust(4) for d in ds)
+    print(c(BLD, "Usage · events") + "  " + c(DIM, f"the last {len(data['days'])} days, from the watch's and the web's logs"
+          " (numbers are the accounts' at the time)"))
+    print()
+    print(c(DIM, f"  {'What':<30} {dh}  {'total':>5}"))
+    for k in data["kinds"]:
+        cnt = data["counts"][k["key"]]
+        cells = " ".join((f"{v:>4}" if v else c(DIM, f"{'·':>4}")) for v in cnt[off:])
+        print(f"  {k['label']:<30} {cells}  {sum(cnt):>5}")
+    print()
+    print(c(DIM, "  Latest:"))
+    for e in data["events"][:30]:
+        print(f"  {when(e['t']):>12}  {meter.ev_text(e)}"[:160])
+    sys.exit(0)
 groups = [g for g in data["groups"] if not group or g["name"] == group]
 if group and not groups:
     print(f"claude-swap usage: no group {group!r} (" + ", ".join(g["name"] for g in data["groups"]) + ")",
@@ -11147,6 +11733,15 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
 .vx td.x-h2{background:color-mix(in srgb,var(--accent) 30%,transparent)}
 .vx td.x-h3{background:color-mix(in srgb,var(--accent) 50%,transparent)}
 .vx td.x-h4{background:color-mix(in srgb,var(--accent) 75%,transparent);color:var(--on-accent)}
+.vx .x-evlist{max-height:540px;overflow:auto;border:1px solid var(--rule);border-radius:10px;background:var(--panel);padding:4px 12px;font-size:13px}
+.vx .x-evrow{display:grid;grid-template-columns:100px 92px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid var(--rule)}
+.vx .x-evrow:last-child{border-bottom:0}
+.vx .x-evt{font:12px/1.5 var(--f-mono);color:var(--ink2)}
+.vx .x-evk{font:12px/1.5 var(--f-mono)}
+.vx .x-evw{overflow-wrap:anywhere}
+.vx table.x-uev{margin-bottom:10px}
+@media (max-width:600px){.vx .x-evrow{grid-template-columns:78px 1fr}.vx .x-evk{display:none}}
+.vx .x-pbar{display:inline-block;height:8px;border-radius:4px;background:var(--accent);opacity:.75;vertical-align:middle}
 .vx .x-sortbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 9px;font-size:12.5px}
 .vx .x-sortbar select{font:inherit;padding:3px 6px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--ink)}
 .vx tbody tr:hover td{background:color-mix(in srgb,var(--accent) 5%,var(--panel))}
@@ -12283,7 +12878,7 @@ const VIEW_OPTS = {
   grp: [["classic", "Cards"], ["table", "Table"], ["board", "Board"]],
   acc: [["classic", "Classic"], ["table", "Table"], ["all", "All in one"], ["groups", "By group"], ["heat", "Heat"]],
   cal: [["classic", "Days"], ["all", "All in one"], ["timeline", "5h timeline"], ["week", "Week × hour"], ["agenda", "Agenda"]],
-  use: [["pace", "Pace"]],
+  use: [["pace", "Pace"], ["events", "Events"], ["tokens", "Tokens"]],
 };
 const VIEW_DEF = { grp: "classic", acc: "classic", cal: "classic", use: "pace" };
 function readViews() {
@@ -12868,8 +13463,80 @@ const Views = (() => {
       scroll(h("table", { class: "upace" }, h("thead", {}, head), h("tbody", {}, body)))];
   }
 
+  const EV_CLS = { cl: "t-accent", "cl-hand": "t-accent", lane: "t-cyan", "lane-hand": "t-cyan", reset: "t-ok",
+    "reset-failed": "t-bad", wall: "t-bad", watch: "faint", web: "t-mag" };
+  function evText(e) {
+    const g = e.g ? " (" + e.g + ")" : "";
+    if (e.kind === "cl" || e.kind === "lane")
+      return (e.kind === "cl" ? "cl" : "lane" + g) + " #" + e.a + " → #" + e.b + (e.who ? " " + e.who : "") + (e.why ? " — " + e.why : "");
+    if (e.kind === "cl-hand" || e.kind === "lane-hand")
+      return (e.kind === "cl-hand" ? "cl" : "lane" + g) + (e.a ? " #" + e.a + " → #" + e.b : " on #" + e.b) + " by hand";
+    if (e.kind === "reset") return "reset spent on #" + e.b + " — now " + (e.why || "");
+    if (e.kind === "reset-failed") return "reset on #" + e.b + " did not work — " + (e.why || "");
+    if (e.kind === "web") return (e.who || "") + " ran claude-swap " + (e.why || "");
+    return e.why || e.kind;
+  }
+  function useEvents(redo, data) {
+    const days = data.days || [], kinds = data.kinds || [];
+    const pick = vu.evk || "all";
+    const head = h("tr", {}, h("th", { text: "What" }), days.map((d, i) => h("th", { class: "uhh" + (i === days.length - 1 ? " today" : "") },
+      DAYS[D(d).getDay()], h("small", { text: String(D(d).getDate()) }))), h("th", { text: "Total" }));
+    const rows = kinds.map((k) => {
+      const c = (data.counts || {})[k.key] || [];
+      return h("tr", { class: pick === k.key ? "on-lane" : "" }, h("td", { class: EV_CLS[k.key] || "", text: k.label }),
+        c.map((v) => h("td", { class: "uh " + (!v ? "h0" : v < 3 ? "h1" : v < 10 ? "h2" : v < 25 ? "h3" : "h4"), text: v ? String(v) : "" })),
+        h("td", { class: "num", text: String(c.reduce((a, b) => a + b, 0)) }));
+    });
+    const chip = (k, t) => h("button", { type: "button", class: "chip", "aria-pressed": String(pick === k), text: t,
+      onclick: () => { vu.evk = k; redo(); } });
+    const list = (data.events || []).filter((e) => pick === "all" || e.kind === pick).slice(0, 200);
+    return [note("What the watch and the web page did, from their logs, a day each. The numbers are the accounts' at the time."),
+      scroll(h("table", { class: "uev" }, h("thead", {}, head), h("tbody", {}, rows))),
+      h("div", { class: "filters" }, h("span", { class: "faint", text: "List" }), chip("all", "everything"), kinds.map((k) => chip(k.key, k.label))),
+      h("div", { class: "evlist" }, list.length ? list.map((e) => h("div", { class: "evrow" },
+        h("span", { class: "evt", text: dayWord(e.t) + hm(e.t) }), h("span", { class: "evk " + (EV_CLS[e.kind] || ""), text: e.kind }),
+        h("span", { class: "evw", text: evText(e) }))) : h("p", { class: "faint", text: "Nothing in these days." }))];
+  }
+
+  const big = (n) => { n = Number(n) || 0; return n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n)); };
+  const usd = (x) => "$" + (x >= 100 ? Math.round(x).toLocaleString("en-US") : (x || 0).toFixed(2));
+  const processed = (v) => (v[0] + v[1] + v[3] + v[4] + v[5]);
+  function useTokens(redo, data) {
+    if (data.indexing) return [note("Reading Claude Code's transcripts for the first time: a few minutes for gigabytes. This view fills in when it is done (the server brings it up to date every 5 minutes after that).")];
+    const tt = data.total || {}, tk = tt.tokens || [0, 0, 0, 0, 0, 0, 0];
+    const days = data.days || [], daily = data.daily || [], hours = data.hours || [];
+    const fig = (v, l) => h("div", {}, h("b", { text: v }), h("small", { text: l }));
+    const top = Math.max(1, ...(data.projects || []).map((x) => x.usd));
+    return [note("The last " + days.length + " days of Claude Code's transcripts on this Mac, read every 5 minutes"
+        + (data.updated ? " (last " + hm(data.updated) + ")" : "") + ". $ is what the tokens would cost on the API at list prices — not what the plans charge; it compares sessions, projects and models."),
+      h("div", { class: "ucards" },
+        h("div", { class: "ucard" }, h("div", { class: "ufigs" }, fig(usd(tt.usd), "at API prices"), fig(big(processed(tk)), "tokens"),
+          fig(tt.cache_hit == null ? "–" : Math.round(tt.cache_hit * 100) + "%", "of the input from cache")),
+          h("div", { class: "ubox" }, h("small", { class: "faint", text: "A day, at API prices" }),
+            chart(daily.map((d) => d.usd), { cls: () => "use", title: (v, i) => dateStr(days[i]) + " · " + usd(v)
+              + " · " + Object.entries(daily[i].models || {}).filter(([, x]) => x > 0).map(([m, x]) => m.replace("claude-", "") + " " + usd(x)).join(", ") }),
+            h("div", { class: "uax" }, days.map((d, i) => h("span", { text: i % 2 === days.length % 2 ? "" : String(D(d).getDate()) }))))),
+        h("div", { class: "ucard" }, h("div", { class: "uhd" }, h("b", { text: "48 hours" }), h("span", { class: "faint", text: "an hour each, at API prices" })),
+          chart(hours.map((x) => x.usd), { cls: () => "use", wide: true, title: (v, i) => dayWord(hours[i].t) + hm(hours[i].t) + " · " + usd(v) + " · " + big(processed(hours[i].tokens)) + " tokens" }),
+          h("div", { class: "uax" }, hours.map((x, i) => h("span", { text: i % 6 === 0 ? pad2(D(x.t).getHours()) : "" }))))),
+      h("p", { class: "note", text: "Per model" }),
+      scroll(h("table", {}, h("thead", {}, h("tr", {}, ["Model", "Input", "Output", "(thinking)", "Cache write", "Cache read", "Answers", "At API prices"].map((x) => h("th", { text: x })))),
+        h("tbody", {}, (data.models || []).map((x) => h("tr", {}, h("td", { text: x.model }),
+          [x.tokens[0], x.tokens[1], x.tokens[2], x.tokens[3] + x.tokens[4], x.tokens[5]].map((v) => h("td", { class: "num", text: big(v) })),
+          h("td", { class: "num", text: x.tokens[6].toLocaleString("en-US") }), h("td", { class: "num", text: x.priced ? usd(x.usd) : "?" })))))),
+      h("p", { class: "note", text: "Per project (claude-snapshot's names; a folder without one goes by its own name)" }),
+      scroll(h("table", {}, h("thead", {}, h("tr", {}, ["Project", "Tokens", "At API prices", ""].map((x) => h("th", { text: x })))),
+        h("tbody", {}, (data.projects || []).map((x) => h("tr", {}, h("td", { text: x.name }), h("td", { class: "num", text: big(processed(x.tokens)) }),
+          h("td", { class: "num", text: usd(x.usd) }), h("td", {}, h("span", { class: "pbar", css: { width: Math.max(2, Math.round(x.usd / top * 160)) + "px" } }))))))),
+      h("p", { class: "note", text: "The costliest sessions (agents: what its subagents used)" }),
+      scroll(h("table", {}, h("thead", {}, h("tr", {}, ["Session", "Project", "Last", "Models", "At API prices", "Agents"].map((x) => h("th", { text: x })))),
+        h("tbody", {}, (data.sessions || []).map((s) => h("tr", {}, h("td", { title: s.id, text: s.name || s.id }), h("td", { text: s.project }),
+          h("td", {}, timeCell(s.last)), h("td", { class: "faint", text: (s.models || []).map((m) => m.replace("claude-", "")).join(", ") }),
+          h("td", { class: "num", text: usd(s.usd) }), h("td", { class: "num faint", text: s.sub_usd ? usd(s.sub_usd) : "–" }))))))];
+  }
+
   return {
-    use: { pace: usePace },
+    use: { pace: usePace, events: useEvents, tokens: useTokens },
     grp: { table: grpTable, board: grpBoard },
     acc: { table: accTable, all: accAll, groups: accGroups, heat: accHeat },
     cal: { all: accAll, timeline: calTimeline, week: calWeek, agenda: calAgenda },

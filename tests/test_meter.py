@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 import test_web
@@ -116,6 +117,69 @@ class PaceViewTest(unittest.TestCase):
         self.assertTrue(s["cut"])
         self.assertEqual(v["groups"][0]["daily"][-1] + v["groups"][0]["daily"][-2], 0.12)
         self.assertIsNotNone(v["groups"][0]["rate"])
+
+
+class EventsTest(unittest.TestCase):
+    def test_the_logs_lines_become_events(self):
+        d = tempfile.mkdtemp(prefix="cs-ev-")
+        self.addCleanup(shutil.rmtree, d, True)
+        wl, bl = os.path.join(d, "watch.log"), os.path.join(d, "web.log")
+        ts = lambda s: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - s))
+        with open(wl, "w") as f:
+            f.write(f"[{ts(500)}] switch #1 -> #2 b@x.io: #1 at its limit (5h 100% · 7d 50%)\n"
+                    f"[{ts(400)}] reserved sessions on #5 by hand — kept until it reaches its limit\n"
+                    f"[{ts(390)}] reserved sessions on #5 by hand — kept until it reaches its limit\n"
+                    f"[{ts(300)}] reserved sessions on #6 by hand — kept until it reaches its limit\n"
+                    f"[{ts(200)}] reset done: #2 now 5h 0% · 7d 10%\n"
+                    f"[{ts(100)}] #2 5h 3% · 7d 11% — #2 goes first — next look 12:00\n")
+        with open(bl, "w") as f:
+            f.write(f"[{ts(50)}] web: owner@x.io runs claude-swap 3 g\n")
+        v = M.events_view(wl, bl, NOW, 2)
+        kinds = [e["kind"] for e in reversed(v["events"])]
+        self.assertEqual(kinds, ["cl", "lane-hand", "lane-hand", "reset", "web"])
+        self.assertEqual(v["events"][2]["a"], 5)   # the second move by hand: #5 -> #6
+        self.assertEqual(sum(v["counts"]["lane-hand"]), 2)
+        self.assertIn("#1 → #2", M.ev_text(v["events"][-1]))
+
+
+class TokensTest(unittest.TestCase):
+    def test_an_answer_counts_once_and_only_what_was_added_is_read(self):
+        d = tempfile.mkdtemp(prefix="cs-tok-")
+        self.addCleanup(shutil.rmtree, d, True)
+        root = os.path.join(d, "projects", "-x")
+        os.makedirs(os.path.join(root, "s1", "subagents"))
+        def line(mid, model="claude-opus-5-5", out=100, sid="s1", ts="2026-11-19T10:00:00.000Z"):
+            return json.dumps({"type": "assistant", "sessionId": sid, "cwd": "/w/proj", "timestamp": ts,
+                               "message": {"id": mid, "model": model, "role": "assistant",
+                                           "usage": {"input_tokens": 10, "output_tokens": out,
+                                                     "cache_creation_input_tokens": 1000,
+                                                     "cache_creation": {"ephemeral_1h_input_tokens": 1000},
+                                                     "cache_read_input_tokens": 5000}}},
+                              separators=(",", ":")) + "\n"
+        main = os.path.join(root, "s1.jsonl")
+        with open(main, "w") as f:
+            f.write(line("msg_a") + line("msg_a") + line("msg_b", model="claude-fable-5-2"))
+            f.write(json.dumps({"type": "custom-title", "customTitle": "WORK", "sessionId": "s1"},
+                               separators=(",", ":")) + "\n")
+        with open(os.path.join(root, "s1", "subagents", "agent-1.jsonl"), "w") as f:
+            f.write(line("msg_c", model="claude-haiku-5-5"))
+        tk = M.Tokens(os.path.join(d, "ix.json"), os.path.join(d, "projects"))
+        ix = tk.update(now=NOW)
+        s = ix["sessions"]["s1"]
+        self.assertEqual(s["name"], "WORK")
+        self.assertEqual(s["m"]["claude-opus-5-5"][6], 1)
+        self.assertEqual(set(s["sub"]), {"claude-haiku-5-5"})
+        with open(main, "a") as f:
+            f.write(line("msg_b", model="claude-fable-5-2") + line("msg_d"))
+        ix = tk.update(now=NOW)
+        self.assertEqual(ix["sessions"]["s1"]["m"]["claude-opus-5-5"][6], 2)
+        self.assertEqual(ix["sessions"]["s1"]["m"]["claude-fable-5-2"][6], 1)
+        v = M.tokens_view(ix, NOW, 3, M.project_namer(os.path.join(d, "none.json"), "/home"))
+        self.assertEqual(v["projects"][0]["name"], "proj")
+        # opus: 2 x (10 in + 100 out + 1000 cache 1h + 5000 read)
+        self.assertAlmostEqual(next(x for x in v["models"] if x["model"] == "claude-opus-5-5")["usd"],
+                               round(2 * (10 * 4 + 100 * 20 + 1000 * 8 + 5000 * 0.2) / 1e6, 2))
+        self.assertIsNone(M.cost("claude-unknown", [1] * 7))
 
 
 class UsageRouteTest(unittest.TestCase):
