@@ -23,7 +23,7 @@
 
 set -e
 
-VERSION="1.24.2"
+VERSION="1.24.3"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -10580,6 +10580,9 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
 .vx th.x-sort{cursor:pointer;user-select:none}
 .vx th.x-sort:hover{color:var(--ink)}
 .vx th .x-arr{color:var(--accent);margin-left:3px}
+.vx th .x-arr2{opacity:.7;font-size:.85em}
+.vx .x-sortbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 9px;font-size:12.5px}
+.vx .x-sortbar select{font:inherit;padding:3px 6px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--ink)}
 .vx tbody tr:hover td{background:color-mix(in srgb,var(--accent) 5%,var(--panel))}
 .vx .x-stk{position:sticky;left:0;z-index:1;background:var(--panel)}
 .vx .x-stk2{position:sticky;left:46px;z-index:1;background:var(--panel);box-shadow:1px 0 0 var(--rule)}
@@ -11760,7 +11763,7 @@ const Views = (() => {
   const short = (a) => (a.label || "").split("@")[0];
   const domain = (a) => { const p = (a.email || a.label || "").split("@"); return p.length > 1 ? "@" + p[1] : ""; };
   const sameT = (a, b) => a != null && b != null && Math.abs(a - b) < 180;
-  const vu = { grp: "all", hideOff: false, sort: { k: "n", dir: 1 }, crit: {}, compact: true };
+  const vu = { grp: "all", hideOff: false, sort: { k: "n", dir: 1 }, then: null, crit: {}, compact: true };
 
   function bar(p, cls) {
     return h("span", { class: "bar " + level(p) + (cls ? " " + cls : ""), vars: { "--p": clamp(p) } }, h("i"));
@@ -11844,6 +11847,38 @@ const Views = (() => {
       chip("hide disabled", vu.hideOff, () => { vu.hideOff = !vu.hideOff; redo(); }), extra || null);
   }
 
+  // ---------- sorting: a heading gives the first key; "then by" (or shift+click a heading) the second ----------
+  const colName = (x) => x.lab || (typeof x.t === "string" ? x.t : x.k);
+  const sortKeys = (cols) => { const f = (s) => s && cols.find((x) => x.k === s.k && x.sort); return [f(vu.sort) || cols[0], f(vu.then)]; };
+  function sortRows(cols, list) {
+    const [c1, c2] = sortKeys(cols);
+    const d1 = c1.k === vu.sort.k ? vu.sort.dir : 1;
+    const cmp = (c, dir, x, y) => { const a = c.sort(x), b = c.sort(y); return (a < b ? -1 : a > b ? 1 : 0) * dir; };
+    return list.slice().sort((x, y) => cmp(c1, d1, x, y) || (c2 && c2 !== c1 ? cmp(c2, vu.then.dir, x, y) : 0) || x.n - y.n);
+  }
+  function sortTh(x, cls, redo) {
+    const first = vu.sort.k === x.k, second = !first && !!vu.then && vu.then.k === x.k;
+    return h("th", { class: cls + (x.sort ? " sort" : ""), title: x.sort ? "click: sort by " + colName(x) + " · shift+click: then by it" : null,
+      onclick: x.sort ? (ev) => {
+        if (ev.shiftKey && !first) vu.then = { k: x.k, dir: second ? -vu.then.dir : 1 };
+        else { vu.sort = { k: x.k, dir: first ? -vu.sort.dir : 1 }; if (vu.then && vu.then.k === x.k) vu.then = null; }
+        redo();
+      } : null },
+      x.t, first ? h("span", { class: "arr", text: vu.sort.dir > 0 ? "▲" : "▼" })
+        : second ? h("span", { class: "arr arr2", text: (vu.then.dir > 0 ? "▲" : "▼") + "2" }) : null);
+  }
+  function thenBy(cols, redo) {
+    const [c1, c2] = sortKeys(cols);
+    const d1 = c1.k === vu.sort.k ? vu.sort.dir : 1;
+    const sel = h("select", { "aria-label": "then sort by" }, h("option", { value: "", text: "nothing" }),
+      cols.filter((x) => x.sort && x !== c1).map((x) => h("option", { value: x.k, selected: c2 === x, text: colName(x) })));
+    sel.addEventListener("change", () => { vu.then = sel.value ? { k: sel.value, dir: 1 } : null; redo(); });
+    return h("div", { class: "sortbar" }, h("span", { class: "faint", text: "Sorted by" }),
+      h("b", { text: colName(c1) + " " + (d1 > 0 ? "▲" : "▼") }), h("span", { class: "faint", text: "then by" }), sel,
+      c2 && c2 !== c1 ? h("button", { type: "button", class: "chip", title: "reverse the second key", text: vu.then.dir > 0 ? "▲" : "▼",
+        onclick: () => { vu.then = { k: vu.then.k, dir: -vu.then.dir }; redo(); } }) : null);
+  }
+
   // ---------- accounts: one flat table ----------
   function accTable(redo) {
     const M = modelName();
@@ -11863,12 +11898,9 @@ const Views = (() => {
       { k: "grp", t: "Groups", cell: (a) => (a.groups || []).map((g) => pill("", g)) },
       { k: "act", t: "", cell: acts },
     ];
-    const c = cols.find((x) => x.k === vu.sort.k && x.sort) || cols[0];
-    const rows = shown().slice().sort((x, y) => { const a = c.sort(x), b = c.sort(y); return (a < b ? -1 : a > b ? 1 : x.n - y.n) * vu.sort.dir; });
-    const head = h("tr", {}, cols.map((x) => h("th", { class: (x.th || "") + (x.sort ? " sort" : ""),
-      onclick: x.sort ? () => { vu.sort = { k: x.k, dir: vu.sort.k === x.k ? -vu.sort.dir : 1 }; redo(); } : null },
-      x.t, vu.sort.k === x.k ? h("span", { class: "arr", text: vu.sort.dir > 0 ? "▲" : "▼" }) : null)));
-    return [filters(redo), note("Tap a heading to sort (again to reverse). # and the account stay put while you slide sideways. Times: today just the hour; underneath, how long until."),
+    const rows = sortRows(cols, shown());
+    const head = h("tr", {}, cols.map((x) => sortTh(x, x.th || "", redo)));
+    return [filters(redo), thenBy(cols, redo), note("Tap a heading to sort (again to reverse); pick a second key in “then by”, or shift+click a heading. # and the account stay put while you slide sideways. Times: today just the hour; underneath, how long until."),
       scroll(h("table", {}, h("thead", {}, head), h("tbody", {}, rows.map((a) => h("tr", { class: rowCls(a) },
         cols.map((x) => h("td", { class: x.td || "" }, x.cell(a)))))))) ];
   }
@@ -11924,7 +11956,7 @@ const Views = (() => {
       { k: "bill", t: "Plan", sort: (a) => (a.renews && a.renews.at) || 9e12, cell: renewsCell },
       { k: "chr", t: "Chrome login", sort: (a) => (a.login && a.login.left) || 9e12, cell: chromeCell },
       { k: "grp", t: "Groups", cell: (a) => (a.groups || []).map((g) => pill("", g)) },
-      { k: "strip", t: stripHead(), g: 1, th: "stc", td: "stc", sort: r5s, cell: strip },
+      { k: "strip", t: stripHead(), lab: "5h window (24 h)", g: 1, th: "stc", td: "stc", sort: r5s, cell: strip },
     ].concat(days.map((d, i) => {
       const today = dayKey(d.start) === dayKey(now) ? " today" : "";
       return { k: "d" + i, g: i === 0 ? 1 : 0, th: "day" + today, td: "day" + today,
@@ -11932,21 +11964,18 @@ const Views = (() => {
         cell: (a) => calCell((a.calendar || [])[i]) };
     }), [{ k: "act", t: "", g: 1, cell: acts }]);
     const cls = (x, base) => ((base || "") + (x.g ? " g0" : "")).trim();
-    const c = cols.find((x) => x.k === vu.sort.k && x.sort) || cols[0];
-    const rows = shown().slice().sort((x, y) => { const a = c.sort(x), b = c.sort(y); return (a < b ? -1 : a > b ? 1 : x.n - y.n) * vu.sort.dir; });
+    const rows = sortRows(cols, shown());
     const sup = h("tr", { class: "sup" }, h("th", { class: "n stk" }), h("th", { class: "stk2" }), h("th"),
       h("th", { colspan: 6, class: "g0", text: "Limits now · when each starts again" }),
       h("th", { colspan: 4, class: "g0", text: "Plan" }),
       h("th", { class: "g0", text: "5h windows · next 24 h" }),
       days.length ? h("th", { colspan: days.length, class: "g0", text: "Renewals · next 8 days" }) : null, h("th", { class: "g0" }));
-    const head = h("tr", {}, cols.map((x) => h("th", { class: cls(x, x.th) + (x.sort ? " sort" : ""),
-      onclick: x.sort ? () => { vu.sort = { k: x.k, dir: vu.sort.k === x.k ? -vu.sort.dir : 1 }; redo(); } : null },
-      x.t, vu.sort.k === x.k ? h("span", { class: "arr", text: vu.sort.dir > 0 ? "▲" : "▼" }) : null)));
+    const head = h("tr", {}, cols.map((x) => sortTh(x, cls(x, x.th), redo)));
     const legend = h("div", { class: "legend" }, h("span", { class: "faint", text: "Days:" }),
       h("span", { class: "t-warn", text: "17:00 weekly renewal" }), h("span", { class: "t-mag", text: "17:00 " + M + " renewal" }),
       h("span", { class: "t-cyan", text: "↓ downgrade" }), h("span", { class: "t-bad", text: "✕ plan ends" }), h("span", { text: "— no plan" }),
       h("span", { class: "faint", text: "· 24 h: the bar is the running 5h window; wk / Fb / ✕ mark the week, " + M + " and a plan end" }));
-    return [filters(redo), note("Everything per account in one table: the limits and when each starts again, the plan, the 5h window over the next 24 hours and the renewals of the next 8 days. Slide sideways; # and the account stay put. Tap a heading to sort."),
+    return [filters(redo), thenBy(cols, redo), note("Everything per account in one table: the limits and when each starts again, the plan, the 5h window over the next 24 hours and the renewals of the next 8 days. Slide sideways; # and the account stay put. Tap a heading to sort; pick a second key in “then by”, or shift+click a heading."),
       legend, scroll(h("table", { class: "all" }, h("thead", {}, sup, head), h("tbody", {}, rows.map((a) => h("tr", { class: rowCls(a) },
         cols.map((x) => h("td", { class: cls(x, x.td) }, x.cell(a))))))))];
   }
