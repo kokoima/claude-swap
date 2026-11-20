@@ -23,7 +23,7 @@
 
 set -e
 
-VERSION="1.23.0"
+VERSION="1.24.0"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -10564,6 +10564,188 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
   *{transition:none!important;animation:none!important}
   html{scroll-behavior:auto}
 }
+.vsw{display:flex;flex-wrap:wrap;gap:4px;margin:-2px 0 10px}
+.vsw button{border:1px solid var(--rule);background:var(--panel);color:var(--ink2);border-radius:999px;padding:4px 12px;font-size:13px;cursor:pointer}
+.vsw button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+/* the other views of groups, accounts and the calendar (x- classes, under .vx) */
+.vx .x-filters{display:flex;gap:6px;align-items:center;padding:8px 0 9px;overflow-x:auto;scrollbar-width:none}
+.vx .x-chip{border:1px solid var(--rule);background:transparent;border-radius:6px;padding:3px 9px;cursor:pointer;font-size:12.5px;white-space:nowrap}
+.vx .x-chip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.vx .x-note{margin:0 0 10px;color:var(--ink2);font-size:13px;max-width:70ch}
+.vx .x-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--rule);border-radius:10px;background:var(--panel)}
+.vx table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%}
+.vx th,.vx td{padding:7px 10px;border-bottom:1px solid var(--rule);text-align:left;vertical-align:middle;white-space:nowrap}
+.vx thead th{position:sticky;top:0;background:var(--inset);font:600 12px/1.1 var(--f-display);letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink2);z-index:2}
+.vx th.x-sort{cursor:pointer;user-select:none}
+.vx th.x-sort:hover{color:var(--ink)}
+.vx th .x-arr{color:var(--accent);margin-left:3px}
+.vx tbody tr:hover td{background:color-mix(in srgb,var(--accent) 5%,var(--panel))}
+.vx .x-stk{position:sticky;left:0;z-index:1;background:var(--panel)}
+.vx .x-stk2{position:sticky;left:46px;z-index:1;background:var(--panel);box-shadow:1px 0 0 var(--rule)}
+.vx thead .x-stk,.vx thead .x-stk2{z-index:3;background:var(--inset)}
+.vx td.x-n,.vx th.x-n{width:46px;min-width:46px;font:600 13px var(--f-mono);color:var(--ink2)}
+.vx .x-acct b{font-weight:600;display:block;max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.vx .x-acct small{display:block;color:var(--ink3);font-size:11.5px;max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.vx tr.x-off td{opacity:.5}
+.vx tr.x-on-cl td.x-stk2{box-shadow:inset 3px 0 0 var(--accent),1px 0 0 var(--rule)}
+.vx tr.x-on-lane td.x-stk2{box-shadow:inset 3px 0 0 var(--cyan),1px 0 0 var(--rule)}
+.vx .x-bc{display:flex;align-items:center;gap:8px}
+.vx .x-bar{position:relative;display:inline-block;width:104px;height:12px;border-radius:6px;background:var(--track);overflow:hidden;flex:none}
+.vx .x-bar>i{position:absolute;left:0;top:0;bottom:0;width:calc(var(--p,0) * 1%);background:var(--ok-fill);border-radius:6px}
+.vx .x-bar.x-warn>i{background:var(--warn-fill)}
+.vx .x-bar.x-bad>i{background:var(--bad-fill)}
+.vx .x-bar.x-none>i{width:0}
+.vx .x-bar.x-sm{width:46px;height:7px}
+.vx .x-pv{font:700 14px/1 var(--f-mono);min-width:44px;text-align:right}
+.vx .x-pv.x-ok{color:var(--ok)}
+.vx .x-pv.x-warn{color:var(--warn)}
+.vx .x-pv.x-bad{color:var(--bad)}
+.vx .x-pv.x-none{color:var(--ink3)}
+.vx .x-tc{display:flex;flex-direction:column;line-height:1.15}
+.vx .x-tc .x-t1{font:600 13.5px var(--f-mono)}
+.vx .x-tc .x-t1 .x-d{color:var(--ink2);font-weight:500}
+.vx .x-tc .x-t2{font-size:11.5px;color:var(--ink3)}
+.vx .x-tc.x-soon .x-t2{color:var(--accent);font-weight:600}
+.vx .x-pill{display:inline-block;font:600 11px/1 var(--f-mono);padding:3px 6px;border-radius:5px;border:1px solid var(--rule);margin-right:4px;color:var(--ink2)}
+.vx .x-pill.x-cl{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.vx .x-pill.x-lane{border-color:var(--cyan);color:var(--cyan)}
+.vx .x-pill.x-flag{border-color:var(--bad);color:var(--bad)}
+.vx .x-pill.x-watch{border-color:var(--cyan);color:var(--cyan)}
+.vx .x-why span{margin-right:8px;font-size:12.5px}
+.vx tr.x-band td{background:var(--inset);border-bottom:1px solid var(--rule);padding:10px 10px 9px}
+.vx tr.x-band .x-bandin{position:sticky;left:10px;display:flex;flex-wrap:wrap;gap:4px 16px;align-items:baseline;max-width:calc(100vw - 2 * var(--gutter) - 24px)}
+.vx tr.x-band h3{margin:0;font:700 19px/1 var(--f-display);letter-spacing:.05em;text-transform:uppercase}
+.vx tr.x-band .x-kv{font-size:12.5px;color:var(--ink2)}
+.vx tr.x-band .x-kv b{color:var(--ink)}
+.vx tr.x-band select{padding:2px 4px;border-radius:5px;border:1px solid var(--rule);background:var(--panel)}
+.vx td.x-pos{font:600 13px var(--f-mono);color:var(--ink3);width:30px}
+.vx tr.x-lo td{opacity:.55}
+.vx td.x-heat{padding:0;border-left:2px solid var(--panel)}
+.vx .x-hc{display:flex;flex-direction:column;justify-content:center;min-width:86px;height:48px;padding:4px 9px;position:relative}
+.vx .x-hc.x-ok{background:var(--ok-bg)}
+.vx .x-hc.x-warn{background:var(--warn-bg)}
+.vx .x-hc.x-bad{background:var(--bad-bg)}
+.vx .x-hc.x-none{background:var(--inset)}
+.vx .x-hc b{font:700 17px/1 var(--f-mono)}
+.vx .x-hc.x-ok b{color:var(--ok)}
+.vx .x-hc.x-warn b{color:var(--warn)}
+.vx .x-hc.x-bad b{color:var(--bad)}
+.vx .x-hc.x-none b{color:var(--ink3)}
+.vx .x-hc small{font:11px/1.2 var(--f-mono);color:var(--ink2);margin-top:3px}
+.vx .x-hc>i{position:absolute;left:0;bottom:0;height:3px;width:calc(var(--p,0) * 1%);background:currentColor;opacity:.55}
+.vx .x-hc.x-ok>i{color:var(--ok-fill)}
+.vx .x-hc.x-warn>i{color:var(--warn-fill)}
+.vx .x-hc.x-bad>i{color:var(--bad-fill)}
+.vx .x-board{display:flex;gap:12px;overflow-x:auto;padding-bottom:6px;align-items:flex-start}
+.vx .x-col{flex:0 0 300px;min-width:0;background:var(--panel);border:1px solid var(--rule);border-radius:10px;overflow:hidden}
+.vx .x-colh{padding:10px 12px;background:var(--inset);border-bottom:1px solid var(--rule)}
+.vx .x-colh h3{margin:0 0 3px;font:700 19px/1 var(--f-display);letter-spacing:.05em;text-transform:uppercase}
+.vx .x-colh .x-kv{font-size:12px;color:var(--ink2)}
+.vx .x-card{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:2px 8px;padding:8px 12px;border-bottom:1px solid var(--rule)}
+.vx .x-card.x-is-on{box-shadow:inset 3px 0 0 var(--accent)}
+.vx .x-card .x-p{font:600 12px var(--f-mono);color:var(--ink3)}
+.vx .x-card .x-w{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vx .x-card .x-r{font:12px var(--f-mono);color:var(--ink2);text-align:right}
+.vx .x-card .x-bars{grid-column:2/4;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.vx .x-mini{display:flex;flex-direction:column;gap:2px;font:11px var(--f-mono)}
+.vx .x-mini .x-bar{width:100%;height:7px}
+.vx .x-mini span{display:flex;justify-content:space-between;color:var(--ink3)}
+.vx .x-mini span b{font-weight:700}
+.vx .x-card .x-why{grid-column:2/4;font-size:11.5px}
+.vx .x-card.x-blk{opacity:.6}
+.vx .x-q{display:flex;flex-direction:column;gap:3px;min-width:130px}
+.vx .x-q small{font:11px var(--f-mono);color:var(--ink3)}
+.vx .x-tl{position:relative;width:max-content}
+.vx .x-tlh,.vx .x-tlr{display:flex}
+.vx .x-tlh{position:sticky;top:0;z-index:3;background:var(--inset);border-bottom:1px solid var(--rule)}
+.vx .x-tll{position:sticky;left:0;z-index:2;flex:0 0 178px;width:178px;background:var(--panel);padding:6px 10px;border-right:1px solid var(--rule);
+  border-bottom:1px solid var(--rule);overflow:hidden}
+.vx .x-tlh .x-tll{background:var(--inset);font:600 12px var(--f-display);letter-spacing:.06em;text-transform:uppercase;color:var(--ink2)}
+.vx .x-tll b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vx .x-tll small{display:block;font:11px var(--f-mono);color:var(--ink3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vx .x-tlt{position:relative;flex:none;border-bottom:1px solid var(--rule)}
+.vx .x-hr{position:absolute;top:0;bottom:0;border-left:1px solid var(--rule);opacity:.6}
+.vx .x-hr.x-mid{border-left:2px solid var(--ink3);opacity:.8}
+.vx .x-hl{position:absolute;top:6px;font:600 12px var(--f-mono);color:var(--ink2);transform:translateX(4px)}
+.vx .x-hl.x-mid{color:var(--ink)}
+.vx .x-dl{position:absolute;top:22px;font:600 10.5px var(--f-display);letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);transform:translateX(4px)}
+.vx .x-win{position:absolute;top:9px;height:26px;border-radius:6px;background:color-mix(in srgb,var(--ok-fill) 22%,transparent);
+  border:1px solid var(--ok-fill);display:flex;align-items:center;justify-content:flex-end;padding:0 6px;overflow:hidden}
+.vx .x-win.x-warn{background:color-mix(in srgb,var(--warn-fill) 24%,transparent);border-color:var(--warn-fill)}
+.vx .x-win.x-bad{background:color-mix(in srgb,var(--bad-fill) 24%,transparent);border-color:var(--bad-fill)}
+.vx .x-win>i{position:absolute;left:0;top:0;bottom:0;width:calc(var(--p,0) * 1%);background:currentColor;opacity:.28;color:var(--ok-fill)}
+.vx .x-win.x-warn>i{color:var(--warn-fill)}
+.vx .x-win.x-bad>i{color:var(--bad-fill)}
+.vx .x-win b{position:relative;font:700 12px var(--f-mono);white-space:nowrap}
+.vx .x-endlbl{position:absolute;top:12px;font:700 13px var(--f-mono);white-space:nowrap;transform:translateX(5px)}
+.vx .x-mk{position:absolute;top:8px;transform:translateX(-50%);font:600 11px/1 var(--f-mono);padding:4px 5px;border-radius:5px;white-space:nowrap;border:1px solid}
+.vx .x-mk.x-w7{color:var(--warn);border-color:var(--warn);background:var(--warn-bg)}
+.vx .x-mk.x-fb{color:var(--mag);border-color:var(--mag);background:var(--panel);top:24px}
+.vx .x-mk.x-end{color:var(--bad);border-color:var(--bad);background:var(--bad-bg)}
+.vx .x-nowl{position:absolute;top:0;bottom:0;width:2px;background:var(--accent);z-index:1;pointer-events:none}
+.vx .x-nowl::before{content:"now";position:absolute;top:2px;left:4px;font:700 10px var(--f-mono);color:var(--accent)}
+.vx .x-freebar{position:absolute;top:15px;height:14px;left:0;right:0;font:11px var(--f-mono);color:var(--ink3);padding-left:8px}
+.vx .x-wk{display:grid;width:max-content;min-width:100%}
+.vx .x-wk>div{border-bottom:1px solid var(--rule);border-right:1px solid var(--rule);padding:4px 5px;min-height:34px}
+.vx .x-wk .x-wh{position:sticky;top:0;z-index:2;background:var(--inset);font:600 12px var(--f-display);letter-spacing:.06em;text-transform:uppercase;color:var(--ink2);min-height:0;padding:7px 6px}
+.vx .x-wk .x-wh.x-today{color:var(--accent)}
+.vx .x-wk .x-hh{position:sticky;left:0;z-index:1;background:var(--inset);font:600 12px var(--f-mono);color:var(--ink2);text-align:right;padding-right:8px}
+.vx .x-wk .x-cur{background:color-mix(in srgb,var(--accent) 7%,var(--panel))}
+.vx .x-wk .x-past{background:repeating-linear-gradient(135deg,transparent 0 6px,color-mix(in srgb,var(--ink3) 10%,transparent) 6px 7px)}
+.vx .x-wk .x-corner{position:sticky;left:0;top:0;z-index:4;background:var(--inset)}
+.vx .x-ev{display:block;font:600 11px/1.25 var(--f-mono);padding:2px 5px;border-radius:4px;margin:0 0 3px;white-space:nowrap;border-left:3px solid}
+.vx .x-ev.x-h5{background:var(--accent-soft);border-color:var(--accent);color:var(--ink)}
+.vx .x-ev.x-wk7{background:var(--warn-bg);border-color:var(--warn-fill);color:var(--ink)}
+.vx .x-ev.x-fb{background:color-mix(in srgb,var(--mag) 14%,var(--panel));border-color:var(--mag);color:var(--ink)}
+.vx .x-ev.x-end{background:var(--bad-bg);border-color:var(--bad);color:var(--ink)}
+.vx .x-ev em{font-style:normal;color:var(--ink2);font-weight:500}
+.vx .x-legend{display:flex;flex-wrap:wrap;gap:6px 10px;margin:0 0 10px;font-size:12px}
+.vx .x-legend .x-ev{display:inline-block;margin:0}
+.vx .x-ag{background:var(--panel);border:1px solid var(--rule);border-radius:10px;overflow:hidden}
+.vx .x-agd{padding:8px 12px;background:var(--inset);font:700 15px var(--f-display);letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid var(--rule);position:sticky;top:0}
+.vx .x-agr{display:grid;grid-template-columns:60px 96px 64px minmax(0,1fr);gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--rule)}
+.vx .x-agr .x-tm{font:700 15px var(--f-mono)}
+.vx .x-agr .x-cd{font:12px var(--f-mono);color:var(--ink3)}
+.vx .x-agr .x-cd.x-soon{color:var(--accent);font-weight:700}
+.vx .x-agr .x-ty{font:700 11px var(--f-mono);text-align:center;padding:3px 0;border-radius:5px;border-left:3px solid}
+.vx .x-agr .x-ty.x-h5{background:var(--accent-soft);border-color:var(--accent)}
+.vx .x-agr .x-ty.x-wk7{background:var(--warn-bg);border-color:var(--warn-fill)}
+.vx .x-agr .x-ty.x-fb{background:color-mix(in srgb,var(--mag) 14%,var(--panel));border-color:var(--mag)}
+.vx .x-agr .x-ty.x-end{background:var(--bad-bg);border-color:var(--bad)}
+.vx .x-agr .x-wh2{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;min-width:0}
+.vx .x-agr .x-wh2 b{font-weight:600}
+@media (max-width:520px){
+.vx .x-agr{grid-template-columns:50px 44px minmax(0,1fr);gap:2px 8px}
+.vx .x-agr .x-tm{grid-column:1;grid-row:1}
+.vx .x-agr .x-ty{grid-column:2;grid-row:1}
+.vx .x-agr .x-cd{grid-column:1/3;grid-row:2;font-size:11px}
+.vx .x-agr .x-wh2{grid-column:3;grid-row:1/3}
+}
+@media (max-width:600px){
+.vx th,.vx td{padding:6px 7px}
+.vx td.x-n,.vx th.x-n{width:38px;min-width:38px;font-size:12px}
+.vx .x-stk2{left:38px}
+.vx .x-acct b{max-width:96px;font-size:12.5px}
+.vx .x-acct small{max-width:96px;font-size:10.5px}
+.vx .x-bar{width:60px;height:10px}
+.vx .x-pv{font-size:13px;min-width:38px}
+.vx .x-bc{gap:5px}
+.vx .x-tc .x-t1{font-size:12.5px}
+.vx .x-hc{min-width:74px;height:44px;padding:3px 7px}
+.vx .x-hc b{font-size:15px}
+.vx .x-tll{flex-basis:118px;width:118px;padding:5px 7px}
+.vx .x-tll b{font-size:12px}
+.vx .x-note{font-size:12px}
+.vx .x-col{flex-basis:84vw}
+}
+.vx .x-gname{font:700 17px/1 var(--f-display);letter-spacing:.05em;text-transform:uppercase}
+.vx .x-sm{font-size:11.5px}
+.vx td.x-wrap{white-space:normal;min-width:180px}
+.vx .x-fig{font:700 12.5px var(--f-mono)}
+.vx .x-acts{display:flex;gap:6px}
+.vx .x-filters>.faint{font-size:12px}
+.vx tr.x-band h3{font-size:19px}
 </style>
 </head>
 <body>
@@ -10588,17 +10770,23 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
   </section>
   <section id="groups">
     <h2>Groups <small>where each group's sessions are, its watch and the order it follows</small></h2>
+    <div class="vsw" id="sw-grp" role="group" aria-label="Show the groups as"></div>
     <div class="groups" id="groups-body"></div>
+    <div class="vx" id="alt-grp" hidden></div>
   </section>
   <section id="accounts">
     <h2>Accounts <small id="acc-sub"></small></h2>
-    <div class="card acc-wrap"><table class="acc" id="acc"></table></div>
+    <div class="vsw" id="sw-acc" role="group" aria-label="Show the accounts as"></div>
+    <div class="card acc-wrap" id="acc-wrap"><table class="acc" id="acc"></table></div>
     <p class="ungrouped" id="ungrouped" hidden></p>
+    <div class="vx" id="alt-acc" hidden></div>
   </section>
   <section id="calendar">
     <h2>Next 8 days <small>weekly renewals and plans that end</small></h2>
+    <div class="vsw" id="sw-cal" role="group" aria-label="Show the calendar as"></div>
     <div class="card cal-wrap" id="cal"></div>
     <div class="legend" id="legend"></div>
+    <div class="vx" id="alt-cal" hidden></div>
   </section>
   <section id="watch">
     <h2>Watch <small>the daemon that moves cl and the lanes</small></h2>
@@ -11313,6 +11501,7 @@ function laneBlock(g) {
 
 function renderGroups() {
   if (!S) return;
+  if (altView("grp", renderGroups)) return;
   const cards = S.groups.map((g) => {
     const general = g.kind === "general";
     const on = general ? g.on : g.lane && g.lane.n;
@@ -11394,6 +11583,7 @@ function renderAccounts() {
   const live = S.accounts.filter((a) => a.live).length;
   $("acc-sub").textContent = S.accounts.length + " accounts, " + live + " usable · " + col
     + (S.model && S.model.counted ? " (* counted: the watch leaves an account at " + S.leave + "% of it)" : "");
+  if (altView("acc", renderAccounts)) return;
   const head = h("thead", {}, h("tr", {}, ["", "#", "Account", "Plan", "Renews", "5h", "Reset", "7d", col, "Resets", "Chrome", "Groups", ""]
     .map((t) => h("th", { text: t }))));
   const body = h("tbody", {}, S.accounts.map((a) => {
@@ -11434,6 +11624,7 @@ function calCell(m) {
   return h("span", { class: cls, text: sign + CS.hm(t), title: what + " " + when(t) });
 }
 function renderCalendar() {
+  if (altView("cal", renderCalendar)) return;
   const days = (S.calendar && S.calendar.days) || [];
   const today = 0;
   const rows = S.accounts.filter((a) => !a.disabled && (a.calendar || []).some(Boolean));
@@ -11490,6 +11681,450 @@ function renderFoot() {
   const v = S.viewer || {};
   fill($("foot"), (v.local ? "Opened on this Mac" : "Signed in as " + (v.name ? v.name + " · " : "") + (v.login || "?") + " (tailscale)")
     + " · claude-swap " + (S.version || "") + " · reads again every minute; Refresh asks claude.ai");
+}
+
+// ---------- other views: each area has a switch, "classic" is the page as before ----------
+// The choice lives in the address (?view=acc.table+grp.board+cal.timeline), so a
+// bookmark keeps it. The views below only show; their buttons are the ones above
+// (accountActions), with the same questions first.
+const VIEW_OPTS = {
+  grp: [["classic", "Cards"], ["table", "Table"], ["board", "Board"]],
+  acc: [["classic", "Classic"], ["table", "Table"], ["groups", "By group"], ["heat", "Heat"]],
+  cal: [["classic", "Days"], ["timeline", "5h timeline"], ["week", "Week × hour"], ["agenda", "Agenda"]],
+};
+function readViews() {
+  const out = { grp: "classic", acc: "classic", cal: "classic" };
+  const q = new URLSearchParams(location.search).get("view") || "";
+  for (const part of q.split(/[ +,]/)) {
+    const [area, mode] = part.split(".");
+    if (VIEW_OPTS[area] && VIEW_OPTS[area].some(([k]) => k === mode)) out[area] = mode;
+  }
+  return out;
+}
+function writeViews() {
+  const q = new URLSearchParams(location.search);
+  const v = Object.keys(VIEW_OPTS).filter((a) => ui.vw[a] !== "classic").map((a) => a + "." + ui.vw[a]).join("+");
+  if (v) q.set("view", v); else q.delete("view");
+  const s = q.toString();
+  history.replaceState(null, "", location.pathname + (s ? "?" + s : "") + location.hash);
+}
+ui.vw = readViews();
+
+const Views = (() => {
+  // the views' own classes all start with x- (their CSS is under .vx), so the
+  // page's .bar, .card, .pill… never meet them; the page's colours stay
+  const KEEP = /^(faint|mute|t-[a-z]+)$/;
+  const h = (tag, props, ...kids) => {
+    let css = null;
+    if (props) {
+      props = Object.assign({}, props);
+      if (props.class) props.class = String(props.class).split(/\s+/).filter(Boolean)
+        .map((c) => (KEEP.test(c) ? c : "x-" + c)).join(" ");
+      if (props.css) { css = props.css; delete props.css; }
+    }
+    const el = window.h(tag, props, ...kids);
+    if (css) Object.assign(el.style, css);
+    return el;
+  };
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const { level, clamp, pct, hm, span, DAYS } = CS;
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const D = (t) => new Date(t * 1000);
+  const dayKey = (t) => D(t).toDateString();
+  function dayWord(t) {
+    const n = nowS();
+    if (dayKey(t) === dayKey(n)) return "";
+    if (dayKey(t) === dayKey(n + 86400)) return "Tmrw ";
+    const d = D(t); return DAYS[d.getDay()] + " " + d.getDate() + " ";
+  }
+  const dateStr = (t) => { const d = D(t); return DAYS[d.getDay()] + " " + d.getDate() + " " + MONTHS[d.getMonth()]; };
+  const until = (t) => (t - nowS() <= 0 ? "passed" : "in " + span(t - nowS()));
+  const short = (a) => (a.label || "").split("@")[0];
+  const domain = (a) => { const p = (a.email || a.label || "").split("@"); return p.length > 1 ? "@" + p[1] : ""; };
+  const sameT = (a, b) => a != null && b != null && Math.abs(a - b) < 180;
+  const vu = { grp: "all", hideOff: false, sort: { k: "n", dir: 1 }, crit: {}, compact: true };
+
+  function bar(p, cls) {
+    return h("span", { class: "bar " + level(p) + (cls ? " " + cls : ""), vars: { "--p": clamp(p) } }, h("i"));
+  }
+  function barCell(p) {
+    return h("div", { class: "bc" }, bar(p), h("b", { class: "pv " + level(p), text: pct(p) }));
+  }
+  function timeCell(t, opts) {
+    opts = opts || {};
+    if (t == null) return h("span", { class: "faint", text: opts.none || "–" });
+    const soon = t - nowS() > 0 && t - nowS() < 3 * 3600;
+    return h("div", { class: "tc" + (soon ? " soon" : "") },
+      h("span", { class: "t1" }, h("span", { class: "d", text: dayWord(t) }), hm(t)),
+      h("span", { class: "t2", text: opts.sub || until(t) }));
+  }
+  function r5Cell(a) {
+    if (a.r5 == null || a.r5 < nowS()) return h("span", { class: "faint", text: a.u5 ? "–" : "no window" });
+    return timeCell(a.r5);
+  }
+  const rfCell = (a) => (sameT(a.rf, a.r7) ? h("span", { class: "faint", text: "= week" }) : timeCell(a.rf));
+  const pill = (cls, text, title) => h("span", { class: "pill " + cls, text, title });
+  function onPills(a) {
+    const out = [];
+    if (a.cl) out.push(pill("cl", "cl"));
+    for (const g of a.lanes || []) out.push(pill("lane", "▸ " + g));
+    if (a.disabled) out.push(pill("flag", "disabled"));
+    else if (!a.live) out.push(pill("flag", "no token"));
+    if (a.rate_limited) out.push(pill("flag", "429"));
+    return out;
+  }
+  function renewsCell(a) {
+    const r = a.renews || {};
+    if (r.kind === "free") return h("span", { class: "faint", text: "free" });
+    if (r.kind === "ends") return h("div", { class: "tc" }, h("span", { class: "t1 t-bad", text: "✕ " + dateStr(r.at) }), h("span", { class: "t2", text: "plan ends " + until(r.at) }));
+    if (r.kind === "down") return h("div", { class: "tc" }, h("span", { class: "t1 t-cyan", text: "↓ " + dateStr(r.at) }), h("span", { class: "t2", text: "downgrade" }));
+    if (r.kind === "renews") return h("div", { class: "tc" }, h("span", { class: "t1", text: dateStr(r.at) }), h("span", { class: "t2", text: "bills " + until(r.at) }));
+    return h("span", { class: "faint", text: "?" });
+  }
+  function resetsCell(a) {
+    const r = a.resets;
+    if (r == null) return h("span", { class: "faint", text: "?" });
+    if (r.eligible === false && !(r.full || r.model)) return h("span", { class: "faint", text: "-" });
+    const any = (r.full || 0) + (r.model || 0) > 0;
+    return h("span", { class: "fig " + (any ? "t-ok" : "faint"), text: (r.full || 0) + " full · " + (r.model || 0) + " " + modelName() });
+  }
+  function chromeCell(a) {
+    const l = a.login || {};
+    if (l.state === "ok") return h("span", { class: "t-ok", text: "✓ " + Math.round((l.left || 0) / 86400) + " d" });
+    if (l.state === "dead") return h("span", { class: "t-bad", text: "✕ gone" });
+    if (l.state === "expiring") return h("span", { class: (l.left || 0) < 86400 ? "t-bad" : "t-warn",
+      text: "⚠ " + ((l.left || 0) >= 86400 ? Math.round(l.left / 86400) + " d" : Math.max(0, Math.round((l.left || 0) / 3600)) + " h") });
+    return h("span", { class: "faint", text: "-" });
+  }
+  const acctCell = (a) => h("div", { class: "acct", title: a.label }, h("b", { text: short(a) }), h("small", { text: domain(a) + " · " + (a.plan_name || "?") }));
+  const acts = (a) => { const b = accountActions(a); return b.length ? h("div", { class: "acts" }, b) : null; };
+  function orderNote(e) {
+    const out = [];
+    if (e.blocked) out.push(["t-bad", e.unblock_at ? "blocked until " + dayWord(e.unblock_at) + hm(e.unblock_at) : "blocked"]);
+    else {
+      if (e.last_day) out.push(["t-warn", "last day"]);
+      if (e.full_reset) out.push(["t-ok", "full reset"]);
+      if (e.model_reset) out.push(["t-ok", e.model_reset + " reset"]);
+      if (e.little_room) out.push(["faint", "little room"]);
+    }
+    if (e.headroom != null) out.push(["", e.headroom.toFixed(1) + " win."]);
+    if (e.binding) out.push(["faint", (e.binding === "model" ? modelName() : e.binding) + " cuts first"]);
+    return out;
+  }
+  const why = (e) => h("span", { class: "why" }, orderNote(e).map(([c, t]) => h("span", { class: c, text: t })));
+  const onOf = (g) => (g.kind === "general" ? g.on : g.lane && g.lane.n);
+  const rowCls = (a) => (a.disabled || !a.live ? "off " : "") + (a.cl ? "on-cl" : (a.lanes || []).length ? "on-lane" : "");
+  const shown = () => S.accounts.filter((a) => (vu.grp === "all" || (a.groups || []).includes(vu.grp))
+    && !(vu.hideOff && (a.disabled || !a.live)));
+  const scroll = (...kids) => h("div", { class: "scroll" }, kids);
+  const note = (text) => h("p", { class: "note", text });
+
+  function filters(redo, extra) {
+    const chip = (text, on, click) => h("button", { type: "button", class: "chip", "aria-pressed": String(on), text, onclick: click });
+    return h("div", { class: "filters" }, h("span", { class: "faint", text: "Show" }),
+      ["all"].concat(S.groups.map((g) => g.name)).map((k) => chip(k === "all" ? "all accounts" : k, vu.grp === k, () => { vu.grp = k; redo(); })),
+      chip("hide disabled", vu.hideOff, () => { vu.hideOff = !vu.hideOff; redo(); }), extra || null);
+  }
+
+  // ---------- accounts: one flat table ----------
+  function accTable(redo) {
+    const M = modelName();
+    const cols = [
+      { k: "n", t: "#", th: "n stk", td: "n stk", sort: (a) => a.n, cell: (a) => "#" + a.n },
+      { k: "acct", t: "Account", th: "stk2", td: "stk2", sort: (a) => a.label, cell: acctCell },
+      { k: "on", t: "On it", cell: onPills },
+      { k: "u5", t: "5h", sort: (a) => a.u5 ?? -1, cell: (a) => barCell(a.u5) },
+      { k: "r5", t: "5h resets", sort: (a) => (a.r5 && a.r5 > nowS() ? a.r5 : 9e12), cell: r5Cell },
+      { k: "u7", t: "Week", sort: (a) => a.u7 ?? -1, cell: (a) => barCell(a.u7) },
+      { k: "r7", t: "Week renews", sort: (a) => a.r7 ?? 9e12, cell: (a) => timeCell(a.r7) },
+      { k: "m", t: M, sort: (a) => a.model_pct ?? -1, cell: (a) => barCell(a.model_pct) },
+      { k: "rf", t: M + " renews", sort: (a) => a.rf ?? 9e12, cell: rfCell },
+      { k: "rst", t: "Free resets", sort: (a) => -((a.resets && (a.resets.full || 0) + (a.resets.model || 0)) || 0), cell: resetsCell },
+      { k: "bill", t: "Plan", sort: (a) => (a.renews && a.renews.at) || 9e12, cell: renewsCell },
+      { k: "chr", t: "Chrome login", sort: (a) => (a.login && a.login.left) || 9e12, cell: chromeCell },
+      { k: "grp", t: "Groups", cell: (a) => (a.groups || []).map((g) => pill("", g)) },
+      { k: "act", t: "", cell: acts },
+    ];
+    const c = cols.find((x) => x.k === vu.sort.k && x.sort) || cols[0];
+    const rows = shown().slice().sort((x, y) => { const a = c.sort(x), b = c.sort(y); return (a < b ? -1 : a > b ? 1 : x.n - y.n) * vu.sort.dir; });
+    const head = h("tr", {}, cols.map((x) => h("th", { class: (x.th || "") + (x.sort ? " sort" : ""),
+      onclick: x.sort ? () => { vu.sort = { k: x.k, dir: vu.sort.k === x.k ? -vu.sort.dir : 1 }; redo(); } : null },
+      x.t, vu.sort.k === x.k ? h("span", { class: "arr", text: vu.sort.dir > 0 ? "▲" : "▼" }) : null)));
+    return [filters(redo), note("Tap a heading to sort (again to reverse). # and the account stay put while you slide sideways. Times: today just the hour; underneath, how long until."),
+      scroll(h("table", {}, h("thead", {}, head), h("tbody", {}, rows.map((a) => h("tr", { class: rowCls(a) },
+        cols.map((x) => h("td", { class: x.td || "" }, x.cell(a)))))))) ];
+  }
+
+  // ---------- accounts: a block per group, in its watch's order ----------
+  function accGroups(redo) {
+    const M = modelName();
+    const heads = ["", "#", "Account", "5h", "5h resets", "Week", "Week renews", M, M + " renews", "Why here", ""];
+    const NC = heads.length;
+    const body = [];
+    for (const g of S.groups) {
+      const key = vu.crit[g.name] || g.order_criterion || "caduca";
+      const rows = (g.orders && g.orders[key]) || g.order || [];
+      const on = onOf(g), w = g.watch || {}, l = g.lane || {};
+      const sel = h("select", { "aria-label": g.name + ": order by" }, (S.order_criteria || []).filter((c) => !g.orders || g.orders[c.key]).map((c) =>
+        h("option", { value: c.key, selected: c.key === key, text: c.label + (c.key === g.order_criterion ? " (watch)" : "") })));
+      sel.addEventListener("change", () => { vu.crit[g.name] = sel.value; redo(); });
+      const fq = (S.free_quota || []).find((q) => q.group === g.name);
+      body.push(h("tr", { class: "band" }, h("td", { colspan: NC }, h("div", { class: "bandin" },
+        h("h3", { text: g.name }),
+        h("span", { class: "kv" }, g.kind === "general" ? "cl on " : "▸ lane on ", h("b", { text: on ? "#" + on + " " + (acc(on) ? short(acc(on)) : "") : "–" }),
+          g.kind !== "general" ? " · " + (l.sessions || 0) + " sessions" : ""),
+        h("span", { class: "kv" }, "watch ", h("b", { class: w.on ? "t-ok" : "faint", text: w.on ? "on" : "off" }),
+          w.on ? " · " + (w.all ? "all seats" : (w.seats || []).length + " seats") + (w.resets ? " · resets" : "") : ""),
+        g.now ? h("span", { class: "kv" }, "now: ", h("b", { text: g.now.reason || g.now.action || "" })) : null,
+        fq ? h("span", { class: "kv" }, "free: 5h ", h("b", { text: (fq.h5 / 100).toFixed(1) }), " · week ", h("b", { text: (fq.d7 / 100).toFixed(1) }),
+          " · " + M + " ", h("b", { text: (fq.model / 100).toFixed(1) }), " accounts") : null,
+        h("span", { class: "kv" }, "order ", sel)))));
+      rows.forEach((e, i) => {
+        const a = acc(e.n) || { n: e.n, label: "?", groups: [], lanes: [], can: {} };
+        body.push(h("tr", { class: (e.n === on ? (g.kind === "general" ? "on-cl" : "on-lane") : "") + (e.blocked ? " off" : "") },
+          h("td", { class: "pos", text: String(i + 1) }),
+          h("td", { class: "n", text: "#" + e.n }),
+          h("td", {}, h("div", { class: "acct" }, h("b", {}, e.n === on ? pill(g.kind === "general" ? "cl" : "lane", g.kind === "general" ? "cl" : "▸") : null, short(a)),
+            h("small", { text: domain(a) + (e.watch ? " · watch seat" : "") }))),
+          h("td", {}, barCell(a.u5)), h("td", {}, r5Cell(a)),
+          h("td", {}, barCell(a.u7)), h("td", {}, timeCell(a.r7)),
+          h("td", {}, barCell(a.model_pct)), h("td", {}, rfCell(a)),
+          h("td", {}, why(e)), h("td", {}, a.can ? acts(a) : null)));
+      });
+      for (const x of g.left_out || []) {
+        const a = acc(x.n) || { label: "?" };
+        body.push(h("tr", { class: "lo" }, h("td", { class: "pos", text: "–" }), h("td", { class: "n", text: "#" + x.n }),
+          h("td", {}, h("div", { class: "acct" }, h("b", { text: short(a) }), h("small", { text: "left out" }))),
+          h("td", { colspan: NC - 3, class: "faint", text: x.reason || "" })));
+      }
+    }
+    return [note("One block per group, its accounts in the order its watch would use them (change the criterion per group). The coloured edge marks where cl or the lane is."),
+      scroll(h("table", {}, h("thead", {}, h("tr", {}, heads.map((t) => h("th", { text: t })))), h("tbody", {}, body)))];
+  }
+
+  // ---------- accounts: heat grid ----------
+  function heat(p, sub) {
+    return h("td", { class: "heat" }, h("div", { class: "hc " + level(p), vars: { "--p": clamp(p) } },
+      h("b", { text: pct(p) }), h("small", { text: sub || " " }), h("i")));
+  }
+  const tShort = (t) => (t == null ? "" : "↻ " + dayWord(t) + hm(t));
+  function accHeat(redo) {
+    const M = modelName();
+    const rows = shown().map((a) => h("tr", { class: rowCls(a) },
+      h("td", { class: "n stk", text: "#" + a.n }),
+      h("td", { class: "stk2" }, acctCell(a), h("div", {}, onPills(a))),
+      heat(a.u5, a.r5 && a.r5 > nowS() ? "↻ " + hm(a.r5) + " · " + span(a.r5 - nowS()) : a.u5 ? "" : "no window"),
+      heat(a.u7, tShort(a.r7)),
+      heat(a.model_pct, sameT(a.rf, a.r7) ? "= week" : tShort(a.rf)),
+      h("td", {}, resetsCell(a)), h("td", {}, renewsCell(a)), h("td", {}, acts(a))));
+    return [filters(redo), note("The figure is what is used; the colour tells at a glance (green <50, yellow <80, red ≥80) and the line underneath is the bar. ↻ is when that limit starts again."),
+      scroll(h("table", {}, h("thead", {}, h("tr", {}, ["#", "Account", "5h", "Week", M, "Free resets", "Plan", ""].map((t, i) =>
+        h("th", { class: i === 0 ? "n stk" : i === 1 ? "stk2" : "", text: t })))), h("tbody", {}, rows)))];
+  }
+
+  // ---------- groups: one row each ----------
+  function quota(free, n) {
+    if (!n) return h("span", { class: "faint", text: "–" });
+    const used = 100 - free / n;
+    return h("div", { class: "q" }, h("div", { class: "bc" }, bar(used), h("b", { class: "pv " + level(used), text: Math.round(free / n) + "% free" })),
+      h("small", { text: "≈ " + (free / 100).toFixed(1) + " of " + n + " accounts" }));
+  }
+  function grpTable() {
+    const M = modelName();
+    const heads = ["Group", "Starts with", "On", "Sessions", "Watch", "Seats", "Resets", "Order", "Now", "Free 5h", "Free week", "Free " + M, "Next weekly renewal"];
+    const crit = (k) => ((S.order_criteria || []).find((c) => c.key === k) || {}).label || k;
+    const rows = S.groups.map((g) => {
+      const on = onOf(g), w = g.watch || {}, l = g.lane || {};
+      const fq = (S.free_quota || []).find((q) => q.group === g.name) || {};
+      const nx = fq.next;
+      return h("tr", {},
+        h("td", { class: "stk" }, h("b", { class: "gname", text: g.name }),
+          h("div", { class: "faint sm", text: g.kind === "general" ? "the shared login" : g.default ? "lane · default" : "lane" })),
+        h("td", {}, h("code", { text: g.starter || "?" })),
+        h("td", {}, on ? [pill(g.kind === "general" ? "cl" : "lane", (g.kind === "general" ? "cl " : "▸ ") + "#" + on), " ", short(acc(on) || { label: "?" })] : h("span", { class: "faint", text: "none" })),
+        h("td", { text: g.kind === "general" ? "–" : String(l.sessions || 0) }),
+        h("td", {}, h("b", { class: w.on ? "t-ok" : "faint", text: w.on ? "on" : "off" })),
+        h("td", { title: (w.seats || []).map((n) => "#" + n).join(" ") }, w.all ? "all " + (g.seats || []).length : (w.seats || []).length + " of " + (g.seats || []).length),
+        h("td", {}, w.resets ? h("span", { class: "t-ok", text: "spends" }) : h("span", { class: "faint", text: "no" })),
+        h("td", { text: crit(g.order_criterion) }),
+        h("td", { class: "wrap" }, g.now ? [h("b", { text: g.now.action + (g.now.target ? " #" + g.now.target : "") }), h("div", { class: "faint sm", text: g.now.reason || "" })] : "–"),
+        h("td", {}, quota(fq.h5 || 0, fq.h5_n || 0)),
+        h("td", {}, quota(fq.d7 || 0, fq.d7_n || 0)),
+        h("td", {}, quota(fq.model || 0, fq.model_n || 0)),
+        h("td", {}, nx ? [timeCell(nx.at), h("div", { class: "faint sm", text: "#" + nx.n + " gives back " + nx.pct + "%" })] : "–"));
+    });
+    return [note("One row per group. Free is what is left, summed: “≈ 7.6 of 20” is about seven and a half whole accounts. To change a watch, use Cards."),
+      scroll(h("table", {}, h("thead", {}, h("tr", {}, heads.map((t, i) => h("th", { class: i === 0 ? "stk" : "", text: t })))), h("tbody", {}, rows)))];
+  }
+
+  // ---------- groups: side by side ----------
+  function mini(p, label, t) {
+    return h("div", { class: "mini" }, h("span", {}, label, h("b", { class: "t-" + level(p), text: pct(p) })), bar(p), h("span", {}, t ? dayWord(t) + hm(t) : " "));
+  }
+  function grpBoard() {
+    const M = modelName();
+    const cols = S.groups.map((g) => {
+      const key = g.order_criterion || "caduca";
+      const rows = (g.orders && g.orders[key]) || g.order || [];
+      const on = onOf(g), w = g.watch || {};
+      return h("section", { class: "col" },
+        h("div", { class: "colh" }, h("h3", { text: g.name }),
+          h("div", { class: "kv" }, (g.kind === "general" ? "cl on #" : "▸ lane on #") + (on || "–") + (g.kind !== "general" ? " · " + ((g.lane || {}).sessions || 0) + " sessions" : "")),
+          h("div", { class: "kv" }, "watch " + (w.on ? "on" : "off") + " · order " + key + (g.now && g.now.reason ? " · " + g.now.reason : ""))),
+        rows.map((e, i) => {
+          const a = acc(e.n) || { label: "?" };
+          return h("div", { class: "card" + (e.n === on ? " is-on" : "") + (e.blocked ? " blk" : "") },
+            h("span", { class: "p", text: String(i + 1) }),
+            h("span", { class: "w", title: a.label, text: "#" + e.n + " " + short(a) }),
+            h("span", { class: "r", text: a.plan_name || "" }),
+            h("div", { class: "bars" }, mini(a.u5, "5h ", a.r5 && a.r5 > nowS() ? a.r5 : null), mini(a.u7, "wk ", a.r7),
+              mini(a.model_pct, M.slice(0, 2) + " ", sameT(a.rf, a.r7) ? null : a.rf)),
+            why(e));
+        }));
+    });
+    return [note("The groups side by side (slide sideways), each in the order its watch uses. Under every bar, when that limit starts again."),
+      h("div", { class: "board" }, cols)];
+  }
+
+  // ---------- calendar ----------
+  function events(from, to) {
+    const ev = [];
+    for (const a of shown()) {
+      if (a.disabled) continue;
+      if (a.r5 && a.r5 >= from && a.r5 <= to) ev.push({ t: a.r5, k: "h5", a, p: a.u5, what: "5h" });
+      if (a.r7 && a.r7 >= from && a.r7 <= to) ev.push({ t: a.r7, k: "wk7", a, p: a.u7, what: sameT(a.rf, a.r7) ? "week + " + modelName() : "week" });
+      if (a.rf && !sameT(a.rf, a.r7) && a.rf >= from && a.rf <= to) ev.push({ t: a.rf, k: "fb", a, p: a.model_pct, what: modelName() });
+      const r = a.renews || {};
+      if ((r.kind === "ends" || r.kind === "down") && r.at >= from && r.at <= to) ev.push({ t: r.at, k: "end", a, p: null, what: r.kind === "ends" ? "plan ends" : "downgrade" });
+    }
+    return ev.sort((x, y) => x.t - y.t || x.a.n - y.a.n);
+  }
+  const TAG = { h5: "5h", wk7: "week", fb: "Fb", end: "✕" };
+
+  function calTimeline(redo, fresh) {
+    const phone = window.matchMedia("(max-width:600px)").matches;
+    const PX = 64, LBL = phone ? 118 : 178;
+    const now = nowS();
+    const start = Math.floor(now / 3600) * 3600 - 7200, HOURS = 26, end = start + HOURS * 3600, W = HOURS * PX;
+    const x = (t) => ((t - start) / 3600) * PX;
+    const head = h("div", { class: "tlh" }, h("div", { class: "tll", text: "Account" }),
+      h("div", { class: "tlt", css: { width: W + "px", height: "40px" } }, Array.from({ length: HOURS + 1 }, (_, i) => {
+        const t = start + i * 3600, mid = D(t).getHours() === 0;
+        return [h("span", { class: "hl" + (mid ? " mid" : ""), css: { left: x(t) + "px" }, text: pad2(D(t).getHours()) }),
+          mid || i === 0 ? h("span", { class: "dl", css: { left: x(t) + "px" }, text: dateStr(t) }) : null];
+      })));
+    const list = shown().filter((a) => !a.disabled && a.live);
+    const key = (a) => (a.r5 && a.r5 > now ? a.r5 : 9e12);
+    list.sort((p, q) => key(p) - key(q) || p.n - q.n);
+    const rows = list.map((a) => {
+      const kids = [];
+      for (let i = 0; i <= HOURS; i++) { const t = start + i * 3600; kids.push(h("span", { class: "hr" + (D(t).getHours() === 0 ? " mid" : ""), css: { left: x(t) + "px" } })); }
+      if (a.r5 && a.r5 > now) {
+        const s = Math.max(a.r5 - 5 * 3600, start), e = Math.min(a.r5, end);
+        kids.push(h("div", { class: "win " + level(a.u5), vars: { "--p": clamp(a.u5) }, css: { left: x(s) + "px", width: Math.max(4, x(e) - x(s)) + "px" },
+          title: "5h window: " + pct(a.u5) + " used, starts again at " + hm(a.r5) }, h("i"), h("b", { text: pct(a.u5) })));
+        kids.push(h("span", { class: "endlbl t-" + level(a.u5), css: { left: x(e) + "px" }, text: hm(a.r5) }));
+      } else {
+        kids.push(h("span", { class: "freebar", css: { left: x(now) + 8 + "px" }, text: a.u5 ? "" : "no 5h window", title: "a fresh 5h window starts with the first message" }));
+      }
+      if (a.r7 && a.r7 > start && a.r7 < end) kids.push(h("span", { class: "mk w7", css: { left: x(a.r7) + "px" }, title: "the week starts again", text: "wk " + hm(a.r7) + " · " + pct(a.u7) }));
+      if (a.rf && !sameT(a.rf, a.r7) && a.rf > start && a.rf < end) kids.push(h("span", { class: "mk fb", css: { left: x(a.rf) + "px" }, text: "Fb " + hm(a.rf) }));
+      const r = a.renews || {};
+      if (r.kind === "ends" && r.at > start && r.at < end) kids.push(h("span", { class: "mk end", css: { left: x(r.at) + "px" }, text: "✕ " + hm(r.at) }));
+      return h("div", { class: "tlr" + (a.cl ? " on-cl" : (a.lanes || []).length ? " on-lane" : "") },
+        h("div", { class: "tll", title: a.label }, h("b", {}, "#" + a.n + " " + short(a)),
+          h("small", { text: "5h " + pct(a.u5) + " wk " + pct(a.u7) + " " + modelName().slice(0, 2) + " " + pct(a.model_pct) })),
+        h("div", { class: "tlt", css: { width: W + "px", height: "44px" } }, kids));
+    });
+    const sc = scroll(h("div", { class: "tl" }, head, rows, h("div", { class: "nowl", css: { left: LBL + x(now) + "px" } })));
+    if (fresh) requestAnimationFrame(() => { sc.scrollLeft = Math.max(0, x(now) - 60); });
+    return [filters(redo), note("The next 24 hours, the soonest 5h reset first. The bar is the running 5h window (filled by how much is used) and ends at the hour it starts again. Yellow: the week starts again; magenta: " + modelName() + " on its own; red: a plan ends."), sc];
+  }
+
+  function calWeek(redo) {
+    const days = (S.calendar && S.calendar.days) || [];
+    if (!days.length) return h("p", { class: "faint", text: "No calendar." });
+    const now = nowS();
+    const ev = events(Math.min(now, days[0].start), days[days.length - 1].start + 86400);
+    const cell = {};
+    for (const e of ev) {
+      const d = days.findIndex((x) => e.t >= x.start && e.t < x.start + 86400);
+      if (d >= 0) (cell[d + "|" + D(e.t).getHours()] = cell[d + "|" + D(e.t).getHours()] || []).push(e);
+    }
+    const hours = [];
+    for (let hh = 0; hh < 24; hh++) if (!vu.compact || days.some((_, d) => cell[d + "|" + hh]) || hh === D(now).getHours()) hours.push(hh);
+    const grid = h("div", { class: "wk" });
+    grid.style.gridTemplateColumns = "52px repeat(" + days.length + ", minmax(128px, 1fr))";
+    grid.append(h("div", { class: "wh corner" }));
+    days.forEach((d) => grid.append(h("div", { class: "wh" + (dayKey(d.start) === dayKey(now) ? " today" : ""), text: DAYS[D(d.start).getDay()] + " " + D(d.start).getDate() })));
+    for (const hh of hours) {
+      grid.append(h("div", { class: "hh", text: pad2(hh) + ":00" }));
+      days.forEach((d, i) => {
+        const t0 = d.start + hh * 3600;
+        grid.append(h("div", { class: now >= t0 && now < t0 + 3600 ? "cur" : t0 + 3600 <= now ? "past" : "" },
+          (cell[i + "|" + hh] || []).map((e) => h("span", { class: "ev " + e.k, title: e.a.label + ": " + e.what + " " + hm(e.t) },
+            hm(e.t) + " #" + e.a.n + " " + TAG[e.k] + " ", e.p != null ? h("em", { text: pct(e.p) }) : null))));
+      });
+    }
+    const compact = h("button", { type: "button", class: "chip", "aria-pressed": String(vu.compact), text: "only hours with something",
+      onclick: () => { vu.compact = !vu.compact; redo(); } });
+    return [filters(redo, compact), note("A week by the hour: when each limit starts again. The % is what is used now and comes back then."),
+      h("div", { class: "legend" }, h("span", { class: "ev h5", text: "5h window" }), h("span", { class: "ev wk7", text: "week (and " + modelName() + " at the same time)" }),
+        h("span", { class: "ev fb", text: modelName() + " alone" }), h("span", { class: "ev end", text: "plan ends / downgrade" })),
+      scroll(grid)];
+  }
+
+  function calAgenda(redo) {
+    const now = nowS();
+    const out = [];
+    let day = null;
+    for (const e of events(now - 600, now + 8 * 86400)) {
+      const k = dayKey(e.t);
+      if (k !== day) {
+        day = k;
+        out.push(h("div", { class: "agd", text: k === dayKey(now) ? "Today · " + dateStr(e.t) : k === dayKey(now + 86400) ? "Tomorrow · " + dateStr(e.t) : dateStr(e.t) }));
+      }
+      out.push(h("div", { class: "agr" },
+        h("span", { class: "tm", text: hm(e.t) }),
+        h("span", { class: "cd" + (e.t - now < 3 * 3600 ? " soon" : ""), text: until(e.t) }),
+        h("span", { class: "ty " + e.k, text: TAG[e.k] }),
+        h("div", { class: "wh2" }, h("b", { text: "#" + e.a.n + " " + short(e.a) }),
+          e.p != null ? h("span", { class: "bc" }, bar(e.p, "sm"), h("span", { class: "fig t-" + level(e.p), text: pct(e.p) + " " + e.what + " back" }))
+            : h("span", { class: "t-bad", text: e.what }), onPills(e.a))));
+    }
+    return [filters(redo), note("What starts again, in order, for the next 8 days."),
+      h("div", { class: "ag" }, out.length ? out : h("p", { class: "faint", text: "Nothing." }))];
+  }
+
+  return {
+    grp: { table: grpTable, board: grpBoard },
+    acc: { table: accTable, groups: accGroups, heat: accHeat },
+    cal: { timeline: calTimeline, week: calWeek, agenda: calAgenda },
+  };
+})();
+
+// The switch of an area and, when it is not on "classic", its view instead of
+// the classic one. true when the area is done (an other view drew it).
+function altView(area, redo) {
+  const sw = $("sw-" + area);
+  fill(sw, VIEW_OPTS[area].map(([k, t]) => h("button", { type: "button", "aria-pressed": String(ui.vw[area] === k), text: t,
+    onclick: () => { if (ui.vw[area] === k) return; ui.vw[area] = k; writeViews(); redo(); } })));
+  const mode = ui.vw[area];
+  const host = $("alt-" + area);
+  const classic = { grp: ["groups-body"], acc: ["acc-wrap", "ungrouped"], cal: ["cal", "legend"] }[area].map($);
+  if (mode === "classic" || !Views[area][mode]) {
+    host.hidden = true; fill(host); host.removeAttribute("data-mode");
+    classic.forEach((e) => { if (e.id !== "ungrouped") e.hidden = false; });
+    return false;
+  }
+  classic.forEach((e) => { e.hidden = true; });
+  host.hidden = false;
+  const fresh = host.getAttribute("data-mode") !== mode;
+  const old = fresh ? [] : [...host.querySelectorAll(".x-scroll,.x-board")].map((e) => e.scrollLeft);
+  fill(host, Views[area][mode](redo, fresh));
+  host.setAttribute("data-mode", mode);
+  [...host.querySelectorAll(".x-scroll,.x-board")].forEach((e, i) => { if (old[i] != null) e.scrollLeft = old[i]; });
+  return true;
 }
 
 // ---------- start ----------

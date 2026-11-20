@@ -433,6 +433,15 @@ a fixed list of allowed commands.
 It reads only local files (no network); **Refresh** runs `check` in the
 background, at most once a minute.
 
+**Views (1.24)** — the groups, the accounts and the calendar each have a
+switch above them. Groups: *Cards* (with the watch's controls), *Table*,
+*Board* (side by side). Accounts: *Classic*, *Table* (one row each, every
+bar with its % and when it resets; sortable, it slides sideways on a
+phone), *By group* (in each watch's order) and *Heat*. Calendar: *Days*,
+*5h timeline* (the next 24 hours, each 5h window up to the hour it starts
+again), *Week × hour* and *Agenda*. The choice is kept in the address
+(`?view=acc.table+cal.timeline`), so a bookmark opens the page that way.
+
 **On the tailnet** — the server listens on 127.0.0.1 only. Publish it with
 Tailscale Serve, **in HTTP mode, never Funnel**:
 
