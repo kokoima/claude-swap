@@ -23,7 +23,7 @@
 
 set -e
 
-VERSION="1.24.1"
+VERSION="1.24.2"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -10244,7 +10244,7 @@ a{color:inherit}
 .chip.ok .dot{background:var(--ok-fill)} .chip.bad .dot{background:var(--bad-fill)}
 .chip.warn{border-color:var(--warn-fill)} .chip.bad{border-color:var(--bad-fill)}
 
-main{max-width:1320px;margin:0 auto;padding:16px var(--gutter) 40px}
+main{margin:0;padding:16px var(--gutter) 40px}
 section{margin-top:28px}
 h2{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 12px;margin:0 0 10px;
   font:700 23px/1 var(--f-display);letter-spacing:.04em;text-transform:uppercase}
@@ -10473,7 +10473,7 @@ pre{margin:0;font:12px/1.5 var(--f-mono);white-space:pre-wrap;overflow-wrap:anyw
   border:1px solid var(--rule)}
 .sub-h{margin:14px 0 0;font:700 14px/1 var(--f-display);letter-spacing:.06em;text-transform:uppercase;color:var(--ink2)}
 
-footer{max-width:1320px;margin:0 auto;padding:0 var(--gutter) max(28px,env(safe-area-inset-bottom));
+footer{margin:0;padding:0 var(--gutter) max(28px,env(safe-area-inset-bottom));
   font-size:12px;color:var(--ink3)}
 
 /* the dialog: every action asks first */
