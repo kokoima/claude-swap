@@ -24,7 +24,7 @@
 
 set -e
 
-VERSION="1.25.5"
+VERSION="1.25.6"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -4757,9 +4757,27 @@ def _hostname(host):
 
 
 # The page (HTML, CSS and JavaScript) is the body of _web_page in the script;
-# cmd_web_serve hands it over here. Taken out of the environment, so the
-# commands the server runs never inherit it.
-PAGE = os.environ.pop("CLAUDE_SWAP_WEB_PAGE", "") or (
+# cmd_web_serve hands it over here in a file it names (Linux takes no single
+# environment string over 128 KB, and the page is bigger), which is read and
+# removed; or, for tests, in the environment. Either is taken out of the
+# environment, so the commands the server runs never inherit it.
+def _page_file():
+    path = os.environ.pop("CLAUDE_SWAP_WEB_PAGE_FILE", "")
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().rstrip("\n")  # as $(_web_page) gave it
+    except OSError:
+        return ""
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+PAGE = os.environ.pop("CLAUDE_SWAP_WEB_PAGE", "") or _page_file() or (
     "<!doctype html><meta charset=utf-8><title>claude-swap</title>"
     "<p>The page comes with the script: start it with claude-swap web.</p>")
 
@@ -11169,7 +11187,10 @@ cmd_web_serve() {
     *) bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" ;;
   esac
   mkdir -p "$(dirname "$WEB_PID")"
-  CLAUDE_SWAP_WEB="$WEB_PY" CLAUDE_SWAP_METER="$METER_PY" CLAUDE_SWAP_WEB_PAGE="$(_web_page)" exec python3 - "$STORE" "$bin" "$VERSION" "$1" "$WEB_PID" <<'PYEOF'
+  local page
+  page="$(mktemp "${TMPDIR:-/tmp}/claude-swap-page.XXXXXX")" || exit 1
+  _web_page > "$page"
+  CLAUDE_SWAP_WEB="$WEB_PY" CLAUDE_SWAP_METER="$METER_PY" CLAUDE_SWAP_WEB_PAGE_FILE="$page" exec python3 - "$STORE" "$bin" "$VERSION" "$1" "$WEB_PID" <<'PYEOF'
 import os, sys, types
 
 engine = types.ModuleType("engine")

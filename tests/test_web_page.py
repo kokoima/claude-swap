@@ -343,7 +343,7 @@ class ServedPageTest(unittest.TestCase):
         for tool in ("security", "claude", "launchctl"):
             self.stub(tool, f'echo {tool} >> "{self.mark}"\nexit 1\n')
         self.swap = self.stub("claude-swap-stub",
-                              'echo "ran: $* page=${CLAUDE_SWAP_WEB_PAGE:+inherited}'
+                              'echo "ran: $* page=${CLAUDE_SWAP_WEB_PAGE:+inherited}${CLAUDE_SWAP_WEB_PAGE_FILE:+inherited}'
                               ' web=${CLAUDE_SWAP_WEB:+inherited}"\n')
         self.store_path = os.path.join(self.dir, "store.json")
         W.oauth.save_store(self.store_path, tw.make_store())
