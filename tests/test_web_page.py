@@ -201,7 +201,7 @@ class PageScriptTest(unittest.TestCase):
         out = run_node(pure_part(page_source()) + """
 const t = Date.UTC(2026, 10, 19, 16, 5) / 1000;  // Thu 19 Nov 17:05 in Madrid
 console.log(JSON.stringify({
-  level: [0, 49.9, 50, 79.9, 80, 100, null].map(CS.level),
+  level: [0, 49.9, 50, 89.9, 90, 100, null].map(CS.level),
   pct: [CS.pct(39.6), CS.pct(null)],
   whole: [CS.whole(170), CS.whole(57), CS.whole(1234), CS.whole(0)],
   span: [CS.span(30), CS.span(600), CS.span(7800), CS.span(3 * 86400 + 7200)],
