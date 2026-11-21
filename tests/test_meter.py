@@ -182,6 +182,38 @@ class TokensTest(unittest.TestCase):
         self.assertIsNone(M.cost("claude-unknown", [1] * 7))
 
 
+class GroupsTest(unittest.TestCase):
+    def test_the_map_says_where_a_session_ran_and_a_folder_guesses_the_rest(self):
+        d = tempfile.mkdtemp(prefix="cs-map-")
+        self.addCleanup(shutil.rmtree, d, True)
+        sm = M.SessionMap(os.path.join(d, "map.json"))
+        m = sm.record([{"sid": "a", "group": "lane1", "cwd": "/w/client", "name": "A"},
+                       {"sid": "b", "group": "general", "cwd": "/w/own", "name": "B"}],
+                      {"general": "x@x.io", "lane1": "y@x.io"}, now=NOW)
+        sm.record([], {"general": "z@x.io", "lane1": "y@x.io"}, now=NOW + H)
+        m = sm.load()
+        self.assertEqual(m["since"], NOW)
+        self.assertEqual(M.seat_at(m, "general", NOW + 10), "x@x.io")
+        self.assertEqual(M.seat_at(m, "general", NOW + 2 * H), "z@x.io")
+        self.assertIsNone(M.seat_at(m, "general", NOW - 10))
+        rule = M.group_rule(m, lambda c: (c or "?").split("/")[-1])
+        self.assertEqual(rule("a", "/elsewhere"), "lane1")
+        self.assertEqual(rule("old", "/w/client"), "lane1")
+        self.assertEqual(rule("old", "/w/unknown"), "general")
+
+    def test_the_breakdown_splits_a_day_by_group_and_account(self):
+        day = time.strftime("%Y-%m-%d", time.localtime(NOW))
+        h = str(int(NOW // 3600 * 3600))
+        v = [0, 1000000, 0, 0, 0, 0, 1]          # a million output tokens of opus: $20
+        ix = {"days": {day: {"/w/p": {"claude-opus-5-5": v}}},
+              "hg": {h: {"lane1": {"claude-opus-5-5": v}}}}
+        smap = {"since": NOW - D, "seats": {"lane1": [[NOW - D, "y@x.io"]]}}
+        b = M.breakdown(ix, smap, NOW, M.local_days(NOW, 2), lambda c: "P")
+        self.assertEqual(b["group"]["lane1"]["usd"][-1], 20.0)
+        self.assertEqual(b["account"]["y@x.io"]["usd"][-1], 20.0)
+        self.assertEqual(b["project"]["P"]["tok"][-1], 1000000)
+
+
 class UsageRouteTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="cs-meter-web-")

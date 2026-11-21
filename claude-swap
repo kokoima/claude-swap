@@ -24,7 +24,7 @@
 
 set -e
 
-VERSION="1.25.6"
+VERSION="1.25.7"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -4560,6 +4560,54 @@ def usage_groups(store):
     return out
 
 
+def live_sessions(store, home, run=subprocess.run):
+    """The open Claude Code sessions and where each runs: [{"sid", "name",
+    "cwd", "group"}] — general (cl), a lane's group, or "pinned" (a
+    setup-token in its environment). From ps (the environment) and Claude
+    Code's sessions/<pid>.json (the session id)."""
+    try:
+        out = run(["ps", "eww", "-axo", "pid=,command="], capture_output=True, text=True,
+                  errors="replace", timeout=10).stdout
+    except Exception:
+        return []
+    lanes = {oauth.lane_dir(None, oauth.lane_key(store, g)): g for g in oauth.groups_of(store)}
+    found = []
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        words = cmd.split()
+        if not pid.isdigit() or not words or os.path.basename(words[0]) != "claude":
+            continue
+        try:
+            with open(os.path.join(home, ".claude", "sessions", pid + ".json")) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        sid = s.get("sessionId")
+        if not isinstance(sid, str):
+            continue
+        env = dict(w.split("=", 1) for w in words[1:] if "=" in w)
+        if "CLAUDE_SWAP_PINNED" not in env:
+            g = oauth.GENERAL
+        else:
+            cfg = env.get("CLAUDE_CONFIG_DIR")
+            g = lanes.get(os.path.realpath(cfg)) if cfg else None
+            g = g or "pinned"
+        found.append({"sid": sid, "name": s.get("name") if isinstance(s.get("name"), str) else None,
+                      "cwd": s.get("cwd") if isinstance(s.get("cwd"), str) else None, "group": g})
+    return found
+
+
+def group_seats(store):
+    """{group: the email of the account it is on now, or None}: general's is cl's."""
+    accounts = store.get("accounts") or []
+    def email(n):
+        return (accounts[n - 1].get("email") or "").lower() or None if isinstance(n, int) and 1 <= n <= len(accounts) else None
+    out = {oauth.GENERAL: email(store.get("active"))}
+    for g in oauth.groups_of(store):
+        out[g] = email(oauth.lane_of(store, g))
+    return out
+
+
 # ---------- the whitelist ----------
 
 def _live_n(store, x):
@@ -4810,7 +4858,8 @@ class App:
             "web_log": os.path.join(c, "claude-swap-web.log"),
             "tokens": os.path.join(c, "claude-swap-tokens.json"),
             "transcripts": os.path.join(c, "projects"),
-            "projects_config": os.path.join(c, "projects-config.json")}
+            "projects_config": os.path.join(c, "projects-config.json"),
+            "session_map": os.path.join(c, "claude-swap-session-map.json")}
         self.home = home
         m = globals().get("meter")  # set by whoever execs this module (1.25)
         self.history = m.History(self.paths["history"]) if m else None
@@ -5102,13 +5151,31 @@ class App:
             self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: usage history: {type(e).__name__}")
             return 0
 
+    def record_sessions(self, store=None):
+        """Note the open sessions' groups and each group's account (the
+        session map, which the token index reads)."""
+        m = globals().get("meter")
+        if m is None:
+            return None
+        try:
+            store = store or oauth.load_store(self.store_path)
+            return m.SessionMap(self.paths["session_map"]).record(
+                live_sessions(store, self.home, self.run), group_seats(store), self.clock())
+        except Exception as e:
+            self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: session map: {type(e).__name__}")
+            return None
+
     def index_tokens(self, budget=None):
         """Read what the transcripts added (the server: every TOKENS_EVERY)."""
         m = globals().get("meter")
         if m is None:
             return None
         try:
-            return m.Tokens(self.paths["tokens"], self.paths["transcripts"]).update(budget=budget)
+            smap = self.record_sessions() or m.SessionMap(self.paths["session_map"]).load()
+            rule = m.group_rule(smap, m.project_namer(self.paths["projects_config"], self.home),
+                                oauth.GENERAL)
+            return m.Tokens(self.paths["tokens"], self.paths["transcripts"]).update(
+                budget=budget, group_of=rule)
         except Exception as e:
             self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: token index: {type(e).__name__}")
             return None
@@ -5135,7 +5202,8 @@ class App:
             if not os.path.exists(self.paths["tokens"]):
                 return {"view": view, "indexing": True, "now": now}
             namer = meter.project_namer(self.paths["projects_config"], self.home)
-            return _finite(dict(meter.tokens_view(tk.load(), now, days, namer), view=view))
+            smap = meter.SessionMap(self.paths["session_map"]).load()
+            return _finite(dict(meter.tokens_view(tk.load(), now, days, namer, smap), view=view))
         if view == "events":
             return _finite(dict(meter.events_view(self.paths["watch_log"], self.paths["web_log"], now, days),
                                 view=view))
@@ -5311,9 +5379,10 @@ def main(store_path, bin_path, version, port, pid_path, home=None):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
 
-    def recorder():  # the usage history, whether anyone looks or not
+    def recorder():  # the usage history and the session map, whether anyone looks or not
         while True:
             app.record()
+            app.record_sessions()
             time.sleep(60)
     threading.Thread(target=recorder, daemon=True).start()
 
@@ -5909,17 +5978,20 @@ class Tokens:
         try:
             with open(self.path) as f:
                 ix = json.load(f)
-            if ix.get("v") == 3:
+            if ix.get("v") == 4:
                 return ix
         except (OSError, ValueError):
             pass
-        return {"v": 3, "files": {}, "hours": {}, "days": {}, "sessions": {}, "updated": None}
+        return {"v": 4, "files": {}, "hours": {}, "days": {}, "sessions": {}, "updated": None}
 
-    def update(self, now=None, budget=None):
+    def update(self, now=None, budget=None, group_of=None):
         """Read what each transcript added since the last update (all of them
         the first time: minutes for gigabytes), under a lock (another update
         running: nothing). budget: stop after this many seconds and carry on
-        next time. -> the index, or None when another update holds the lock."""
+        next time. group_of(sid, folder): the group a session ran in, for the
+        sums an hour x group. -> the index, or None when another update
+        holds the lock."""
+        self.group_of = group_of
         now = time.time() if now is None else now
         try:
             os.mkdir(self.lock)
@@ -6044,6 +6116,9 @@ class Tokens:
         day = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
         _add(ix["days"].setdefault(day, {}).setdefault(cwd, {}), model, v)
         sm = _find(_RX["sid"], line, head)
+        sid = sm.group(1).decode() if sm else None
+        g = (getattr(self, "group_of", None) or (lambda s, c: "general"))(sid, cwd)
+        _add(ix.setdefault("hg", {}).setdefault(hour, {}).setdefault(g, {}), model, v)
         if sm:
             s = ix["sessions"].setdefault(sm.group(1).decode(), {"m": {}})
             s.setdefault("cwd", cwd)
@@ -6058,6 +6133,7 @@ class Tokens:
     def _prune(self, ix, now):
         cut = now - TOK_KEEP
         ix["hours"] = {h: v for h, v in ix["hours"].items() if int(h) >= cut}
+        ix["hg"] = {h: v for h, v in (ix.get("hg") or {}).items() if int(h) >= cut}
         dcut = datetime.fromtimestamp(cut).strftime("%Y-%m-%d")
         ix["days"] = {d: v for d, v in ix["days"].items() if d >= dcut}
         ix["sessions"] = {k: v for k, v in ix["sessions"].items() if (v.get("last") or now) >= cut}
@@ -6111,7 +6187,7 @@ def _sum_models(by_model):
     return tot, usd, unknown
 
 
-def tokens_view(ix, now, ndays=14, namer=None):
+def tokens_view(ix, now, ndays=14, namer=None, smap=None):
     """The Usage section's Tokens, over the last ndays: per model, per day
     (and model), the last 48 hours, per project and the costliest sessions;
     tokens and what they would cost on the API at list prices."""
@@ -6174,7 +6250,154 @@ def tokens_view(ix, now, ndays=14, namer=None):
         "models": sorted(({"model": m, "tokens": v, "usd": round(cost(m, v) or 0, 2), "priced": price(m) is not None}
                           for m, v in models.items()), key=lambda x: -x["usd"]),
         "daily": daily, "hours": hours, "projects": proj[:25], "sessions": sess[:30],
+        "by": breakdown(ix, smap or {}, now, days, namer), "exact_since": (smap or {}).get("since"),
         "fields": ["in", "out", "thinking", "cache write 5m", "cache write 1h", "cache read", "answers"]}
+
+
+# ---------- which group each session ran in (1.25.7) ----------
+# A transcript does not say whether its session ran on cl or in a lane. The
+# web looks every minute at the open sessions (their environment says it) and
+# at which account each group is on, and keeps both here; the token index
+# reads it. Sessions that ended before it started looking are put in the
+# group their folder's sessions were seen in (an estimate).
+
+MAP_KEEP = 90 * 86400
+MAP_TOUCH = 300            # a session's "last seen" is written at most this often
+
+
+class SessionMap:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                m = json.load(f)
+            if m.get("v") == 1:
+                return m
+        except (OSError, ValueError):
+            pass
+        return {"v": 1, "since": None, "sessions": {}, "seats": {}}
+
+    def record(self, live, seats, now=None):
+        """live: the open sessions ([{"sid", "group", "name", "cwd"}]); seats:
+        {group: the email of the account it is on, or None}. Written only
+        when something changed. -> the map."""
+        now = time.time() if now is None else now
+        m, changed = self.load(), False
+        if m["since"] is None:
+            m["since"], changed = now, True
+        for s in live:
+            cur = m["sessions"].get(s["sid"])
+            if cur is None:
+                m["sessions"][s["sid"]] = {"g": s["group"], "name": s.get("name"), "cwd": s.get("cwd"),
+                                           "first": now, "last": now}
+                changed = True
+                continue
+            if cur.get("g") != s["group"] or (s.get("name") and cur.get("name") != s.get("name")):
+                cur["g"], cur["name"] = s["group"], s.get("name") or cur.get("name")
+                changed = True
+            if now - cur.get("last", 0) >= MAP_TOUCH:
+                cur["last"], changed = now, True
+        for g, email in seats.items():
+            tl = m["seats"].setdefault(g, [])
+            if not tl or tl[-1][1] != email:
+                tl.append([now, email])
+                changed = True
+        if changed:
+            cut = now - MAP_KEEP
+            m["sessions"] = {k: v for k, v in m["sessions"].items() if v.get("last", now) >= cut}
+            for g, tl in m["seats"].items():
+                keep = [x for x in tl if x[0] >= cut]
+                older = [x for x in tl if x[0] < cut]
+                m["seats"][g] = older[-1:] + keep
+            tmp = self.path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(m, f, separators=(",", ":"))
+            os.replace(tmp, self.path)
+        return m
+
+
+def group_rule(smap, namer, default="general"):
+    """sid, folder -> the group a session ran in: as the map saw it, else the
+    group its folder's sessions (then its project's) were seen in most,
+    else default."""
+    by_sid = {sid: v.get("g") for sid, v in (smap.get("sessions") or {}).items()}
+    by_cwd, by_proj = {}, {}
+    for v in (smap.get("sessions") or {}).values():
+        g, cwd = v.get("g"), v.get("cwd")
+        if not g or not cwd:
+            continue
+        by_cwd.setdefault(cwd, {}).setdefault(g, 0)
+        by_cwd[cwd][g] += 1
+        p = namer(cwd)
+        by_proj.setdefault(p, {}).setdefault(g, 0)
+        by_proj[p][g] += 1
+    best = lambda c: max(c.items(), key=lambda kv: kv[1])[0]
+
+    def rule(sid, cwd):
+        if sid in by_sid and by_sid[sid]:
+            return by_sid[sid]
+        if cwd in by_cwd:
+            return best(by_cwd[cwd])
+        p = namer(cwd)
+        if p in by_proj:
+            return best(by_proj[p])
+        return default
+    return rule
+
+
+def seat_at(smap, group, t):
+    """The email of the account group was on at t (the map's), or None."""
+    got = None
+    for at, email in (smap.get("seats") or {}).get(group) or []:
+        if at > t:
+            break
+        got = email
+    return got
+
+
+def breakdown(ix, smap, now, days, namer, top=8):
+    """Day by day, by group, project, model and account: {by: {series:
+    {"usd": [a day], "tok": [a day]}}}; projects past the top ones go to
+    "others". Accounts only from when the map started (before: "?")."""
+    keys = [datetime.fromtimestamp(d).strftime("%Y-%m-%d") for d in days]
+    idx = {k: i for i, k in enumerate(keys)}
+    n = len(keys)
+    out = {"group": {}, "project": {}, "model": {}, "account": {}}
+
+    def add(kind, name, i, model, v):
+        s = out[kind].setdefault(name, {"usd": [0.0] * n, "tok": [0] * n})
+        s["usd"][i] += cost(model, v) or 0
+        s["tok"][i] += v[0] + v[1] + v[3] + v[4] + v[5]
+
+    for k in keys:
+        for cwd, mv in (ix.get("days", {}).get(k) or {}).items():
+            p = namer(cwd)
+            for model, v in mv.items():
+                add("project", p, idx[k], model, v)
+                add("model", model, idx[k], model, v)
+    since = (smap or {}).get("since")
+    for h, gm in (ix.get("hg") or {}).items():
+        t = int(h)
+        k = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+        if k not in idx:
+            continue
+        for g, mv in gm.items():
+            who = (seat_at(smap, g, t + 1800) if since and t + 1800 >= since else None) or "?"
+            for model, v in mv.items():
+                add("group", g, idx[k], model, v)
+                add("account", who, idx[k], model, v)
+    for kind in out:
+        for s in out[kind].values():
+            s["usd"] = [round(x, 2) for x in s["usd"]]
+    proj = sorted(out["project"].items(), key=lambda kv: -sum(kv[1]["usd"]))
+    if len(proj) > top:
+        rest = {"usd": [round(sum(s["usd"][i] for _, s in proj[top:]), 2) for i in range(n)],
+                "tok": [sum(s["tok"][i] for _, s in proj[top:]) for i in range(n)]}
+        out["project"] = dict(proj[:top] + [("others", rest)])
+    return out
 PYEOF
 
 # --- Checks ---
@@ -6270,6 +6493,7 @@ cmd_help() {
   echo "                           On the tailnet: tailscale serve --bg --https=N http://127.0.0.1:N"
   echo "                           (the node's owner may use it; the store's web.allow overrides)"
   echo "  claude-swap usage [pace|events|tokens] [--days N] [--group g] [--all] [--json]"
+  echo "                    [--by group|project|model|account]"
   echo "                           What the accounts used over time: per group the week left,"
   echo "                           a day's use and whether it lasts to the renewals; per"
   echo "                           account its pace and when it runs out; events: moves, resets"
@@ -10912,6 +11136,7 @@ web.engine, web.oauth, web.meter = engine, oauth, meter
 exec(os.environ.pop("CLAUDE_SWAP_WEB"), web.__dict__)
 
 USAGE = ("Usage: claude-swap usage [pace|events|tokens] [--days N] [--group g] [--all] [--json]\n"
+         "                         [--by group|project|model|account]   (tokens: day by day)\n"
          "  pace    per group: the week left (in whole accounts), what it used a day and,\n"
          "          at the last 24 h's pace, whether it lasts until the renewals;\n"
          "          per account: what it used, how fast it climbs now, when it runs out\n"
@@ -10922,7 +11147,7 @@ USAGE = ("Usage: claude-swap usage [pace|events|tokens] [--days N] [--group g] [
          "  --days N  the days shown (14) · --group g  one group's seats · --all  every\n"
          "          account (else those that used something in the days shown)")
 store_path, args = sys.argv[1], sys.argv[2:]
-view, days, group, show_all, as_json = "pace", 14, None, False, False
+view, days, group, show_all, as_json, by = "pace", 14, None, False, False, None
 i = 0
 while i < len(args):
     a = args[i]
@@ -10936,6 +11161,8 @@ while i < len(args):
         group = args[i + 1]; i += 1
     elif a == "--all":
         show_all = True
+    elif a == "--by" and i + 1 < len(args) and args[i + 1] in ("group", "project", "model", "account"):
+        by = args[i + 1]; i += 1
     elif a == "--json":
         as_json = True
     else:
@@ -11005,6 +11232,20 @@ if view == "tokens":
     for x in data["projects"][:10]:
         print(f"  {x['name'][:24]:<24} {big(sum(x['tokens'][:6]) - x['tokens'][2]):>8} {x['usd']:>9,.2f}")
     print()
+    if by:
+        ds = data["days"][-min(7, len(data["days"])):]
+        off = len(data["days"]) - len(ds)
+        series = sorted(data["by"][by].items(), key=lambda kv: -sum(kv[1]["usd"]))
+        W2 = max([12] + [len(k) for k, _ in series])
+        dh = " ".join(f"{DN[datetime.fromtimestamp(d).weekday()]}{datetime.fromtimestamp(d).day:02d}".rjust(7) for d in ds)
+        ex = data.get("exact_since")
+        print(c(DIM, f"  Day by day, by {by} ($ at API prices)"
+              + (f" — groups exact since {when(ex)}, estimated by folder before" if by in ("group", "account") and ex else "")))
+        print(c(DIM, f"  {by:<{W2}} {dh} {'total':>9}"))
+        for name, s in series:
+            cells = " ".join((f"{v:>7,.0f}" if round(v) else c(DIM, f"{'·':>7}")) for v in s["usd"][off:])
+            print(f"  {name[:W2]:<{W2}} {cells} {sum(s['usd'][off:]):>9,.0f}")
+        print()
     print(c(DIM, f"  {'Session':<26} {'project':<14} {'last':<12} {'$':>9} {'agents':>8}"))
     for s in data["sessions"][:12]:
         print(f"  {(s['name'] or s['id'])[:26]:<26} {s['project'][:14]:<14} {when(s['last']):<12} {s['usd']:>9,.2f}"
@@ -11763,6 +12004,15 @@ dialog::backdrop{background:rgba(10,14,18,.5);backdrop-filter:blur(2px);-webkit-
 .vx table.x-uev{margin-bottom:10px}
 @media (max-width:600px){.vx .x-evrow{grid-template-columns:78px 1fr}.vx .x-evk{display:none}}
 .vx .x-pbar{display:inline-block;height:8px;border-radius:4px;background:var(--accent);opacity:.75;vertical-align:middle}
+.vx .x-ustack{display:flex;align-items:flex-end;gap:3px;height:124px;border-bottom:1px solid var(--rule)}
+.vx .x-ucol{flex:1;display:flex;flex-direction:column-reverse;min-width:6px}
+.vx .x-ucol i{display:block;width:100%}
+.vx .x-ucol i:last-child{border-radius:3px 3px 0 0}
+.vx .x-s0{background:var(--accent)} .vx .x-s1{background:var(--cyan)} .vx .x-s2{background:var(--mag)}
+.vx .x-s3{background:var(--ok-fill)} .vx .x-s4{background:var(--warn-fill)} .vx .x-s5{background:var(--bad-fill)}
+.vx .x-s6{background:var(--ink2)} .vx .x-s7{background:var(--ink3)}
+.vx .x-sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:7px;vertical-align:-1px}
+.vx table.x-uday td:first-child{white-space:nowrap}
 .vx .x-sortbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 9px;font-size:12.5px}
 .vx .x-sortbar select{font:inherit;padding:3px 6px;border:1px solid var(--rule);border-radius:6px;background:var(--panel);color:var(--ink)}
 .vx tbody tr:hover td{background:color-mix(in srgb,var(--accent) 5%,var(--panel))}
@@ -13522,6 +13772,42 @@ const Views = (() => {
   const big = (n) => { n = Number(n) || 0; return n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n)); };
   const usd = (x) => "$" + (x >= 100 ? Math.round(x).toLocaleString("en-US") : (x || 0).toFixed(2));
   const processed = (v) => (v[0] + v[1] + v[3] + v[4] + v[5]);
+
+  const SERIES = 8;
+  function dayByDay(redo, data) {
+    const by = vu.tkBy || "group", metric = vu.tkMetric || "usd";
+    const days = data.days || [], n = days.length;
+    let series = Object.entries((data.by || {})[by] || {}).map(([name, s]) => ({ name, v: s[metric] || [] }))
+      .sort((a, b) => b.v.reduce((x, y) => x + y, 0) - a.v.reduce((x, y) => x + y, 0));
+    if (series.length > SERIES) {
+      const rest = series.slice(SERIES - 1);
+      series = series.slice(0, SERIES - 1).concat([{ name: "others", v: days.map((_, i) => rest.reduce((x, s) => x + (s.v[i] || 0), 0)) }]);
+    }
+    const fmt = metric === "usd" ? usd : big;
+    const totals = days.map((_, i) => series.reduce((x, s) => x + (s.v[i] || 0), 0));
+    const top = Math.max(1e-9, ...totals);
+    const chip = (k, t, cur, set) => h("button", { type: "button", class: "chip", "aria-pressed": String(cur === k), text: t, onclick: () => { set(k); redo(); } });
+    const ex = data.exact_since;
+    const caveat = (by === "group" || by === "account") && ex
+      ? (by === "group" ? "Groups are exact from " : "Accounts are known from ") + dateStr(ex) + " " + hm(ex)
+        + (by === "group" ? "; before, each session goes to the group its folder's sessions were seen in." : "; before, \"?\".")
+      : null;
+    const stack = h("div", { class: "ustack" }, days.map((d, i) => h("div", { class: "ucol", title: dateStr(d) + " · " + fmt(totals[i]) + "\n"
+        + series.filter((s) => s.v[i]).map((s) => s.name + " " + fmt(s.v[i])).join("\n") },
+      series.map((s, j) => s.v[i] ? h("i", { class: "s" + j, css: { height: Math.max(1, Math.round((s.v[i] / top) * 120)) + "px" } }) : null))));
+    const head = h("tr", {}, h("th", { text: by }), days.map((d, i) => h("th", { class: "uhh" + (i === n - 1 ? " today" : "") },
+      DAYS[D(d).getDay()], h("small", { text: String(D(d).getDate()) }))), h("th", { text: "Total" }));
+    const rows = series.map((s, j) => h("tr", {}, h("td", {}, h("span", { class: "sw s" + j }), s.name),
+      s.v.map((v) => h("td", { class: "num" + (v ? "" : " faint"), text: v ? fmt(v) : "·" })),
+      h("td", { class: "num", text: fmt(s.v.reduce((x, y) => x + y, 0)) })));
+    return [h("p", { class: "note", text: "Day by day" }),
+      h("div", { class: "filters" }, h("span", { class: "faint", text: "By" }),
+        [["group", "group / lane"], ["project", "project"], ["model", "model"], ["account", "account"]].map(([k, t]) => chip(k, t, by, (x) => { vu.tkBy = x; })),
+        h("span", { class: "faint", text: "·" }), chip("usd", "$", metric, (x) => { vu.tkMetric = x; }), chip("tok", "tokens", metric, (x) => { vu.tkMetric = x; })),
+      caveat ? note(caveat) : null,
+      h("div", { class: "ucard" }, stack, h("div", { class: "uax" }, days.map((d) => h("span", { text: String(D(d).getDate()) })))),
+      scroll(h("table", { class: "uday" }, h("thead", {}, head), h("tbody", {}, rows)))];
+  }
   function useTokens(redo, data) {
     if (data.indexing) return [note("Reading Claude Code's transcripts for the first time: a few minutes for gigabytes. This view fills in when it is done (the server brings it up to date every 5 minutes after that).")];
     const tt = data.total || {}, tk = tt.tokens || [0, 0, 0, 0, 0, 0, 0];
@@ -13540,6 +13826,7 @@ const Views = (() => {
         h("div", { class: "ucard" }, h("div", { class: "uhd" }, h("b", { text: "48 hours" }), h("span", { class: "faint", text: "an hour each, at API prices" })),
           chart(hours.map((x) => x.usd), { cls: () => "use", wide: true, title: (v, i) => dayWord(hours[i].t) + hm(hours[i].t) + " · " + usd(v) + " · " + big(processed(hours[i].tokens)) + " tokens" }),
           h("div", { class: "uax" }, hours.map((x, i) => h("span", { text: i % 6 === 0 ? pad2(D(x.t).getHours()) : "" }))))),
+      dayByDay(redo, data),
       h("p", { class: "note", text: "Per model" }),
       scroll(h("table", {}, h("thead", {}, h("tr", {}, ["Model", "Input", "Output", "(thinking)", "Cache write", "Cache read", "Answers", "At API prices"].map((x) => h("th", { text: x })))),
         h("tbody", {}, (data.models || []).map((x) => h("tr", {}, h("td", { text: x.model }),
