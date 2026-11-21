@@ -214,6 +214,59 @@ class GroupsTest(unittest.TestCase):
         self.assertEqual(b["project"]["P"]["tok"][-1], 1000000)
 
 
+class TeamsTest(unittest.TestCase):
+    def test_an_admin_is_found_and_only_own_seats_are_named(self):
+        d = tempfile.mkdtemp(prefix="cs-team-")
+        self.addCleanup(shutil.rmtree, d, True)
+        store = {"accounts": [
+            {"email": "seat@team.io", "org_id": "org1", "plan": "default_raven", "session_key": "k-seat"},
+            {"email": "boss@team.io", "org_id": "own", "plan": "default_claude_max_20x", "session_key": "k-boss"}]}
+        calls = []
+
+        def get(url, sk):
+            calls.append((url.split("?")[0].rsplit("/", 1)[-1], sk))
+            if sk != "k-boss":
+                return 403, None
+            if "/users" in url:
+                return 200, {"users": [
+                    {"email": "seat@team.io", "total_cost": "100.5", "avg_cost_per_day": "50.25",
+                     "total_lines_accepted": 10, "total_sessions": 2, "last_active": "2026-11-18T00:00:00"},
+                    {"email": "someone.else@client.io", "total_cost": "7", "avg_cost_per_day": "7",
+                     "total_lines_accepted": 3, "total_sessions": 1, "last_active": "2026-11-18T00:00:00"}],
+                    "pagination": {"has_next": False}}
+            if "/overview" in url:
+                return 200, {"summary": {"total_cost_usd": "107.5", "total_sessions": 3},
+                             "time_series": {"activity": [{"date": "2026-11-18", "total_cost_usd": "107.5",
+                                                           "sessions_count": 3, "users_active": 2}]}}
+            return 200, [{"uuid": "org1", "name": "The Team"}]
+        path = os.path.join(d, "teams.json")
+        got = M.fetch_teams(store, path, now=NOW, get=get, sleep=lambda s: None)
+        o = got["orgs"][0]
+        self.assertEqual(o["via"], "boss@team.io")   # the seats' domain, a non-seat first
+        self.assertEqual(calls[0][1], "k-boss")
+        self.assertEqual([s["email"] for s in o["seats"]], ["seat@team.io"])
+        self.assertEqual(o["seats"][0]["days"], 2)
+        self.assertEqual(o["others"], {"members": 1, "cost": 7.0, "lines": 3, "sessions": 1})
+        self.assertEqual(o["name"], "The Team")
+        with open(path) as f:
+            text = f.read()
+        self.assertNotIn("someone.else", text)
+        self.assertNotIn("k-boss", text)
+        v = M.teams_view(got, [{"n": 1, "email": "seat@team.io", "u7": 40}], NOW)
+        self.assertEqual(v["orgs"][0]["seats"][0]["n"], 1)
+
+    def test_a_rate_limit_stops_it(self):
+        d = tempfile.mkdtemp(prefix="cs-team-")
+        self.addCleanup(shutil.rmtree, d, True)
+        store = {"accounts": [{"email": f"s{i}@t.io", "org_id": "org1", "plan": "default_raven",
+                               "session_key": f"k{i}"} for i in range(5)]}
+        calls = []
+        got = M.fetch_teams(store, os.path.join(d, "t.json"), now=NOW,
+                            get=lambda u, sk: calls.append(sk) or (429, None), sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(got["stopped"])
+
+
 class UsageRouteTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="cs-meter-web-")

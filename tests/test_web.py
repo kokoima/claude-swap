@@ -977,6 +977,7 @@ class ScriptTest(unittest.TestCase):
                  CLAUDE_SWAP_VAULT="claude-swap-tests", NO_COLOR="1",
                  CLAUDE_SWAP_WEB_BIN=self.swap,
                  CLAUDE_SWAP_TAILSCALE=os.path.join(self.bin, "tailscale"),
+                 CLAUDE_SWAP_TEAMS="off",
                  PATH=self.bin + os.pathsep + "/usr/bin:/bin:/usr/sbin:/sbin")
         return e
 

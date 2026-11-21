@@ -24,7 +24,7 @@
 
 set -e
 
-VERSION="1.25.7"
+VERSION="1.25.8"
 STORE="${CLAUDE_SWAP_STORE:-$HOME/.claude/claude-swap.json}"
 # A session of `claude-swap run` on a full login has its lane's own
 # CLAUDE_CONFIG_DIR, which the commands it runs inherit: claude-swap itself
@@ -4859,7 +4859,9 @@ class App:
             "tokens": os.path.join(c, "claude-swap-tokens.json"),
             "transcripts": os.path.join(c, "projects"),
             "projects_config": os.path.join(c, "projects-config.json"),
-            "session_map": os.path.join(c, "claude-swap-session-map.json")}
+            "session_map": os.path.join(c, "claude-swap-session-map.json"),
+            "teams": os.path.join(c, "claude-swap-teams.json"),
+            "teams_lock": os.path.join(c, "claude-swap-teams.lock")}
         self.home = home
         m = globals().get("meter")  # set by whoever execs this module (1.25)
         self.history = m.History(self.paths["history"]) if m else None
@@ -5151,6 +5153,39 @@ class App:
             self.log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] web: usage history: {type(e).__name__}")
             return 0
 
+    def refresh_teams(self):
+        """claude-swap usage teams --refresh in the background, when the Team
+        analytics are TEAM_EVERY old (it reads claude.ai: this server does
+        not), one at a time (a lock directory)."""
+        m = globals().get("meter")
+        if m is None or os.environ.get("CLAUDE_SWAP_TEAMS") == "off":
+            return False
+        up = (_read_json(self.paths["teams"]) or {}).get("updated")
+        if isinstance(up, (int, float)) and self.clock() - up < m.TEAM_EVERY:
+            return False
+        try:
+            if not m.team_orgs(oauth.load_store(self.store_path)):
+                return False   # no seat of a Team among the accounts
+        except Exception:
+            return False
+        lock = self.paths["teams_lock"]
+        try:
+            if os.path.isdir(lock):
+                if time.time() - os.path.getmtime(lock) < 600:
+                    return False
+                os.rmdir(lock)
+            os.mkdir(lock)
+            self.popen(["/bin/sh", "-c", '"$0" usage teams --refresh --quiet >/dev/null 2>&1; rmdir "$1" 2>/dev/null',
+                        self.bin, lock], start_new_session=True, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env())
+            return True
+        except Exception:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+            return False
+
     def record_sessions(self, store=None):
         """Note the open sessions' groups and each group's account (the
         session map, which the token index reads)."""
@@ -5204,6 +5239,10 @@ class App:
             namer = meter.project_namer(self.paths["projects_config"], self.home)
             smap = meter.SessionMap(self.paths["session_map"]).load()
             return _finite(dict(meter.tokens_view(tk.load(), now, days, namer, smap), view=view))
+        if view == "teams":
+            st = web_state(store, _read_json(self.paths["cache"]), now)
+            return _finite(dict(meter.teams_view(_read_json(self.paths["teams"]), st["accounts"], now),
+                                view=view))
         if view == "events":
             return _finite(dict(meter.events_view(self.paths["watch_log"], self.paths["web_log"], now, days),
                                 view=view))
@@ -5383,6 +5422,7 @@ def main(store_path, bin_path, version, port, pid_path, home=None):
         while True:
             app.record()
             app.record_sessions()
+            app.refresh_teams()
             time.sleep(60)
     threading.Thread(target=recorder, daemon=True).start()
 
@@ -5417,7 +5457,8 @@ read -r -d '' METER_PY <<'PYEOF' || true
 #    that moved (or every HEARTBEAT), keyed by email, so that renumbering the
 #    accounts never mixes two of them (~/.claude/claude-swap-usage-history.jsonl);
 #  - the logs (events) and Claude Code's transcripts (tokens).
-# Nothing here reaches the network, and nothing it writes holds a token.
+# Nothing here reaches the network but fetch_teams (claude.ai's admin
+# analytics, from the CLI only), and nothing it writes holds a token.
 
 import json, os, re, time
 from datetime import datetime, timedelta
@@ -6398,6 +6439,190 @@ def breakdown(ix, smap, now, days, namer, top=8):
                 "tok": [sum(s["tok"][i] for _, s in proj[top:]) for i in range(n)]}
         out["project"] = dict(proj[:top] + [("others", rest)])
     return out
+
+
+# ---------- Team analytics (1.25.8): what claude.ai's admin pages say ----------
+# A Team's admin reads Claude Code's analytics of every member (estimated cost
+# at API list prices, lines accepted, sessions, last day active) and the
+# org's day-by-day totals. fetch_teams() is the only part of this module that
+# reaches the network (`claude-swap usage teams --refresh`: GETs only, paced,
+# stopping at the first refusal that is not a "not an admin"). What it keeps
+# names only the store's own accounts; every other member is summed in
+# "others", so no one else's email is written down.
+
+TEAM_DAYS = 30
+TEAM_EVERY = 1800           # the web refreshes the Team analytics this often
+TEAM_PAUSE = 1.6            # seconds between two requests
+TEAM_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _fnum(x):
+    v = _num(x)
+    return 0.0 if v is None else v
+
+
+def team_orgs(store):
+    """The Team orgs the store's accounts hold seats in: [(org uuid, [seat emails])]."""
+    out = {}
+    for a in store.get("accounts") or []:
+        org, plan = a.get("org_id"), (a.get("plan") or "")
+        if org and "raven" in plan and a.get("email"):
+            out.setdefault(org, []).append(a["email"].strip().lower())
+    return list(out.items())
+
+
+def _http_get(url, sk):
+    import urllib.request, urllib.error
+    req = urllib.request.Request(url, headers={"Cookie": f"sessionKey={sk}", "User-Agent": TEAM_UA,
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (OSError, ValueError):
+        return 0, None
+
+
+def fetch_teams(store, cache_path, now=None, get=None, pause=TEAM_PAUSE, sleep=time.sleep):
+    """Read each Team org's analytics with an admin's cookie (the one that
+    worked last time first, then the store's accounts of the seats' domain,
+    others before seats, then the rest) and write the cache. -> the cache."""
+    get = get or _http_get
+    now = time.time() if now is None else now
+    old = {}
+    try:
+        with open(cache_path) as f:
+            old = {o["org"]: o for o in (json.load(f).get("orgs") or [])}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    accounts = [a for a in store.get("accounts") or [] if a.get("session_key") and a.get("email")]
+    mine = {a["email"].strip().lower() for a in store.get("accounts") or [] if a.get("email")}
+    end = datetime.fromtimestamp(now).date()
+    start = end - timedelta(days=TEAM_DAYS - 1)
+    q = f"start_date={start}&end_date={end}&customer_type=claude_ai"
+    orgs, calls, stop = [], [0], [False]
+
+    def call(url, sk):
+        if calls[0]:
+            sleep(pause)
+        calls[0] += 1
+        st, body = get(url, sk)
+        if st not in (200, 401, 403, 404):
+            stop[0] = True   # Cloudflare, a rate limit, the network: no more this time
+        return st, body
+
+    for org, seats in team_orgs(store):
+        if stop[0]:
+            break
+        rec = {"org": org, "name": (old.get(org) or {}).get("name"), "via": None, "error": None,
+               "start": str(start), "end": str(end)}
+        doms = {e.split("@")[-1] for e in seats}
+        prev = (old.get(org) or {}).get("via")
+        order = sorted(accounts, key=lambda a: (a["email"].lower() != prev,
+                                                a["email"].split("@")[-1].lower() not in doms,
+                                                a["email"].lower() in seats))
+        users = None
+        for a in order:
+            sk = a["session_key"]
+            got, offset = [], 0
+            while True:
+                st, body = call(f"https://claude.ai/api/claude_code/metrics_aggs/users?{q}"
+                                f"&organization_uuid={org}&limit=100&offset={offset}", sk)
+                if st != 200 or not isinstance(body, dict):
+                    break
+                got += [u for u in body.get("users") or [] if isinstance(u, dict)]
+                pg = body.get("pagination") or {}
+                if not pg.get("has_next") or offset >= 400:
+                    users = got
+                    break
+                offset += 100
+            if users is not None:
+                rec["via"] = a["email"].lower()
+                break
+            if stop[0]:
+                break
+        if users is None:
+            rec["error"] = "no account of the store could read this Team's analytics (an admin's cookie is needed)"
+            orgs.append(rec)
+            continue
+        sk = next(a["session_key"] for a in accounts if a["email"].lower() == rec["via"])
+        own, others = [], {"members": 0, "cost": 0.0, "lines": 0, "sessions": 0}
+        for u in users:
+            e = (u.get("email") or "").strip().lower()
+            cost_, per = _fnum(u.get("total_cost")), _fnum(u.get("avg_cost_per_day"))
+            if e in mine:
+                own.append({"email": e, "cost": round(cost_, 2), "per_day": round(per, 2),
+                            "days": round(cost_ / per) if per > 0 else 0,
+                            "lines": int(_fnum(u.get("total_lines_accepted"))),
+                            "sessions": int(_fnum(u.get("total_sessions"))),
+                            "last": (u.get("last_active") or "")[:10] or None})
+            else:
+                others["members"] += 1
+                others["cost"] += cost_
+                others["lines"] += int(_fnum(u.get("total_lines_accepted")))
+                others["sessions"] += int(_fnum(u.get("total_sessions")))
+        others["cost"] = round(others["cost"], 2)
+        rec["seats"] = sorted(own, key=lambda x: -x["cost"])
+        rec["others"] = others
+        for _ in range(2):   # it fails now and then, and answers the next time
+            st, body = call(f"https://claude.ai/api/claude_code/metrics_aggs/overview?{q}"
+                            f"&organization_uuid={org}&granularity=daily", sk)
+            if st == 200 or stop[0]:
+                break
+        if st == 200 and isinstance(body, dict):
+            sm = body.get("summary") or {}
+            rec["summary"] = {"cost": round(_fnum(sm.get("total_cost_usd")), 2),
+                              "sessions": int(_fnum(sm.get("total_sessions"))),
+                              "lines": int(_fnum(sm.get("total_lines_accepted"))),
+                              "commits": int(_fnum(sm.get("commits_created"))),
+                              "users": int(_fnum(sm.get("active_users")))}
+            # each series fills its own field: spend the cost, activity the
+            # sessions and users, lines_of_code the lines; merged by day
+            days_ = {}
+            for series, fields in (("spend", (("cost", "total_cost_usd"),)),
+                                   ("activity", (("sessions", "sessions_count"), ("users", "users_active"))),
+                                   ("lines_of_code", (("lines", "lines_of_code"),))):
+                for x in (body.get("time_series") or {}).get(series) or []:
+                    if not isinstance(x, dict) or not x.get("date"):
+                        continue
+                    dd = days_.setdefault(x["date"][:10], {"date": x["date"][:10], "cost": 0.0, "sessions": 0,
+                                                           "users": 0, "lines": 0})
+                    for k, src in fields:
+                        if x.get(src) is not None:
+                            dd[k] = round(_fnum(x[src]), 2) if k == "cost" else int(_fnum(x[src]))
+            rec["daily"] = [days_[k] for k in sorted(days_)]
+        if not rec["name"] and not stop[0]:
+            st, body = call("https://claude.ai/api/organizations", sk)
+            if st == 200 and isinstance(body, list):
+                rec["name"] = next((o.get("name") for o in body if isinstance(o, dict) and o.get("uuid") == org), None)
+        orgs.append(rec)
+    out = {"updated": now, "orgs": orgs, "stopped": stop[0]}
+    if not orgs and old:
+        return out
+    tmp = cache_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(out, f)
+    os.replace(tmp, cache_path)
+    return out
+
+
+def teams_view(cache, accounts, now):
+    """The Usage section's Teams: the cache, each own seat with its number
+    and week now (from the state's accounts)."""
+    by_email = {(a.get("email") or "").lower(): a for a in accounts}
+    orgs = []
+    for o in (cache or {}).get("orgs") or []:
+        o = dict(o)
+        o["seats"] = [dict(s, n=(by_email.get(s["email"]) or {}).get("n"),
+                           u7=(by_email.get(s["email"]) or {}).get("u7"))
+                      for s in o.get("seats") or []]
+        orgs.append(o)
+    up = (cache or {}).get("updated")
+    return {"now": now, "updated": up, "age": now - up if up else None, "orgs": orgs,
+            "stopped": bool((cache or {}).get("stopped"))}
 PYEOF
 
 # --- Checks ---
@@ -6493,7 +6718,7 @@ cmd_help() {
   echo "                           On the tailnet: tailscale serve --bg --https=N http://127.0.0.1:N"
   echo "                           (the node's owner may use it; the store's web.allow overrides)"
   echo "  claude-swap usage [pace|events|tokens] [--days N] [--group g] [--all] [--json]"
-  echo "                    [--by group|project|model|account]"
+  echo "                    [--by group|project|model|account]   claude-swap usage teams [--refresh]"
   echo "                           What the accounts used over time: per group the week left,"
   echo "                           a day's use and whether it lasts to the renewals; per"
   echo "                           account its pace and when it runs out; events: moves, resets"
@@ -11137,6 +11362,7 @@ exec(os.environ.pop("CLAUDE_SWAP_WEB"), web.__dict__)
 
 USAGE = ("Usage: claude-swap usage [pace|events|tokens] [--days N] [--group g] [--all] [--json]\n"
          "                         [--by group|project|model|account]   (tokens: day by day)\n"
+         "                         [--refresh] [--quiet]                (teams: read claude.ai now)\n"
          "  pace    per group: the week left (in whole accounts), what it used a day and,\n"
          "          at the last 24 h's pace, whether it lasts until the renewals;\n"
          "          per account: what it used, how fast it climbs now, when it runs out\n"
@@ -11144,16 +11370,20 @@ USAGE = ("Usage: claude-swap usage [pace|events|tokens] [--days N] [--group g] [
          "          watch or by hand), resets and how they went, walls, starts, a day each\n"
          "  tokens  Claude Code's transcripts: tokens per model, day, project and session, the\n"
          "          cache's share and what they would cost on the API at list prices\n"
+         "  teams   claude.ai's admin analytics of each Team the accounts hold seats in (an\n"
+         "          admin's cookie): estimated cost, lines, sessions per seat, the org a day;\n"
+         "          only the store's own accounts by name, other members summed\n"
          "  --days N  the days shown (14) · --group g  one group's seats · --all  every\n"
          "          account (else those that used something in the days shown)")
 store_path, args = sys.argv[1], sys.argv[2:]
 view, days, group, show_all, as_json, by = "pace", 14, None, False, False, None
+refresh = quiet = False
 i = 0
 while i < len(args):
     a = args[i]
     if a in ("-h", "--help", "help"):
         print(USAGE); sys.exit(0)
-    elif a in ("pace", "events", "tokens"):
+    elif a in ("pace", "events", "tokens", "teams"):
         view = a
     elif a == "--days" and i + 1 < len(args) and args[i + 1].isdigit():
         days = max(1, min(60, int(args[i + 1]))); i += 1
@@ -11161,6 +11391,10 @@ while i < len(args):
         group = args[i + 1]; i += 1
     elif a == "--all":
         show_all = True
+    elif a == "--refresh":
+        refresh = True
+    elif a == "--quiet":
+        quiet = True
     elif a == "--by" and i + 1 < len(args) and args[i + 1] in ("group", "project", "model", "account"):
         by = args[i + 1]; i += 1
     elif a == "--json":
@@ -11171,6 +11405,12 @@ while i < len(args):
 
 store = oauth.load_store(store_path)
 app = web.App(store_path, "")
+if view == "teams" and (refresh or not os.path.exists(app.paths["teams"])):
+    if not quiet:
+        print("Reading claude.ai's Team analytics (GETs, 1.6 s apart)…", file=sys.stderr)
+    got = meter.fetch_teams(store, app.paths["teams"])
+    if quiet:
+        sys.exit(0 if got.get("orgs") else 1)
 if view == "tokens":
     if not os.path.exists(app.paths["tokens"]):
         print("Reading Claude Code's transcripts for the first time (a few minutes for gigabytes)…", file=sys.stderr)
@@ -11207,6 +11447,31 @@ def big(n):
         if n >= d:
             return f"{n / d:.1f}{u}"
     return f"{int(n)}"
+if view == "teams":
+    print(c(BLD, "Usage · teams") + "  " + c(DIM, f"claude.ai's admin analytics, last {meter.TEAM_DAYS} days — cost is"
+          " claude.ai's estimate at API list prices" + (f"; read {span(data['age'])} ago" if data.get("age") is not None else "")))
+    if not data["orgs"]:
+        print(c(DIM, "  no Team org among the accounts (or nothing read yet: --refresh)"))
+    for o in data["orgs"]:
+        print()
+        head = f"  {c(BLD, o.get('name') or o['org'][:8])} {c(DIM, '(' + o['org'][:8] + ')')}"
+        if o.get("error"):
+            print(head + "  " + c(RED, o["error"]))
+            continue
+        sm = o.get("summary") or {}
+        print(head + f"  via {o['via']} · ${sm.get('cost', 0):,.0f} · {sm.get('sessions', 0)} sessions"
+              f" · {sm.get('lines', 0):,} lines · {sm.get('commits', 0)} commits · {sm.get('users', 0)} active")
+        print(c(DIM, f"  {'#':>3} {'seat':<30} {'est. $':>8} {'$/day':>7} {'days':>5} {'lines':>8} {'sessions':>8}  last"))
+        for s in o.get("seats") or []:
+            print(f"  {(s['n'] or ''):>3} {s['email']:<30} {s['cost']:>8,.0f} {s['per_day']:>7,.0f} {s['days']:>5}"
+                  f" {s['lines']:>8,} {s['sessions']:>8}  {s['last'] or '–'}")
+        ot = o.get("others") or {}
+        if ot.get("members"):
+            print(c(DIM, f"      others: {ot['members']} members · ${ot['cost']:,.0f} · {ot['lines']:,} lines · {ot['sessions']} sessions"))
+        dl = (o.get("daily") or [])[-10:]
+        if dl:
+            print(c(DIM, "  A day ($): ") + "  ".join(f"{x['date'][5:]} {x['cost']:,.0f}" for x in dl))
+    sys.exit(0)
 if view == "tokens":
     tt = data["total"]
     tk = tt["tokens"]
@@ -13149,7 +13414,7 @@ const VIEW_OPTS = {
   grp: [["classic", "Cards"], ["table", "Table"], ["board", "Board"]],
   acc: [["classic", "Classic"], ["table", "Table"], ["all", "All in one"], ["groups", "By group"], ["heat", "Heat"]],
   cal: [["classic", "Days"], ["all", "All in one"], ["timeline", "5h timeline"], ["week", "Week × hour"], ["agenda", "Agenda"]],
-  use: [["pace", "Pace"], ["events", "Events"], ["tokens", "Tokens"]],
+  use: [["pace", "Pace"], ["events", "Events"], ["tokens", "Tokens"], ["teams", "Teams"]],
 };
 const VIEW_DEF = { grp: "classic", acc: "classic", cal: "classic", use: "pace" };
 function readViews() {
@@ -13808,6 +14073,35 @@ const Views = (() => {
       h("div", { class: "ucard" }, stack, h("div", { class: "uax" }, days.map((d) => h("span", { text: String(D(d).getDate()) })))),
       scroll(h("table", { class: "uday" }, h("thead", {}, head), h("tbody", {}, rows)))];
   }
+
+  function useTeams(redo, data) {
+    const orgs = data.orgs || [];
+    const out = [note("claude.ai's own analytics of each Team (read with an admin's cookie every 30 minutes, the last 30 days; claude.ai fills them in about a day late). Cost is its estimate at API list prices, not what the Team costs. Only your own accounts are listed; other members are summed."
+      + (data.age != null ? " Read " + span(data.age) + " ago." : ""))];
+    if (!orgs.length) out.push(h("p", { class: "faint", text: "Nothing read yet: it appears within a minute or two (claude-swap usage teams --refresh)." }));
+    for (const o of orgs) {
+      const sm = o.summary || {}, daily = o.daily || [];
+      if (o.error) { out.push(h("div", { class: "ucard" }, h("div", { class: "uhd" }, h("b", { text: o.name || o.org.slice(0, 8) })), h("p", { class: "t-bad", text: o.error }))); continue; }
+      const fig = (v, l) => h("div", {}, h("b", { text: v }), h("small", { text: l }));
+      out.push(h("div", { class: "ucards" },
+        h("div", { class: "ucard" }, h("div", { class: "uhd" }, h("b", { text: o.name || o.org.slice(0, 8) }), h("span", { class: "faint", text: "via " + (o.via || "?") })),
+          h("div", { class: "ufigs" }, fig(usd(sm.cost || 0), "estimated, 30 d"), fig(String(sm.sessions || 0), "sessions"), fig(big(sm.lines || 0), "lines accepted")),
+          daily.length ? h("div", { class: "ubox" }, h("small", { class: "faint", text: "A day, estimated $" }),
+            chart(daily.map((x) => x.cost), { cls: () => "use", title: (v, i) => daily[i].date + " · " + usd(v) + " · " + daily[i].sessions + " sessions · " + daily[i].users + " active" }),
+            h("div", { class: "uax" }, daily.map((x, i) => h("span", { text: i % 3 === 0 ? String(Number(x.date.slice(8))) : "" })))) : null)));
+      const head = h("tr", {}, ["#", "Seat", "Estimated $", "$ an active day", "Days active", "Lines", "Sessions", "Last active", "Week now"].map((x) => h("th", { text: x })));
+      const rows = (o.seats || []).map((s) => h("tr", {}, h("td", { class: "n", text: s.n ? "#" + s.n : "" }), h("td", { text: s.email }),
+        h("td", { class: "num", text: usd(s.cost) }), h("td", { class: "num", text: usd(s.per_day) }), h("td", { class: "num", text: String(s.days) }),
+        h("td", { class: "num", text: big(s.lines) }), h("td", { class: "num", text: String(s.sessions) }), h("td", { text: s.last || "–" }),
+        h("td", {}, s.u7 == null ? h("span", { class: "faint", text: "–" }) : barCell(s.u7))));
+      const ot = o.others || {};
+      if (ot.members) rows.push(h("tr", { class: "off" }, h("td"), h("td", { class: "faint", text: "others: " + ot.members + " members" }),
+        h("td", { class: "num faint", text: usd(ot.cost) }), h("td"), h("td"), h("td", { class: "num faint", text: big(ot.lines) }),
+        h("td", { class: "num faint", text: String(ot.sessions) }), h("td"), h("td")));
+      out.push(scroll(h("table", {}, h("thead", {}, head), h("tbody", {}, rows))));
+    }
+    return out;
+  }
   function useTokens(redo, data) {
     if (data.indexing) return [note("Reading Claude Code's transcripts for the first time: a few minutes for gigabytes. This view fills in when it is done (the server brings it up to date every 5 minutes after that).")];
     const tt = data.total || {}, tk = tt.tokens || [0, 0, 0, 0, 0, 0, 0];
@@ -13844,7 +14138,7 @@ const Views = (() => {
   }
 
   return {
-    use: { pace: usePace, events: useEvents, tokens: useTokens },
+    use: { pace: usePace, events: useEvents, tokens: useTokens, teams: useTeams },
     grp: { table: grpTable, board: grpBoard },
     acc: { table: accTable, all: accAll, groups: accGroups, heat: accHeat },
     cal: { all: accAll, timeline: calTimeline, week: calWeek, agenda: calAgenda },

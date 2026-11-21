@@ -362,7 +362,7 @@ class ServedPageTest(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
         env.update(HOME=self.home, CLAUDE_SWAP_STORE=self.store_path,
                    CLAUDE_SWAP_RUN=os.path.join(self.dir, "run"), CLAUDE_SWAP_VAULT="claude-swap-tests",
-                   NO_COLOR="1", CLAUDE_SWAP_WEB_BIN=self.swap, CLAUDE_SWAP_TAILSCALE="none",
+                   NO_COLOR="1", CLAUDE_SWAP_WEB_BIN=self.swap, CLAUDE_SWAP_TAILSCALE="none", CLAUDE_SWAP_TEAMS="off",
                    PATH=self.bin + os.pathsep + "/usr/bin:/bin:/usr/sbin:/sbin")
         p = subprocess.Popen(["bash", tw.SCRIPT, "web", "--foreground", "--port", str(port)], env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
